@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+relay_env/
+.cache/
+
+# Local state: logs, generated audio, personal configuration
+*.log
+outputs/
+config.json
+
+# Voice data never belongs in the repository
+datasets/*
+!datasets/.gitkeep
+voicechanger/rvc_dataset/
+voicechanger/*_rvc_manifest.csv
