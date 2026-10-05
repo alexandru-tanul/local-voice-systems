@@ -1,137 +1,96 @@
 # Local Voice Systems
 
-A local, browser-based dashboard for building a cloned voice and talking
-through it. Record or type a line, have it transcribed on your own machine,
-and hear it spoken in a voice you trained from your own clips. Everything runs
-locally: speech recognition with faster-whisper, speech synthesis with
-GPT-SoVITS, and an optional real-time voice changer through Applio.
+Speak or type, then hear the words in a reference voice. Runs locally after model downloads.
 
-The project ships no voice data. You bring your own clips and train the voice
-yourself.
+![Generate screen in Local Voice Systems](docs/screenshot.png)
 
-## What it does
+Requires **Windows 10/11 x64 + WSL2**, Python 3.12, FFmpeg on PATH, and Chrome or Edge.
+The dashboard does not support native Linux, macOS, or Windows ARM. CPU mode works but is slow.
 
-- **Relay.** Hold a key or the big microphone button, speak, and the line is
-  transcribed and spoken in the trained voice. Works while the page is not
-  focused, so it can feed a game or a call through a virtual microphone.
-- **Generate.** Type a line, choose a reference clip, and produce a WAV file.
-- **TTS Training.** Create a dataset from audio files with transcripts,
-  prepare its features, and train GPT and SoVITS models with names of your
-  choosing.
-- **Voice Changer.** Experimental real-time voice conversion with an RVC model
-  trained from the same dataset.
-- **Logs** and a read-only **Setup** check for the whole toolchain.
+## Install
 
-## Requirements
+Install [Python 3.12](https://www.python.org/downloads/windows/), [Git](https://git-scm.com/downloads/win), and [FFmpeg](https://ffmpeg.org/download.html) on Windows.
+For NVIDIA, install the [Windows driver](https://www.nvidia.com/Download/index.aspx). WSL uses it; do not install a Linux GPU driver.
 
-- Windows 10 or 11. The global push-to-talk helper uses Windows input hooks.
-- Python 3.11 or newer for the dashboard.
-- WSL2 with a Linux distribution that has [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS)
-  installed together with its v2Pro pretrained models and a PyTorch build for
-  your GPU. The dashboard runs training and synthesis inside WSL.
-- ffmpeg on the Windows PATH, used to convert uploaded audio.
-- Chrome, Edge, or Brave. Output device selection needs a Chromium browser.
-- Optional: [VB-CABLE](https://vb-audio.com/Cable/) to route the generated
-  voice into other applications, and [Applio](https://github.com/IAHispano/Applio)
-  for the voice changer.
-
-## Setup
-
-1. Clone the repository and copy `config.example.json` to `config.json`.
-   Fill in the WSL distribution name, the GPT-SoVITS folder and its Python
-   interpreter inside WSL, and, if you use them, the Applio folder and the AMD
-   HIP folder. Empty values fall back to the defaults shown in the example.
-2. Run `Setup-Relay-Env.bat`. It creates `relay_env` and installs
-   faster-whisper for speech recognition. The Whisper model downloads on
-   first use.
-3. Run `Launch-Voice-Dashboard.bat`. It finds Python, starts the dashboard in
-   the background, and opens http://localhost:8790. `Stop-Voice-Dashboard.bat`
-   stops it together with the services it started.
-4. Open **Setup** in the dashboard and run the system check. It reports what
-   is missing before you start anything.
-
-## Train a voice
-
-1. On **TTS Training**, create a dataset and add audio files. Each file gets
-   an editable transcript; the file name is used as a starting suggestion.
-   For large folders, use the command line instead:
-
-   ```text
-   python import_dataset.py --name "Station Announcer" --audio-dir C:\clips --transcripts C:\clips\lines.csv
-   ```
-
-   The CSV needs the columns `file,text`. Without a CSV, transcripts are
-   derived from file names, so check them by ear.
-2. Enter a model name and press **Sync & Prepare**. The dataset is copied into
-   WSL and the text, HuBERT, and semantic features are extracted on the GPU.
-3. Train SoVITS, then GPT. Checkpoints appear under the model name in the
-   GPT-SoVITS weights folders and are listed at the bottom of the page.
-
-Reference clips for synthesis come from the dataset you choose on the Generate
-page or in the Relay settings, so a dataset has to be synced into WSL before
-it can be used for synthesis.
-
-## Use the voice
-
-- **Relay.** Press **Start System** in the control island to load speech
-  recognition, the voice engine, and the global push-to-talk helper. Then hold
-  the microphone button or the push-to-talk key, speak, and release. The
-  status under the button moves through Listening, Transcribing, Generating
-  voice, and Playing. Each line is listed in the sidebar for the session.
-  Without Start System, services start on first use, but the push-to-talk
-  key only works while the page is focused.
-- **Settings** in the island holds the output device, volume, voice dataset,
-  models, reference clip, extra reference clips, and generation settings.
-- **Generate** produces a WAV file from typed text and starts the voice engine
-  on its own when it is off. Files are written to `outputs/`.
-
-## Global push-to-talk
-
-`ptt_helper.py` installs Windows keyboard and mouse hooks and forwards only the
-configured key's pressed and released state to the dashboard on `127.0.0.1`.
-It does not record text and does not talk to anything outside the machine.
-Some games run elevated and only expose input to elevated applications; run
-the launcher at the same privilege level if the key does not work in one game.
-
-## Configuration keys
-
-| Key | Meaning |
-| --- | --- |
-| `dashboard_python` | Python used by the launcher. Empty: `.venv`, then `python` or `py` on PATH. |
-| `wsl_distro` | WSL distribution that has GPT-SoVITS. |
-| `wsl_gpt_sovits_root` | GPT-SoVITS folder inside WSL. |
-| `wsl_python` | Python interpreter inside WSL with GPT-SoVITS dependencies. |
-| `wsl_datasets_root` | Where datasets are copied inside WSL. |
-| `asr_model_dir` | Folder for the faster-whisper model. Empty: `cache_dir/faster-whisper`. |
-| `cache_dir` | Cache folder for Hugging Face, pip, and RVC kernels. Empty: `.cache` in the project. |
-| `tmp_dir` | Temporary folder for the services. Empty: `cache_dir/tmp`. |
-| `applio_root` | Applio installation for the voice changer. |
-| `amd_hip_bin` | AMD HIP runtime folder, needed by Applio on AMD GPUs. |
-
-## Layout
+In administrator PowerShell:
 
 ```text
-voice_dashboard.py               the dashboard: HTTP server, job control, and the web page
-relay_asr_server.py              local speech recognition service (faster-whisper)
-ptt_helper.py                    global push-to-talk hook for Windows
-import_dataset.py                command-line dataset importer
-prepare_voicechanger_dataset.py  converts a dataset for RVC training
-rvc_monitor.py                   small status page for an RVC training run
-datasets/                        your datasets (ignored by git)
-outputs/                         generated audio (ignored by git)
-voicechanger/                    RVC dataset folder and notes
+wsl --install -d Ubuntu-24.04
+wsl --update
 ```
 
-## Credits
+Restart if prompted. Open Ubuntu once and create your Linux user.
+For NVIDIA, `/usr/lib/wsl/lib/nvidia-smi` inside Ubuntu must list your card ([WSL requirements](https://docs.nvidia.com/cuda/wsl-user-guide/index.html)).
 
-- [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) for few-shot voice
-  synthesis and training.
-- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) for local speech
-  recognition.
-- [Applio](https://github.com/IAHispano/Applio) for RVC training and real-time
-  conversion.
+### Engine
 
-## License
+With an existing GPT-SoVITS v2Pro install, skip to [Dashboard](#dashboard).
+Install [Miniforge for Linux](https://github.com/conda-forge/miniforge#install) inside Ubuntu, then reopen Ubuntu.
+Choose your values below. `build` is used in the commands; the other two go in `config.json`.
 
-MIT. See `LICENSE`. Voice data you train from remains subject to its own
-rights; only use recordings you are allowed to use.
+| Hardware | `build` | `tts_device` | `tts_precision` |
+| --- | --- | --- | --- |
+| RTX 20/30/40/50 | `cu128` | `cuda` | `fp16` |
+| GTX 16 | `cu128` | `cuda` | `fp32` |
+| GTX 10, Pascal/Volta | `cu126` | `cuda` | `fp32` |
+| Older NVIDIA, Intel, or no GPU | `cpu` | `cpu` | `fp32` |
+
+Run in Ubuntu. The upstream installer downloads the models and dependencies.
+
+```text
+sudo apt update
+sudo apt install -y build-essential git wget
+conda create -y -n gsv python=3.10 uv
+conda activate gsv
+git clone https://github.com/RVC-Boss/GPT-SoVITS.git ~/GPT-SoVITS
+cd ~/GPT-SoVITS
+git checkout 48b1a0169a28582a8984402f82cf438d3bfa6aca
+build=cu128
+uv pip install "torch==2.11.0+$build" "torchaudio==2.11.0+$build" torchcodec==0.11.1 --index-url "https://download.pytorch.org/whl/$build"
+printf 'torch==2.11.0\ntorchaudio==2.11.0\ntorchcodec==0.11.1\n' > voice-constraints.txt
+CONDA_PINNED_PACKAGES='ffmpeg>=6,<9' PIP_CONSTRAINT="$PWD/voice-constraints.txt" WORKFLOW=true bash install.sh --device "${build^^}" --source HF
+```
+
+These pins keep PyTorch, torchaudio, and FFmpeg compatible.
+For AMD, follow [GPT-SoVITS's ROCm setup](https://github.com/RVC-Boss/GPT-SoVITS), then use `tts_device: "cuda"`.
+
+### Dashboard
+
+In a normal Windows PowerShell:
+
+```text
+git clone https://github.com/scriptogre/local-voice-systems.git
+cd local-voice-systems
+Copy-Item config.example.json config.json
+```
+
+Edit `config.json`: replace `YOUR_WSL_USER` in the three paths and choose the device and precision from the table.
+For an existing engine, keep its paths. Restart the dashboard after config edits.
+
+Run `Setup-Relay-Env.bat`, then `Launch-Voice-Dashboard.bat`. Open **Setup** to check the selected device.
+Use `Stop-Voice-Dashboard.bat` to stop it. Speech recognition uses CPU and downloads its model on first use.
+
+## Use
+
+1. On **TTS Training**, create a dataset with a clear 3 to 10 second clip and its exact transcript. Press **Sync & Prepare**.
+2. On **Generate**, choose the dataset, reference clip, and pretrained `s1v3.ckpt` / `s2Gv2Pro.pth` models. Enter text and generate audio.
+3. On **Relay**, press **Start System**, hold push-to-talk, speak, then release. Choose audio output in **Settings**.
+
+To train a voice, add more clips, prepare the dataset, then train SoVITS and GPT with batch size 1.
+For live microphone conversion, see [Voice Changer](voicechanger/README.md). Use [VB-CABLE](https://vb-audio.com/Cable/) to send audio to another app.
+
+## Fix
+
+- GPU error: check the Windows driver and build. To use CPU, set `tts_device` to `cpu`.
+- Noise or NaNs: use `tts_precision: "fp32"`. Out of memory: stop other GPU jobs, reduce batch size, or use CPU.
+- Upload fails: run `ffmpeg -version` in Windows. Missing WSL files: check the paths in `config.json`.
+
+## Check
+
+```text
+python -m unittest discover -s tests
+```
+
+CI checks Windows and Linux. CPU synthesis was tested in Ubuntu; Windows GPU execution remains unverified.
+
+[Upstream dashboard](https://github.com/alexandru-tanul/local-voice-systems) · [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) · [faster-whisper](https://github.com/SYSTRAN/faster-whisper) · [MIT](LICENSE)
