@@ -15,7 +15,6 @@ import urllib.parse
 import urllib.request
 import wave
 from datetime import datetime
-from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -130,19 +129,16 @@ def run_wsl(script, **kwargs):
     )
 
 
-@lru_cache(maxsize=1)
 def voice_runtime():
-    probe = (ROOT / "voice_hardware.py").read_text(encoding="utf-8")
-    args = [
-        WSL_PYTHON, "-c", probe,
-        "--device", APP_CONFIG.get("tts_device", "auto"),
-        "--precision", APP_CONFIG.get("tts_precision", "auto"),
-        "--gpu-index", APP_CONFIG.get("tts_gpu_index", 0),
-    ]
-    result = run_wsl(" ".join(shquote(arg) for arg in args), timeout=60)
-    if result.returncode:
-        raise RuntimeError(result.stderr.strip() or "Voice engine check failed. Check the WSL Python path.")
-    return json.loads(result.stdout.strip().splitlines()[-1])
+    device = APP_CONFIG.get("tts_device", "cuda")
+    precision = APP_CONFIG.get("tts_precision", "fp32")
+    if device not in {"cuda", "cpu"} or precision not in {"fp16", "fp32"}:
+        raise ValueError("Set tts_device to cuda or cpu, and tts_precision to fp16 or fp32.")
+    return {
+        "device": device,
+        "is_half": device == "cuda" and precision == "fp16",
+        "gpu_index": "0" if device == "cuda" else "",
+    }
 
 
 def voice_environment():
@@ -881,9 +877,19 @@ def setup_status():
 
     gpu = {"status": "missing", "detail": "Voice engine is not installed."}
     try:
-        voice_runtime.cache_clear()
         runtime = voice_runtime()
-        gpu = {"status": "ready" if runtime["device"] == "cuda" else "cpu", "detail": runtime["detail"]}
+        probe = (
+            "import torch; "
+            f"x = torch.ones((8, 8), device={runtime['device']!r}, "
+            f"dtype=torch.{'float16' if runtime['is_half'] else 'float32'}); "
+            "assert (x @ x).isfinite().all().item(), 'Try tts_precision: fp32'; "
+            f"print(torch.cuda.get_device_name(0) if {runtime['device'] == 'cuda'} else 'CPU')"
+        )
+        result = run_wsl(f"{shquote(WSL_PYTHON)} -c {shquote(probe)}", timeout=60)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip())
+        precision = "FP16" if runtime["is_half"] else "FP32"
+        gpu = {"status": "ready", "detail": f"{result.stdout.strip()} ({precision})"}
     except Exception as exc:
         gpu["detail"] = str(exc)
 
@@ -2212,7 +2218,7 @@ HTML = r"""<!doctype html>
     .setup-state { text-transform: uppercase; font-size: 11px; letter-spacing: .07em; color: var(--muted); }
     .setup-state.ready { color: var(--good); }
     .setup-state.missing { color: var(--bad); }
-    .setup-state.needs_configuration, .setup-state.needs_browser_check, .setup-state.cpu { color: var(--warn); }
+    .setup-state.needs_configuration, .setup-state.needs_browser_check { color: var(--warn); }
     .training-project { border: 1px solid var(--line-subtle); background: var(--field); padding: var(--space-4); }
     .upload-list { display: grid; gap: var(--space-2); max-height: 310px; overflow: auto; margin-top: var(--space-3); }
     .upload-row { display: grid; grid-template-columns: minmax(150px,.7fr) minmax(260px,1.5fr); gap: var(--space-2); align-items: center; border: 1px solid var(--line-subtle); padding: var(--space-2); background: #101214; }
@@ -4672,7 +4678,7 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
         };
         let ready = 0;
         Object.entries(checks).forEach(([key, check]) => {
-          if (check.status === "ready" || check.status === "cpu") ready += 1;
+          if (check.status === "ready") ready += 1;
           const row = document.createElement("div");
           row.className = "setup-row";
           const name = document.createElement("strong");

@@ -1,157 +1,94 @@
 # Local Voice Systems
 
-Speak or type, then hear the words in a reference voice. Everything runs locally after model downloads.
-The dashboard can also train GPT-SoVITS voices and run an optional Applio voice changer.
+Speak or type, then hear the words in a reference voice. Runs locally after model downloads.
 
-```text
-Microphone -> faster-whisper (Windows CPU) -> text
-Text + reference clip -> GPT-SoVITS (WSL2 GPU or CPU) -> WAV / audio output
-Microphone -> Applio (optional, Windows) -> live voice conversion
-```
-
-## Machines
-
-The full app needs **64-bit Windows 10/11 with WSL2**. Windows 11 is the preferred setup.
-Launchers, global push-to-talk, and file access use Windows APIs. Native Linux, macOS, and Windows ARM are not supported by this dashboard.
-
-| Hardware | GPT-SoVITS setup | Automatic precision |
-| --- | --- | --- |
-| NVIDIA RTX 20/30/40/50 series | CUDA 12.8 | FP16 |
-| NVIDIA GTX 16 series | CUDA 12.8 | FP32 |
-| NVIDIA GTX 10 series, supported Pascal/Volta cards | CUDA 12.6 | FP32 on Pascal, FP16 on Volta |
-| Older NVIDIA, Intel graphics, or no GPU | CPU | FP32 |
-| AMD with a working WSL ROCm PyTorch install | Manual ROCm setup | FP16 |
-
-GPU support also depends on the driver, PyTorch build, and available VRAM.
-[NVIDIA supports WSL GPU compute on Pascal and newer cards in WDDM mode](https://docs.nvidia.com/cuda/wsl-user-guide/index.html). Maxwell and older cards use the CPU route here.
-
-The dashboard runs a small GPU calculation before choosing CUDA. `auto` falls back to CPU if that fails and shows the reason in **Setup**.
-CPU use is slow, especially training. GPU memory can still run out when a full model loads.
-
-Allow several GB of downloads. Plan for 16 GB RAM and 30 GB free disk as starting headroom, not measured minimums.
-CPU installation and WAV synthesis were checked in Ubuntu 24.04. No Windows GPU run has been validated for this fork.
+Requires **Windows 10/11 x64 + WSL2**, Python 3.12, FFmpeg on PATH, and Chrome or Edge.
+The dashboard does not support native Linux, macOS, or Windows ARM. CPU mode works but is slow.
 
 ## Install
 
-1. Install [64-bit Python 3.12](https://www.python.org/downloads/windows/), [Git](https://git-scm.com/downloads/win), and [FFmpeg](https://ffmpeg.org/download.html).
-   Add Python and FFmpeg to the Windows PATH. Use Chrome, Edge, or Brave for audio output selection.
-2. For NVIDIA, install the current [Windows driver](https://www.nvidia.com/Download/index.aspx).
-   WSL uses that driver. Do not install a Linux NVIDIA driver inside WSL.
-3. In an administrator PowerShell, install WSL2. Restart if prompted, then open Ubuntu once to create your Linux user.
+Install [Python 3.12](https://www.python.org/downloads/windows/), [Git](https://git-scm.com/downloads/win), and [FFmpeg](https://ffmpeg.org/download.html) on Windows.
+For NVIDIA, install the [Windows driver](https://www.nvidia.com/Download/index.aspx). WSL uses it; do not install a Linux GPU driver.
 
-   ```text
-   wsl --install -d Ubuntu-24.04
-   wsl --update
-   wsl -l -v
-   ```
-
-   Ubuntu must show version `2`. For NVIDIA, confirm this command lists your card:
-
-   ```text
-   wsl -d Ubuntu-24.04 -- /usr/lib/wsl/lib/nvidia-smi
-   ```
-
-4. In a normal PowerShell, clone this fork and install the voice engine. Run this as your normal WSL user.
-
-   ```text
-   git clone https://github.com/scriptogre/local-voice-systems.git
-   cd local-voice-systems
-   Copy-Item config.example.json config.json
-   wsl -d Ubuntu-24.04 -- bash ./setup_voice_engine.sh
-   ```
-
-   The installer asks for your Ubuntu password for system packages. It installs Miniforge, a separate Python 3.10 environment, a pinned GPT-SoVITS checkout, matching PyTorch packages, and pretrained models.
-   It chooses CUDA 12.8, CUDA 12.6, or CPU from the detected NVIDIA card. AMD users get CPU unless they supply their own ROCm environment.
-
-   To choose explicitly, add `--device cu128`, `--device cu126`, or `--device cpu`. Use `--help` for paths, model mirrors, and GPU selection.
-
-5. Open `config.json`. Copy the paths printed by the installer into the matching keys.
-   Keep `tts_device` and `tts_precision` set to `auto`. Set `wsl_distro` to the distribution shown by `wsl -l -v`.
-6. Run `Setup-Relay-Env.bat`, then `Launch-Voice-Dashboard.bat`.
-   Open **Setup** and run the check. It shows the selected GPU and precision, or the CPU fallback reason.
-
-`Stop-Voice-Dashboard.bat` stops the dashboard and its services.
-The first speech recognition request downloads the English Whisper model. Speech recognition uses CPU, leaving GPU memory for the voice engine.
-
-## Try it
-
-1. On **TTS Training**, create a dataset. Add a clear recording of 3 to 10 seconds and its exact transcript.
-2. Press **Sync & Prepare** to copy it into WSL and build the features.
-3. On **Generate**, select the dataset, reference clip, and pretrained `s1v3.ckpt` / `s2Gv2Pro.pth` models. Enter text and generate a WAV.
-
-Training is optional. To fine-tune a voice, prepare more transcribed clips, choose a model name, then train SoVITS and GPT.
-Start with batch size 1. Keep generated audio in `outputs/` and your recordings in `datasets/`.
-
-For a folder of clips and a CSV with columns `file,text`:
+In administrator PowerShell:
 
 ```text
-relay_env\Scripts\python.exe import_dataset.py --name "Station Announcer" --audio-dir C:\clips --transcripts C:\clips\lines.csv
+wsl --install -d Ubuntu-24.04
+wsl --update
 ```
 
-On **Relay**, press **Start System**, hold push-to-talk, speak, then release.
-Choose the voice, reference, models, and output device in **Settings**. [VB-CABLE](https://vb-audio.com/Cable/) can route output into another app.
+Restart if prompted. Open Ubuntu once and create your Linux user.
+For NVIDIA, `/usr/lib/wsl/lib/nvidia-smi` inside Ubuntu must list your card ([WSL requirements](https://docs.nvidia.com/cuda/wsl-user-guide/index.html)).
 
-Global push-to-talk uses Windows input hooks. If a game runs as administrator, the dashboard may need the same privilege level.
-For direct microphone conversion, follow the separate [Applio setup](voicechanger/README.md).
+### Engine
 
-## Fixes
+With an existing GPT-SoVITS v2Pro install, skip to [Dashboard](#dashboard).
+Install [Miniforge for Linux](https://github.com/conda-forge/miniforge#install) inside Ubuntu, then reopen Ubuntu.
+Choose your values below. `build` is used in the commands; the other two go in `config.json`.
 
-| Problem | Action |
-| --- | --- |
-| Setup reports CPU on an NVIDIA machine | Check `nvidia-smi` in WSL, update the Windows driver, then rerun the installer with the correct `--device`. Run Setup again. |
-| `no kernel image` or an unsupported GPU warning | Use `cu126` for Pascal/Volta or `cu128` for RTX 50. Set `tts_device` to `cuda` to make detection failures stop with an error. |
-| NaNs, noise, or failed half precision | Set `tts_precision` to `fp32`, then restart the dashboard and engine. GTX 10/16 cards select FP32 automatically. |
-| CUDA out of memory | Stop Applio and other GPU jobs. Use training batch size 1, shorter clips, or `tts_device: "cpu"`. |
-| Missing WSL folder or Python | Use the exact paths printed by the installer. `/home/YOUR_WSL_USER` is a placeholder. Keep all paths under the same WSL user. |
-| Missing training features | Run **Sync & Prepare**. v2Pro needs text, HuBERT, speaker, and semantic features. |
-| Audio upload fails | Run `ffmpeg -version` in Windows PowerShell. Restart the dashboard after fixing PATH. |
-| Existing relay environment uses Python 3.11 | Rename `relay_env`, install Python 3.12, and rerun `Setup-Relay-Env.bat`. |
+| Hardware | `build` | `tts_device` | `tts_precision` |
+| --- | --- | --- | --- |
+| RTX 20/30/40/50 | `cu128` | `cuda` | `fp16` |
+| GTX 16 | `cu128` | `cuda` | `fp32` |
+| GTX 10, Pascal/Volta | `cu126` | `cuda` | `fp32` |
+| Older NVIDIA, Intel, or no GPU | `cpu` | `cpu` | `fp32` |
 
-## Config
-
-Copy `config.example.json` to `config.json`. Restart the dashboard after edits.
-Keep this file private to your machine. It is ignored by Git.
-
-| Key | Value |
-| --- | --- |
-| `dashboard_python` | Launcher override. Empty: `relay_env`, `.venv`, then `python` or `py`. |
-| `wsl_distro` | Distribution name, such as `Ubuntu-24.04`. |
-| `wsl_gpt_sovits_root` | Absolute Linux path to GPT-SoVITS. |
-| `wsl_python` | Its Python executable. The installer prints this path. |
-| `wsl_datasets_root` | Linux folder for synced datasets. |
-| `tts_device` | `auto`, `cuda` (GPU required, including ROCm), or `cpu`. |
-| `tts_precision` | `auto`, `fp16`, or `fp32`. CPU requires FP32. |
-| `tts_gpu_index` | GPU number, starting at `0`. Also pass `--gpu-index` to the installer when selecting another card. |
-| `asr_model_dir` | Empty: `cache_dir/faster-whisper`. |
-| `cache_dir` | Empty: `.cache` in this repository. |
-| `tmp_dir` | Empty: `cache_dir/tmp`. |
-| `applio_root` | Empty: an `Applio` folder beside this repository. |
-| `applio_python` | Optional executable override. Auto-detects `env/python.exe` and `env/Scripts/python.exe`. |
-| `applio_backend` | `auto` uses installed PyTorch, `cpu` hides GPUs, `zluda` uses Applio's ZLUDA wrapper. |
-| `amd_hip_bin` | Optional AMD runtime folder added to Applio's PATH. Leave empty for NVIDIA/CPU. |
-
-## Existing engines
-
-You can keep an existing GPT-SoVITS install: set its paths in `config.json` and run **Setup**.
-It needs v2Pro pretrained models, including the speaker checkpoint under `GPT_SoVITS/pretrained_models/sv/`.
-
-The installer targets [GPT-SoVITS commit 48b1a01](https://github.com/RVC-Boss/GPT-SoVITS/tree/48b1a0169a28582a8984402f82cf438d3bfa6aca), PyTorch/torchaudio 2.11.0, and FFmpeg 6 to 8.
-It refuses to replace another checkout. Use `--root /home/YOUR_WSL_USER/GPT-SoVITS-dashboard --env /home/YOUR_WSL_USER/gsv-dashboard` for a separate install.
-
-For AMD acceleration, use [AMD's WSL compatibility guidance](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility/compatibilityrad/wsl/wsl_compatibility.html) and [GPT-SoVITS's ROCm setup](https://github.com/RVC-Boss/GPT-SoVITS).
-The dashboard recognizes ROCm through PyTorch's CUDA API. The installer does not set up AMD drivers.
-
-## Checks
-
-Run the dependency-free regression suite with Python 3.12:
+Run in Ubuntu. The upstream installer downloads the models and dependencies.
 
 ```text
-python -m unittest discover -s tests -v
+sudo apt update
+sudo apt install -y build-essential git wget
+conda create -y -n gsv python=3.10 uv
+conda activate gsv
+git clone https://github.com/RVC-Boss/GPT-SoVITS.git ~/GPT-SoVITS
+cd ~/GPT-SoVITS
+git checkout 48b1a0169a28582a8984402f82cf438d3bfa6aca
+build=cu128
+uv pip install "torch==2.11.0+$build" "torchaudio==2.11.0+$build" torchcodec==0.11.1 --index-url "https://download.pytorch.org/whl/$build"
+printf 'torch==2.11.0\ntorchaudio==2.11.0\ntorchcodec==0.11.1\n' > voice-constraints.txt
+CONDA_PINNED_PACKAGES='ffmpeg>=6,<9' PIP_CONSTRAINT="$PWD/voice-constraints.txt" WORKFLOW=true bash install.sh --device "${build^^}" --source HF
 ```
 
-GitHub Actions runs it on Windows and Linux. These checks do not load full voice models or prove GPU performance.
+These pins keep PyTorch, torchaudio, and FFmpeg compatible.
+For AMD, follow [GPT-SoVITS's ROCm setup](https://github.com/RVC-Boss/GPT-SoVITS), then use `tts_device: "cuda"`.
 
-## Credits
+### Dashboard
 
-[GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS), [faster-whisper](https://github.com/SYSTRAN/faster-whisper), and [Applio](https://github.com/IAHispano/Applio) provide the engines.
-[Upstream dashboard](https://github.com/alexandru-tanul/local-voice-systems). [MIT license](LICENSE). Use recordings you have permission to use.
+In a normal Windows PowerShell:
+
+```text
+git clone https://github.com/scriptogre/local-voice-systems.git
+cd local-voice-systems
+Copy-Item config.example.json config.json
+```
+
+Edit `config.json`: replace `YOUR_WSL_USER` in the three paths and choose the device and precision from the table.
+For an existing engine, keep its paths. Restart the dashboard after config edits.
+
+Run `Setup-Relay-Env.bat`, then `Launch-Voice-Dashboard.bat`. Open **Setup** to check the selected device.
+Use `Stop-Voice-Dashboard.bat` to stop it. Speech recognition uses CPU and downloads its model on first use.
+
+## Use
+
+1. On **TTS Training**, create a dataset with a clear 3 to 10 second clip and its exact transcript. Press **Sync & Prepare**.
+2. On **Generate**, choose the dataset, reference clip, and pretrained `s1v3.ckpt` / `s2Gv2Pro.pth` models. Enter text and generate audio.
+3. On **Relay**, press **Start System**, hold push-to-talk, speak, then release. Choose audio output in **Settings**.
+
+To train a voice, add more clips, prepare the dataset, then train SoVITS and GPT with batch size 1.
+For live microphone conversion, see [Voice Changer](voicechanger/README.md). Use [VB-CABLE](https://vb-audio.com/Cable/) to send audio to another app.
+
+## Fix
+
+- GPU error: check the Windows driver and build. To use CPU, set `tts_device` to `cpu`.
+- Noise or NaNs: use `tts_precision: "fp32"`. Out of memory: stop other GPU jobs, reduce batch size, or use CPU.
+- Upload fails: run `ffmpeg -version` in Windows. Missing WSL files: check the paths in `config.json`.
+
+## Check
+
+```text
+python -m unittest discover -s tests
+```
+
+CI checks Windows and Linux. CPU synthesis was tested in Ubuntu; Windows GPU execution remains unverified.
+
+[Upstream dashboard](https://github.com/alexandru-tanul/local-voice-systems) · [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) · [faster-whisper](https://github.com/SYSTRAN/faster-whisper) · [MIT](LICENSE)
