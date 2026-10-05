@@ -4,10 +4,16 @@ cd /d "%~dp0"
 
 echo Creating the speech recognition environment in relay_env...
 if not exist "relay_env\Scripts\python.exe" (
-    where py >nul 2>nul && (py -3 -m venv relay_env) || (python -m venv relay_env)
+    where py >nul 2>nul && (py -3.12 -m venv relay_env) || (python -m venv relay_env)
 )
 if not exist "relay_env\Scripts\python.exe" (
-    echo Python was not found. Install Python 3.11 or newer and run this again.
+    echo Python was not found. Install 64-bit Python 3.12 and run this again.
+    pause
+    exit /b 1
+)
+"relay_env\Scripts\python.exe" -c "import struct, sys; sys.exit(0 if sys.version_info[:2] == (3, 12) and struct.calcsize('P') == 8 else 1)"
+if errorlevel 1 (
+    echo This setup needs 64-bit Python 3.12. Rename relay_env and run this again after installing it.
     pause
     exit /b 1
 )

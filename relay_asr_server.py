@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-MODEL_DIR = Path(os.environ.get("RELAY_ASR_MODEL_DIR", r"E:\projects\models\faster-whisper"))
+MODEL_DIR = Path(os.environ.get("RELAY_ASR_MODEL_DIR", str(ROOT / ".cache" / "faster-whisper")))
 TMP_DIR = Path(os.environ.get("RELAY_ASR_TMP", str(ROOT / "outputs" / "relay_asr_tmp")))
 MODEL_NAME = os.environ.get("RELAY_ASR_MODEL", "base.en")
 MODEL = None

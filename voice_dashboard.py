@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 import wave
 from datetime import datetime
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -35,9 +36,12 @@ RVC_DATASETS_DIR = VOICECHANGER_DIR / "rvc_dataset"
 CACHE_DIR = Path(APP_CONFIG.get("cache_dir") or ROOT / ".cache")
 TMP_DIR = Path(APP_CONFIG.get("tmp_dir") or CACHE_DIR / "tmp")
 APPLIO_ROOT = Path(APP_CONFIG.get("applio_root") or ROOT.parent / "Applio")
-APPLIO_ENV_PYTHON = APPLIO_ROOT / "env" / "Scripts" / "python.exe"
+APPLIO_ENV_PYTHON = Path(APP_CONFIG["applio_python"]) if APP_CONFIG.get("applio_python") else next(
+    (path for path in [APPLIO_ROOT / "env" / "python.exe", APPLIO_ROOT / "env" / "Scripts" / "python.exe"] if path.exists()),
+    APPLIO_ROOT / "env" / "python.exe",
+)
 APPLIO_TORCH_LIB = APPLIO_ROOT / "env" / "Lib" / "site-packages" / "torch" / "lib"
-AMD_HIP_BIN = Path(APP_CONFIG.get("amd_hip_bin") or r"C:\Program Files\AMD\ROCm\6.4\bin")
+AMD_HIP_BIN = Path(APP_CONFIG["amd_hip_bin"]) if APP_CONFIG.get("amd_hip_bin") else None
 RVC_SAMPLE_RATE = 32000
 
 WSL_DISTRO = APP_CONFIG.get("wsl_distro") or "Ubuntu-24.04"
@@ -106,13 +110,83 @@ def shquote(value):
     return "'" + str(value).replace("'", "'\"'\"'") + "'"
 
 
+def wsl_command(script):
+    python_dir = WSL_PYTHON.rsplit("/", 1)[0]
+    lib_dir = python_dir.rsplit("/", 1)[0] + "/lib"
+    script = (
+        f'export PATH={shquote(python_dir)}:"$PATH":/usr/lib/wsl/lib; '
+        f'export LD_LIBRARY_PATH={shquote(lib_dir)}"${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"; '
+        + script
+    )
+    return ["wsl", "-d", WSL_DISTRO, "--", "bash", "-lc", script]
+
+
 def run_wsl(script, **kwargs):
     return subprocess.run(
-        ["wsl", "-d", WSL_DISTRO, "--", "bash", "-lc", script],
+        wsl_command(script),
         text=True,
         capture_output=True,
         **kwargs,
     )
+
+
+@lru_cache(maxsize=1)
+def voice_runtime():
+    probe = (ROOT / "voice_hardware.py").read_text(encoding="utf-8")
+    args = [
+        WSL_PYTHON, "-c", probe,
+        "--device", APP_CONFIG.get("tts_device", "auto"),
+        "--precision", APP_CONFIG.get("tts_precision", "auto"),
+        "--gpu-index", APP_CONFIG.get("tts_gpu_index", 0),
+    ]
+    result = run_wsl(" ".join(shquote(arg) for arg in args), timeout=60)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Voice engine check failed. Check the WSL Python path.")
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def voice_environment():
+    runtime = voice_runtime()
+    return (
+        f"export CUDA_VISIBLE_DEVICES={shquote(runtime['gpu_index'])}; "
+        f"export _CUDA_VISIBLE_DEVICES={shquote(runtime['gpu_index'])}; "
+        f"export is_half={runtime['is_half']}; "
+    )
+
+
+def applio_environment():
+    env = os.environ.copy()
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    env.update({
+        "PYTHONNOUSERSITE": "1", "PYTHONUNBUFFERED": "1",
+        "OMP_NUM_THREADS": "4", "MKL_NUM_THREADS": "4", "NUMEXPR_MAX_THREADS": "4",
+        "UV_CACHE_DIR": str(CACHE_DIR / "uv"), "PIP_CACHE_DIR": str(CACHE_DIR / "pip"),
+        "TEMP": str(TMP_DIR), "TMP": str(TMP_DIR),
+    })
+    paths = [APPLIO_ENV_PYTHON.parent, APPLIO_ROOT / "env" / "Library" / "bin", APPLIO_TORCH_LIB]
+    if AMD_HIP_BIN:
+        paths.insert(0, AMD_HIP_BIN)
+    env["PATH"] = os.pathsep.join(str(path) for path in paths if path.exists()) + os.pathsep + env.get("PATH", "")
+    backend = APP_CONFIG.get("applio_backend", "auto")
+    if backend == "cpu":
+        env.update({"CUDA_VISIBLE_DEVICES": "-1", "HIP_VISIBLE_DEVICES": "-1"})
+    elif backend == "zluda":
+        env["DISABLE_ADDMM_CUDA_LT"] = "1"
+    elif backend != "auto":
+        raise ValueError("applio_backend must be auto, cpu, or zluda.")
+    return env
+
+
+def applio_command(*args):
+    if not APPLIO_ENV_PYTHON.exists():
+        raise RuntimeError("Applio Python is missing. Run Applio's run-install.bat, then restart the dashboard.")
+    command = [str(APPLIO_ENV_PYTHON), *args]
+    if APP_CONFIG.get("applio_backend") == "zluda":
+        zluda = APPLIO_ROOT / "zluda" / "zluda.exe"
+        if not zluda.exists():
+            raise RuntimeError("ZLUDA is missing. Complete Applio's AMD setup first.")
+        command = [str(zluda), "--", *command]
+    return command
 
 
 class ManagedProcess:
@@ -270,8 +344,8 @@ def model_files():
         return rows
 
     return {
-        "gpt": collect("GPT_weights_v2Pro", "*.ckpt"),
-        "sovits": collect("SoVITS_weights_v2Pro", "*.pth"),
+        "gpt": collect("GPT_weights_v2Pro", "*.ckpt") + collect("GPT_SoVITS/pretrained_models", "s1v3.ckpt"),
+        "sovits": collect("SoVITS_weights_v2Pro", "*.pth") + collect("GPT_SoVITS/pretrained_models/v2Pro", "s2Gv2Pro.pth"),
     }
 
 
@@ -471,18 +545,6 @@ def voicechanger_status(dataset_id="", model_name=""):
         except Exception:
             manifest_rows = 0
             total_seconds = 0.0
-    hip_runtime_names = ["amdhip64.dll", "hiprtc0506.dll", "hiprtc0604.dll", "rocblas.dll", "amd_comgr.dll"]
-    hip_runtime_found = False
-    try:
-        search_roots = [Path(r"C:\Program Files\AMD"), AMD_HIP_BIN.parent.parent]
-        hip_runtime_found = any(
-            child.is_file() and child.name.lower() in {name.lower() for name in hip_runtime_names}
-            for root in search_roots
-            if root.exists()
-            for child in root.glob("**/*")
-        )
-    except OSError:
-        hip_runtime_found = False
     model_dir = APPLIO_ROOT / "logs" / model_name
     def file_count(folder, pattern="*"):
         path = model_dir / folder
@@ -551,8 +613,7 @@ def voicechanger_status(dataset_id="", model_name=""):
         "applio_cloned": (APPLIO_ROOT / ".git").exists(),
         "applio_launcher": (APPLIO_ROOT / "run-applio.bat").exists(),
         "applio_amd_launcher": (APPLIO_ROOT / "run-applio-amd.bat").exists(),
-        "zluda_ready": True,
-        "hip_runtime_found": hip_runtime_found,
+        "applio_backend": APP_CONFIG.get("applio_backend", "auto"),
         "applio_installed": APPLIO_ENV_PYTHON.exists(),
         "applio_dataset": (APPLIO_ROOT / "assets" / "datasets" / rvc_dataset_name(dataset_id)).exists(),
         "rvc_model_dir": str(model_dir),
@@ -818,17 +879,11 @@ def setup_status():
         except OSError:
             return False
 
-    gpu = {"status": "missing", "detail": "GPU acceleration was not detected."}
+    gpu = {"status": "missing", "detail": "Voice engine is not installed."}
     try:
-        result = run_wsl(
-            f"{WSL_PYTHON} -c \"import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU')\"",
-            timeout=20,
-        )
-        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        if lines and lines[0] == "True":
-            gpu = {"status": "ready", "detail": lines[1] if len(lines) > 1 else "CUDA-compatible GPU"}
-        elif result.stderr.strip():
-            gpu["detail"] = result.stderr.replace("\x00", "").strip().splitlines()[-1]
+        voice_runtime.cache_clear()
+        runtime = voice_runtime()
+        gpu = {"status": "ready" if runtime["device"] == "cuda" else "cpu", "detail": runtime["detail"]}
     except Exception as exc:
         gpu["detail"] = str(exc)
 
@@ -870,21 +925,24 @@ def setup_status():
 
 
 def write_tts_config(gpt_path, sovits_path):
+    runtime = voice_runtime()
     config = f"""custom:
   bert_base_path: GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
   cnhuhbert_base_path: GPT_SoVITS/pretrained_models/chinese-hubert-base
-  device: cuda
-  is_half: true
-  t2s_weights_path: {gpt_path}
+  device: {runtime['device']}
+  is_half: {str(runtime['is_half']).lower()}
+  t2s_weights_path: {json.dumps(gpt_path)}
   version: v2Pro
-  vits_weights_path: {sovits_path}
+  vits_weights_path: {json.dumps(sovits_path)}
 """
     path = WSL_GSV_WIN / "TEMP" / "dashboard_tts_infer.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(config, encoding="utf-8")
     return "TEMP/dashboard_tts_infer.yaml"
 
 
 def write_s1_config(epochs, batch_size, save_every, model_name="voice-model"):
+    runtime = voice_runtime()
     model_name = slugify(model_name, "voice-model")
     text = f"""data:
   max_eval_sample: 8
@@ -921,18 +979,20 @@ train:
   if_dpo: false
   if_save_every_weights: true
   if_save_latest: true
-  precision: 16-mixed
+  precision: {"16-mixed" if runtime['is_half'] else '"32"'}
   save_every_n_epoch: {int(save_every)}
   seed: 1234
 train_phoneme_path: logs/{model_name}/2-name2text.txt
 train_semantic_path: logs/{model_name}/6-name2semantic.tsv
 """
     path = WSL_GSV_WIN / "TEMP" / f"{model_name}_s1.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return f"{WSL_GSV_ROOT}/TEMP/{model_name}_s1.yaml"
 
 
 def write_s2_config(epochs, batch_size, save_every, model_name="voice-model", include_model_version=True):
+    runtime = voice_runtime()
     model_name = slugify(model_name, "voice-model")
     config = {
         "train": {
@@ -944,7 +1004,7 @@ def write_s2_config(epochs, batch_size, save_every, model_name="voice-model", in
             "betas": [0.8, 0.99],
             "eps": 1e-9,
             "batch_size": int(batch_size),
-            "fp16_run": True,
+            "fp16_run": runtime["is_half"],
             "lr_decay": 0.999875,
             "segment_size": 20480,
             "init_lr_ratio": 1,
@@ -958,7 +1018,7 @@ def write_s2_config(epochs, batch_size, save_every, model_name="voice-model", in
             "if_save_latest": True,
             "if_save_every_weights": True,
             "save_every_epoch": int(save_every),
-            "gpu_numbers": "0",
+            "gpu_numbers": runtime["gpu_index"],
             "lora_rank": "32",
         },
         "data": {
@@ -1005,6 +1065,7 @@ def write_s2_config(epochs, batch_size, save_every, model_name="voice-model", in
     if not include_model_version:
         config["model"].pop("version", None)
     path = WSL_GSV_WIN / "TEMP" / f"{model_name}_s2.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config, indent=2), encoding="utf-8")
     return f"{WSL_GSV_ROOT}/TEMP/{model_name}_s2.json"
 
@@ -1020,13 +1081,13 @@ def start_api(gpt_path, sovits_path):
         return True
     config_path = write_tts_config(gpt_path, sovits_path)
     script = (
-        "ulimit -l 2097152; "
+        voice_environment() + "ulimit -l 2097152; "
         f"cd {shquote(WSL_GSV_ROOT)} && "
-        f"{WSL_PYTHON} api_v2.py -a 0.0.0.0 -p 9880 -c {shquote(config_path)}"
+        f"{shquote(WSL_PYTHON)} api_v2.py -a 0.0.0.0 -p 9880 -c {shquote(config_path)}"
     )
     API_PROCESS = ManagedProcess(
         "inference engine",
-        ["wsl", "-d", WSL_DISTRO, "--", "bash", "-lc", script],
+        wsl_command(script),
         stop_script="pkill -f 'api_v2.py.*9880' || true",
     )
     API_PROCESS.start()
@@ -1128,7 +1189,7 @@ def sync_dataset_job(dataset_id):
         raise RuntimeError("The selected dataset needs matching audio files and transcript rows before it can be synced.")
     proc = ManagedProcess(
         f"Sync {descriptor['name']}",
-        ["wsl", "-d", WSL_DISTRO, "--", "bash", "-lc", dataset_sync_script(descriptor)],
+        wsl_command(dataset_sync_script(descriptor)),
     )
     with STATE_LOCK:
         current = JOBS.get("dataset-sync")
@@ -1152,11 +1213,12 @@ def prepare_tts_dataset_job(dataset_id, model_name):
         f"export inp_text={shquote(target + '/training.list')}; "
         f"export inp_wav_dir={shquote(target + '/wavs')}; "
         f"export exp_name={shquote(model_name)}; export i_part=0; export all_parts=1; "
-        "export _CUDA_VISIBLE_DEVICES=0; export is_half=True; export version=v2Pro; "
+        + voice_environment() + "export version=v2Pro; "
         f"export opt_dir={shquote(opt_dir)}; "
         f"export bert_pretrained_dir={shquote(WSL_GSV_ROOT + '/GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large')}; "
         f"export cnhubert_base_dir={shquote(WSL_GSV_ROOT + '/GPT_SoVITS/pretrained_models/chinese-hubert-base')}; "
         f"export pretrained_s2G={shquote(WSL_GSV_ROOT + '/GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth')}; "
+        f"export sv_path={shquote(WSL_GSV_ROOT + '/GPT_SoVITS/pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt')}; "
         f"export s2config_path={shquote(s2_config)}; "
     )
     script = (
@@ -1166,17 +1228,18 @@ def prepare_tts_dataset_job(dataset_id, model_name):
         + f"rm -f {shquote(opt_dir)}/2-name2text-0.txt {shquote(opt_dir)}/6-name2semantic-0.tsv; "
         + common
         + f"cd {shquote(WSL_GSV_ROOT)}; "
-        + f"{WSL_PYTHON} -s GPT_SoVITS/prepare_datasets/1-get-text.py; "
+        + f"{shquote(WSL_PYTHON)} -s GPT_SoVITS/prepare_datasets/1-get-text.py; "
         + f"cp {shquote(opt_dir)}/2-name2text-0.txt {shquote(opt_dir)}/2-name2text.txt; "
-        + f"{WSL_PYTHON} -s GPT_SoVITS/prepare_datasets/2-get-hubert-wav32k.py; "
-        + f"{WSL_PYTHON} -s GPT_SoVITS/prepare_datasets/3-get-semantic.py; "
+        + f"{shquote(WSL_PYTHON)} -s GPT_SoVITS/prepare_datasets/2-get-hubert-wav32k.py; "
+        + f"{shquote(WSL_PYTHON)} -s GPT_SoVITS/prepare_datasets/2-get-sv.py; "
+        + f"{shquote(WSL_PYTHON)} -s GPT_SoVITS/prepare_datasets/3-get-semantic.py; "
         + f"printf 'item_name\\tsemantic_audio\\n' > {shquote(opt_dir)}/6-name2semantic.tsv; "
         + f"cat {shquote(opt_dir)}/6-name2semantic-0.tsv >> {shquote(opt_dir)}/6-name2semantic.tsv; "
         + f"echo Training features ready for {shquote(model_name)}."
     )
     proc = ManagedProcess(
         f"Prepare {descriptor['name']} for {model_name}",
-        ["wsl", "-d", WSL_DISTRO, "--", "bash", "-lc", script],
+        wsl_command(script),
     )
     with STATE_LOCK:
         current = JOBS.get("dataset-prepare")
@@ -1203,24 +1266,14 @@ def prepare_voicechanger_job(dataset_id, copy_to_applio=True):
 
 
 def start_applio():
-    if not APPLIO_ENV_PYTHON.exists():
-        raise RuntimeError("Applio is cloned but not installed yet. Run Install-Applio-Voice-Changer.bat first.")
-    if not voicechanger_status()["hip_runtime_found"]:
-        raise RuntimeError("Windows AMD HIP SDK is missing. Install AMD HIP SDK for Windows.")
     if realtime_ready():
         log(f"Live voice changer engine is already running at {RVC_REALTIME_URL}.")
         return
-    prefix = (
-        "set PYTHONNOUSERSITE=1&& "
-        "set PYTHONUNBUFFERED=1&& "
-        "set CUDA_VISIBLE_DEVICES=0&& "
-        "set HIP_VISIBLE_DEVICES=0&& "
-        "set UV_CACHE_DIR=E:\\projects\\.cache\\uv&& "
-        "set PIP_CACHE_DIR=E:\\projects\\.cache\\pip&& "
-        f"set TEMP=E:\\projects\\.tmp&& set TMP=E:\\projects\\.tmp&& "
-        f"set PATH={AMD_HIP_BIN};{APPLIO_TORCH_LIB};%PATH%&& "
+    proc = ManagedProcess(
+        "live voice changer engine",
+        applio_command("app.py", "--client", "--server-name", "127.0.0.1", "--port", "6970"),
+        cwd=APPLIO_ROOT, env=applio_environment(),
     )
-    proc = ManagedProcess("live voice changer engine", ["cmd", "/c", prefix + "env\\Scripts\\python.exe app.py --client --server-name 127.0.0.1 --port 6970"], cwd=APPLIO_ROOT)
     with STATE_LOCK:
         current = JOBS.get("applio")
         if current and current.process and current.process.poll() is None:
@@ -1233,15 +1286,12 @@ def start_applio():
 def install_applio_job():
     installer = APPLIO_ROOT / "run-install.bat"
     if not installer.exists():
-        raise RuntimeError("Applio is not cloned at E:\\projects\\Applio.")
-    proc = ManagedProcess("Applio install", ["cmd", "/c", str(installer)], cwd=APPLIO_ROOT)
-    with STATE_LOCK:
-        current = JOBS.get("applio-install")
-        if current and current.process and current.process.poll() is None:
-            raise RuntimeError("Applio install is already running.")
-        JOBS["applio-install"] = proc
-    proc.start()
-    log("Applio install started. This may take a while.")
+        raise RuntimeError(f"Applio is not installed at {APPLIO_ROOT}. See voicechanger/README.md.")
+    subprocess.Popen(
+        ["cmd", "/c", str(installer)], cwd=APPLIO_ROOT,
+        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+    )
+    log("Complete the Applio installer in its terminal, then restart the dashboard.")
 
 
 def start_rvc_training(model_name, epochs=100, batch_size=4, save_every=25, fresh=True):
@@ -1263,24 +1313,6 @@ def start_rvc_training(model_name, epochs=100, batch_size=4, save_every=25, fres
             current_epoch = max(current_epoch, int(match.group(1)))
     target_epoch = current_epoch + epoch_increment
     save_every = max(1, min(int(save_every), epoch_increment))
-    prefix = (
-        "set PYTHONNOUSERSITE=1&& "
-        "set PYTHONUNBUFFERED=1&& "
-        "set CUDA_VISIBLE_DEVICES=0&& "
-        "set HIP_VISIBLE_DEVICES=0&& "
-        "set OMP_NUM_THREADS=4&& "
-        "set MKL_NUM_THREADS=4&& "
-        "set NUMEXPR_MAX_THREADS=4&& "
-        f"set UV_CACHE_DIR={CACHE_DIR}\\uv&& "
-        f"set PIP_CACHE_DIR={CACHE_DIR}\\pip&& "
-        f"set TEMP={TMP_DIR}&& "
-        f"set TMP={TMP_DIR}&& "
-        "set MIOPEN_FIND_MODE=2&& "
-        "set MIOPEN_FIND_ENFORCE=1&& "
-        f"set MIOPEN_USER_DB_PATH={CACHE_DIR}\\miopen&& "
-        f"set MIOPEN_CUSTOM_CACHE_DIR={CACHE_DIR}\\miopen-kernels&& "
-        f"set PATH={AMD_HIP_BIN};{APPLIO_TORCH_LIB};%PATH%&& "
-    )
     args = [
         model_name,
         str(save_every),
@@ -1297,16 +1329,17 @@ def start_rvc_training(model_name, epochs=100, batch_size=4, save_every=25, fres
         "HiFi-GAN",
         "False",
     ]
-    quoted_args = " ".join(f'"{arg}"' if " " in arg else arg for arg in args)
-    command = prefix + f'env\\Scripts\\python.exe -u rvc\\train\\train.py {quoted_args}'
-    proc = ManagedProcess("RVC training", ["cmd", "/c", command], cwd=APPLIO_ROOT)
+    proc = ManagedProcess(
+        "RVC training", applio_command("-u", "rvc/train/train.py", *args),
+        cwd=APPLIO_ROOT, env=applio_environment(),
+    )
     with STATE_LOCK:
         current = JOBS.get("train-rvc")
         if current and current.process and current.process.poll() is None:
             raise RuntimeError("RVC training is already running.")
         JOBS["train-rvc"] = proc
     proc.start()
-    log(f"RVC GPU training started: +{epoch_increment} epoch(s), target_epoch={target_epoch}, batch={batch_size}, save_every={save_every}.")
+    log(f"RVC training started: +{epoch_increment} epoch(s), target_epoch={target_epoch}, batch={batch_size}, save_every={save_every}.")
 
 
 def start_rvc_index(model_name, index_algorithm="Auto"):
@@ -1315,20 +1348,11 @@ def start_rvc_index(model_name, index_algorithm="Auto"):
         raise RuntimeError("Applio is not installed.")
     if not (model_dir / "extracted").exists():
         raise RuntimeError("RVC features are missing. Run preprocessing and extraction first.")
-    prefix = (
-        "set PYTHONNOUSERSITE=1&& "
-        "set PYTHONUNBUFFERED=1&& "
-        f"set UV_CACHE_DIR={CACHE_DIR}\\uv&& "
-        f"set PIP_CACHE_DIR={CACHE_DIR}\\pip&& "
-        f"set TEMP={TMP_DIR}&& "
-        f"set TMP={TMP_DIR}&& "
-        f"set PATH={AMD_HIP_BIN};{APPLIO_TORCH_LIB};%PATH%&& "
+    proc = ManagedProcess(
+        "RVC index",
+        applio_command("-u", "rvc/train/process/extract_index.py", f"logs/{model_name}", index_algorithm),
+        cwd=APPLIO_ROOT, env=applio_environment(),
     )
-    command = (
-        prefix
-        + f'env\\Scripts\\python.exe -u rvc\\train\\process\\extract_index.py logs\\{model_name} {index_algorithm}'
-    )
-    proc = ManagedProcess("RVC index", ["cmd", "/c", command], cwd=APPLIO_ROOT)
     with STATE_LOCK:
         current = JOBS.get("rvc-index")
         if current and current.process and current.process.poll() is None:
@@ -1403,24 +1427,24 @@ def start_train(kind, epochs, batch_size, save_every, dataset_id="", model_name=
     if kind == "gpt":
         config_path = write_s1_config(epochs, batch_size, save_every, model_name)
         script = (
-            "ulimit -l 2097152; "
+            voice_environment() + "ulimit -l 2097152; "
             f"cd {shquote(WSL_GSV_ROOT)} && "
-            f"{WSL_PYTHON} -s GPT_SoVITS/s1_train.py --config_file {shquote(config_path)}"
+            f"{shquote(WSL_PYTHON)} -s GPT_SoVITS/s1_train.py --config_file {shquote(config_path)}"
         )
         stop_script = "pkill -f 'GPT_SoVITS/s1_train.py' || true"
         name = f"GPT training: {model_name}"
     elif kind == "sovits":
         config_path = write_s2_config(epochs, batch_size, save_every, model_name)
         script = (
-            "ulimit -l 2097152; "
+            voice_environment() + "ulimit -l 2097152; "
             f"cd {shquote(WSL_GSV_ROOT)} && "
-            f"{WSL_PYTHON} -s GPT_SoVITS/s2_train.py --config {shquote(config_path)}"
+            f"{shquote(WSL_PYTHON)} -s GPT_SoVITS/s2_train.py --config {shquote(config_path)}"
         )
         stop_script = "pkill -f 'GPT_SoVITS/s2_train.py' || true"
         name = f"SoVITS training: {model_name}"
     else:
         raise ValueError("Unknown training kind.")
-    proc = ManagedProcess(name, ["wsl", "-d", WSL_DISTRO, "--", "bash", "-lc", script], stop_script=stop_script)
+    proc = ManagedProcess(name, wsl_command(script), stop_script=stop_script)
     key = f"train-{kind}"
     with STATE_LOCK:
         current = JOBS.get(key)
@@ -2188,7 +2212,7 @@ HTML = r"""<!doctype html>
     .setup-state { text-transform: uppercase; font-size: 11px; letter-spacing: .07em; color: var(--muted); }
     .setup-state.ready { color: var(--good); }
     .setup-state.missing { color: var(--bad); }
-    .setup-state.needs_configuration, .setup-state.needs_browser_check { color: var(--warn); }
+    .setup-state.needs_configuration, .setup-state.needs_browser_check, .setup-state.cpu { color: var(--warn); }
     .training-project { border: 1px solid var(--line-subtle); background: var(--field); padding: var(--space-4); }
     .upload-list { display: grid; gap: var(--space-2); max-height: 310px; overflow: auto; margin-top: var(--space-3); }
     .upload-row { display: grid; grid-template-columns: minmax(150px,.7fr) minmax(260px,1.5fr); gap: var(--space-2); align-items: center; border: 1px solid var(--line-subtle); padding: var(--space-2); background: #101214; }
@@ -4641,14 +4665,14 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
           asr_environment: "Speech recognition",
           asr_model_cache: "ASR model cache",
           ptt_helper: "Global PTT helper",
-          gpu: "GPU acceleration",
+          gpu: "Voice engine device",
           microphone: "Microphone",
           audio_output: "Audio outputs",
           vb_cable: "VB-CABLE / audio"
         };
         let ready = 0;
         Object.entries(checks).forEach(([key, check]) => {
-          if (check.status === "ready") ready += 1;
+          if (check.status === "ready" || check.status === "cpu") ready += 1;
           const row = document.createElement("div");
           row.className = "setup-row";
           const name = document.createElement("strong");
@@ -4702,8 +4726,8 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
         const liveIndexOld = $("liveRvcIndex").value;
         $("vcDatasetChip").textContent = `RVC dataset: ${vc.wav_count} wavs / ${vc.minutes} min`;
         $("vcDatasetChip").className = vc.wav_count > 0 && vc.wav_count === vc.manifest_rows ? "status-line good" : "status-line bad";
-        $("applioChip").textContent = vc.realtime_ready ? "Live engine ready" : (vc.applio_installed ? (vc.hip_runtime_found ? "Engine off, RVC GPU ready" : "Engine off, needs HIP SDK") : (vc.applio_cloned ? "Applio needs install" : "Applio not cloned"));
-        $("applioChip").className = vc.realtime_ready ? "status-line good" : (vc.applio_installed && vc.hip_runtime_found ? "status-line" : "status-line warn");
+        $("applioChip").textContent = vc.realtime_ready ? "Live engine ready" : (vc.applio_installed ? `Engine off (${vc.applio_backend})` : (vc.applio_cloned ? "Applio needs install" : "Applio not cloned"));
+        $("applioChip").className = vc.realtime_ready ? "status-line good" : (vc.applio_installed ? "status-line" : "status-line warn");
         $("vcPath").textContent = vc.applio_dataset ? `Copied to ${vc.applio_root}\\assets\\datasets\\${vc.dataset_name}` : vc.dataset_dir;
         $("rvcFeatureStatus").textContent = `RVC features: ${vc.sliced_count} audio / ${vc.feature_count} embeddings / ${vc.f0_count} pitch / ${vc.filelist_rows} filelist rows`;
         const rvcRunning = (vc.training_pids || []).length > 0;
