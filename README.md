@@ -59,7 +59,7 @@ For AMD, follow [GPT-SoVITS's ROCm setup](https://github.com/RVC-Boss/GPT-SoVITS
 In a normal Windows PowerShell:
 
 ```text
-git clone https://github.com/scriptogre/local-voice-systems.git
+git clone https://github.com/alexandru-tanul/local-voice-systems.git
 cd local-voice-systems
 Copy-Item config.example.json config.json
 ```
@@ -93,4 +93,4 @@ python -m unittest discover -s tests
 
 CI checks Windows and Linux. CPU synthesis was tested in Ubuntu; Windows GPU execution remains unverified.
 
-[Upstream dashboard](https://github.com/alexandru-tanul/local-voice-systems) · [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) · [faster-whisper](https://github.com/SYSTRAN/faster-whisper) · [MIT](LICENSE)
+[GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) · [faster-whisper](https://github.com/SYSTRAN/faster-whisper) · [MIT](LICENSE)
