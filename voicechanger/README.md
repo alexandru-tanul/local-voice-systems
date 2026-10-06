@@ -1,38 +1,26 @@
-# Live voice changer (experimental)
+# Voice changer
 
-The dashboard's TTS pages turn typed or spoken text into a trained voice. The
-Voice Changer page is different: it converts your microphone in real time, so
-your words and timing stay yours and only the voice colour changes. It uses an
-RVC model trained and served by [Applio](https://github.com/IAHispano/Applio).
+[Clone Applio](https://github.com/IAHispano/Applio), run `run-install.bat` on Windows, then set `applio_root` in `config.json` to its folder.
+Restart the dashboard. Applio uses its own Python and GPU packages.
 
-## Folder contents
+| Hardware | Setup |
+| --- | --- |
+| NVIDIA GTX 16 / RTX | Use Applio's CUDA install. No AMD SDK needed. |
+| NVIDIA Pascal / Volta | Replace its PyTorch packages with CUDA 12.6 using the command below. |
+| CPU | Set `applio_backend` to `cpu`. Live conversion may be slow. |
+| AMD | Follow [Applio's AMD guide](https://docs.applio.org/getting-started/installation/#amd-gpu-support-windows). For ZLUDA, set `applio_backend` to `zluda` and `amd_hip_bin` to the HIP `bin` folder. |
+
+For Pascal/Volta, run from Applio's folder after its installer:
 
 ```text
-voicechanger/rvc_dataset/<name>/     clips converted for RVC training (ignored by git)
-voicechanger/<name>_rvc_manifest.csv what was kept, with durations (ignored by git)
+.\env\python.exe -m uv pip install --python .\env\python.exe "torch==2.11.0+cu126" "torchaudio==2.11.0+cu126" --index-url https://download.pytorch.org/whl/cu126
 ```
 
-`<name>` is the dataset id without hyphens, so the dataset `station-announcer`
-becomes `stationannouncer`, and the default RVC model name is
-`stationannouncer_rvc_32k`.
+On the dashboard's **Voice Changer** page:
 
-## Workflow
+1. Choose a dataset and press **Prepare RVC Dataset**.
+2. In Applio, preprocess and extract features for the shown model name. Use RVC v2, F0, and 32 kHz.
+3. Press **Start RVC Training** with batch size 1, then **Build Index**.
+4. Press **Start Live Engine**, choose the microphone, output, model, and index, then **Start Live Voice**.
 
-1. Build a dataset on the TTS Training page, or with `import_dataset.py`.
-2. On the Voice Changer page, choose the source dataset and press
-   **Prepare RVC Dataset**. The clips are converted and copied into Applio's
-   `assets/datasets/<name>/` folder when Applio is installed.
-3. Run Applio's preprocessing and feature extraction for the model name shown
-   on the page, then press **Start RVC Training** and later **Build Index**.
-4. Press **Start Live Engine**, choose the microphone, output, model, and
-   index, and press **Start Live Voice**.
-
-Route the output into a virtual microphone such as VB-CABLE to use the voice
-in other applications.
-
-## Starting points
-
-- Model version RVC v2, F0 enabled, pitch extraction RMVPE, 32 kHz.
-- Batch size 1 or 2 on consumer GPUs, 50 to 150 epochs, then listen.
-- For real time, start with a larger chunk size for stability and lower it
-  for latency once it runs cleanly. Use headphones to avoid feedback.
+Use headphones. Stop GPT-SoVITS if GPU memory is tight.

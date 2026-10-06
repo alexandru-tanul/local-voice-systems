@@ -13,7 +13,7 @@ try {
     # Expected when the dashboard is not running yet.
 }
 
-# Python lookup order: config.json "dashboard_python", a local .venv, then python or py on PATH.
+# Python lookup order: config.json "dashboard_python", relay_env, a local .venv, then python or py on PATH.
 $pythonCandidates = @()
 $configPath = Join-Path $projectRoot 'config.json'
 if (Test-Path -LiteralPath $configPath) {
@@ -24,6 +24,7 @@ if (Test-Path -LiteralPath $configPath) {
         Write-Warning 'config.json could not be parsed; continuing with the default Python lookup.'
     }
 }
+$pythonCandidates += (Join-Path $projectRoot 'relay_env\Scripts\python.exe')
 $pythonCandidates += (Join-Path $projectRoot '.venv\Scripts\python.exe')
 $python = $pythonCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
 if (-not $python) {
@@ -35,8 +36,11 @@ if (-not $python) {
     if ($pyLauncher) { $python = $pyLauncher.Source }
 }
 if (-not $python) {
-    throw 'Python was not found. Install Python 3.11 or newer, or set "dashboard_python" in config.json.'
+    throw 'Python was not found. Install 64-bit Python 3.12, or set "dashboard_python" in config.json.'
 }
+
+& $python -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)"
+if ($LASTEXITCODE -ne 0) { throw 'Python 3.12 or newer is required. Run Setup-Relay-Env.bat first.' }
 
 $stdoutLog = Join-Path $projectRoot 'voice_dashboard.out.log'
 $stderrLog = Join-Path $projectRoot 'voice_dashboard.err.log'

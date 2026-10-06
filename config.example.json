@@ -1,12 +1,9 @@
 {
-  "dashboard_python": "",
   "wsl_distro": "Ubuntu-24.04",
-  "wsl_gpt_sovits_root": "/root/GPT-SoVITS",
-  "wsl_python": "/root/gsv-venv/bin/python",
-  "wsl_datasets_root": "/root/datasets",
-  "asr_model_dir": "",
-  "cache_dir": "",
-  "tmp_dir": "",
-  "applio_root": "D:\\projects\\Applio",
-  "amd_hip_bin": "C:\\Program Files\\AMD\\ROCm\\6.4\\bin"
+  "wsl_gpt_sovits_root": "/home/YOUR_WSL_USER/GPT-SoVITS",
+  "wsl_python": "/home/YOUR_WSL_USER/miniforge3/envs/gsv/bin/python",
+  "wsl_datasets_root": "/home/YOUR_WSL_USER/voice-datasets",
+  "tts_device": "cuda",
+  "tts_precision": "fp32",
+  "applio_root": ""
 }

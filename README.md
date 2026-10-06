@@ -1,6 +1,9 @@
 # Local Voice Systems
 
 Speak or type, then hear the words in a reference voice. Runs locally after model downloads.
+
+![Generate screen in Local Voice Systems](docs/screenshot.png)
+
 Requires **Windows 10/11 x64 + WSL2**, Python 3.12, FFmpeg on PATH, and Chrome or Edge.
 The dashboard does not support native Linux, macOS, or Windows ARM. CPU mode works but is slow.
 
