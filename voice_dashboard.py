@@ -887,7 +887,9 @@ def setup_status():
         )
         result = run_wsl(f"{shquote(WSL_PYTHON)} -c {shquote(probe)}", timeout=60)
         if result.returncode:
-            raise RuntimeError(result.stderr.strip())
+            # wsl.exe reports its own failures on stdout in UTF-16, so fall back to that.
+            message = result.stderr.strip() or result.stdout.replace("\x00", "").strip().split("\n")[0]
+            raise RuntimeError(message or "The voice engine check failed.")
         precision = "FP16" if runtime["is_half"] else "FP32"
         gpu = {"status": "ready", "detail": f"{result.stdout.strip()} ({precision})"}
     except Exception as exc:

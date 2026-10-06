@@ -46,6 +46,13 @@ class DashboardTests(unittest.TestCase):
             check = dashboard.setup_status()["gpu"]
         self.assertEqual(check, {"status": "missing", "detail": "CUDA driver missing"})
 
+    def test_setup_reports_wsl_start_errors(self):
+        message = "WSL2 is unable to start.\n\nEnable virtualization.\n"
+        result = subprocess.CompletedProcess([], 4294967295, "\x00".join(message) + "\x00", "")
+        with patch.object(dashboard, "run_wsl", return_value=result):
+            check = dashboard.setup_status()["gpu"]
+        self.assertEqual(check, {"status": "missing", "detail": "WSL2 is unable to start."})
+
     def test_pretrained_models_need_no_training(self):
         root = self.root / "GPT_SoVITS/pretrained_models"
         (root / "v2Pro").mkdir(parents=True)
