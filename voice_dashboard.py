@@ -4788,7 +4788,8 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
       };
       jobLine("train-sovits", "trainSovitsStatus");
       jobLine("train-gpt", "trainGptStatus");
-      $("trainingJobsStatus").textContent = running ? `${running.name} is running` : "";
+      const trainingJob = ["dataset-sync", "dataset-prepare", "train-sovits", "train-gpt"].map(key => state.jobs[key]).find(job => job && job.status === "running");
+      $("trainingJobsStatus").textContent = trainingJob ? `${trainingJob.name} is running` : "";
       const jobLogs = Object.values(state.jobs || {})
         .filter(job => job.lines && job.lines.length)
         .map(job => [`--- ${job.name}: ${job.status} ---`, ...job.lines].join("\n"))
