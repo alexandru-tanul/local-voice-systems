@@ -75,8 +75,8 @@ Optional keys, for when a port is taken or you want a different setting:
 | `asr_port` | `8792` | Port of speech recognition |
 | `tts_port` | `9880` | Port of the voice engine in WSL |
 | `asr_model` | `base.en` | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) model, for example `small.en` for better accuracy |
-| `asr_model_dir` | `.cache/faster-whisper` | Download folder of the speech model |
-| `cache_dir`, `tmp_dir` | `.cache`, `.cache/tmp` | Download caches and temporary files |
+| `asr_model_dir` | `cache_dir/faster-whisper` | Download folder of the speech model |
+| `cache_dir`, `tmp_dir` | `.cache`, `cache_dir/tmp` | Download caches and temporary files |
 | `dashboard_python` | `relay_env` | Python that runs the dashboard |
 
 Run `Setup-Relay-Env.bat`, then `Launch-Voice-Dashboard.bat`. Open **Setup** to check the selected device.
@@ -85,10 +85,23 @@ Use `Stop-Voice-Dashboard.bat` to stop it. Speech recognition uses CPU and downl
 ## Use
 
 1. On **TTS Training**, create a dataset with a clear 3 to 10 second clip and its exact transcript. Press **Sync & Prepare**.
+   Generate reads clips from the copy in WSL, so sync again after adding clips. **Sync Only** is enough for Generate.
 2. On **Generate**, choose the dataset, reference clip, and pretrained `s1v3.ckpt` / `s2Gv2Pro.pth` models. Enter text and generate audio.
+   **Text language** under **Generation settings** follows the dataset's language.
 3. On **Relay**, press **Start System**, hold push-to-talk, speak, then release. Choose audio output in **Settings**.
+   Relay understands English speech and speaks it in the selected voice, whatever the dataset's language.
 
+Datasets can be English, Chinese, Japanese, Korean, or Cantonese.
 To train a voice, add more clips, prepare the dataset, then train SoVITS and GPT with batch size 1.
+To import a folder of clips at once, with transcripts from a CSV with the columns `file,text`:
+
+```text
+python import_dataset.py --name "My Voice" --audio-dir C:\clips --transcripts C:\clips\lines.csv
+```
+
+Without `--transcripts`, each transcript comes from the file name. Add `--language` for a dataset that is not English.
+
+Generated audio is saved in `outputs`. Relay keeps only its newest 200 lines, in `outputs\relay`.
 Use [VB-CABLE](https://vb-audio.com/Cable/) to send the generated voice to another app.
 
 ## Fix
@@ -103,6 +116,6 @@ Use [VB-CABLE](https://vb-audio.com/Cable/) to send the generated voice to anoth
 python -m unittest discover -s tests
 ```
 
-CI checks Windows and Linux. CPU synthesis was tested in Ubuntu; Windows GPU execution remains unverified.
+CI checks Windows and Linux. Training and generation were tested on Windows 10 with an AMD Radeon RX 7900 XTX, through ROCm in WSL2, and CPU synthesis in Ubuntu. NVIDIA GPUs remain untested.
 
 [GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) · [faster-whisper](https://github.com/SYSTRAN/faster-whisper) · [MIT](LICENSE)
