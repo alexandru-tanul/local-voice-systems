@@ -1,5 +1,7 @@
 import json
 import base64
+import ctypes
+import hashlib
 import io
 import os
 import re
@@ -22,10 +24,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DASHBOARD_PORT = int(os.environ.get("VOICE_DASHBOARD_PORT", "8790"))
 CONFIG_PATH = ROOT / "config.json"
-try:
-    APP_CONFIG = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
-except (OSError, ValueError):
-    APP_CONFIG = {}
+
+
+def load_config(path):
+    """Read config.json. Returns the settings and an error message for the page, or "" when there is none."""
+    if not path.exists():
+        return {}, ""
+    try:
+        config = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        return {}, (
+            f"config.json could not be read ({exc}), so the dashboard is using default paths. "
+            "In Windows paths, write \\\\ or / instead of \\."
+        )
+    if not isinstance(config, dict):
+        return {}, "config.json must contain one JSON object, so the dashboard is using default paths."
+    return config, ""
+
+
+APP_CONFIG, CONFIG_ERROR = load_config(CONFIG_PATH)
 DATASETS_DIR = ROOT / "datasets"
 DATASETS_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR = ROOT / "outputs"
@@ -57,6 +74,8 @@ RVC_REALTIME_URL = "http://127.0.0.1:6970"
 RVC_REALTIME_WS = "ws://127.0.0.1:6970/api/ws-audio"
 MIN_REFERENCE_SECONDS = 3.0
 MAX_REFERENCE_SECONDS = 10.0
+LANGUAGES = {"en", "zh", "ja", "ko", "yue"}
+MODEL_LIST = {"checked_at": 0.0, "listed": False, "models": {"gpt": [], "sovits": []}}
 
 APP_LOG = []
 JOBS = {}
@@ -339,15 +358,54 @@ def model_files():
         rows.sort(key=lambda row: row["mtime"], reverse=True)
         return rows
 
-    return {
+    models = {
         "gpt": collect("GPT_weights_v2Pro", "*.ckpt") + collect("GPT_SoVITS/pretrained_models", "s1v3.ckpt"),
         "sovits": collect("SoVITS_weights_v2Pro", "*.pth") + collect("GPT_SoVITS/pretrained_models/v2Pro", "s2Gv2Pro.pth"),
     }
+    MODEL_LIST.update(models=models, checked_at=time.time(), listed=True)
+    return models
+
+
+def wsl_distro_running():
+    try:
+        result = subprocess.run(
+            ["wsl", "--list", "--running", "--quiet"],
+            capture_output=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    # wsl.exe prints UTF-16 unless WSL_UTF8 is set.
+    text = result.stdout.decode("utf-16-le" if b"\x00" in result.stdout else "utf-8", errors="ignore")
+    return WSL_DISTRO.lower() in {line.strip().lower() for line in text.splitlines()}
+
+
+def polled_model_files(max_age=15):
+    """Model list for the page's 5-second poll.
+
+    It rescans at most every max_age seconds, and only while the distro runs, because reading
+    \\\\wsl.localhost starts a stopped distro. Starting an engine or a check rescans at once."""
+    if time.time() - MODEL_LIST["checked_at"] >= max_age:
+        MODEL_LIST["checked_at"] = time.time()
+        if wsl_distro_running():
+            model_files()
+    return MODEL_LIST["models"]
 
 
 def slugify(value, fallback="dataset"):
     slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
     return (slug or fallback)[:64]
+
+
+def language_code(value):
+    return value if value in LANGUAGES else "en"
+
+
+def dataset_id_for_name(name):
+    """Folder id for a dataset name. A name without Latin letters or digits gets a stable id from its hash."""
+    clean = str(name or "").strip()
+    return slugify(clean, "") or "dataset-" + hashlib.sha1(clean.encode("utf-8")).hexdigest()[:8]
 
 
 def rvc_dataset_name(dataset_id):
@@ -387,7 +445,6 @@ def dataset_descriptor(dataset_id):
         "root": root,
         "list_path": root / f"{dataset_id}.list",
         "wsl_root": f"{WSL_DATASETS_ROOT}/{dataset_id}",
-        "builtin": False,
     }
 
 
@@ -401,7 +458,6 @@ def dataset_summary(descriptor):
     return {
         "id": descriptor["id"],
         "name": descriptor["name"],
-        "builtin": descriptor["builtin"],
         "wav_count": len(wavs),
         "list_rows": len(rows),
         "ready": bool(wavs and len(wavs) == len(rows)),
@@ -424,16 +480,16 @@ def create_dataset(name, speaker="speaker", language="en"):
     clean_name = str(name or "").strip()
     if not clean_name:
         raise RuntimeError("Enter a dataset name.")
-    dataset_id = slugify(clean_name)
+    dataset_id = dataset_id_for_name(clean_name)
     root = DATASETS_DIR / dataset_id
     if root.exists():
-        raise RuntimeError("A dataset with that name already exists.")
+        raise RuntimeError(f"A dataset with the id {dataset_id} already exists. Choose another name.")
     (root / "wavs").mkdir(parents=True)
     manifest = {
         "id": dataset_id,
         "name": clean_name,
         "default_speaker": slugify(speaker, "speaker"),
-        "default_language": language if language in {"en", "zh", "ja", "ko", "yue"} else "en",
+        "default_language": language_code(language),
         "created_at": time.time(),
         "entries": [],
     }
@@ -453,7 +509,7 @@ def write_dataset_manifest(root, manifest):
         wav_name = entry["wav"]
         text = str(entry["text"]).replace("|", " ").strip()
         speaker = slugify(entry.get("speaker"), "speaker")
-        language = entry.get("language") if entry.get("language") in {"en", "zh", "ja", "ko", "yue"} else "en"
+        language = language_code(entry.get("language"))
         list_rows.append(f"wavs/{wav_name}|{speaker}|{language}|{text}")
         metadata_rows.append(f"{Path(wav_name).stem}|{text}|{text}")
     ending = "\n" if list_rows else ""
@@ -574,26 +630,9 @@ def voicechanger_status(dataset_id="", model_name=""):
     checkpoint_files.sort(key=lambda row: row["mtime"], reverse=True)
     index_files.sort(key=lambda row: row["mtime"], reverse=True)
 
-    active_pids = []
     try:
-        output = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                (
-                    "Get-CimInstance Win32_Process | "
-                    f"Where-Object {{ $_.Name -notmatch 'powershell|pwsh' -and $_.CommandLine -match '{model_name}|rvc\\\\train\\\\train.py|rvc/train/train.py|extract_index.py' }} | "
-                    "Select-Object -ExpandProperty ProcessId"
-                ),
-            ],
-            text=True,
-            capture_output=True,
-            timeout=4,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        active_pids = [int(line.strip()) for line in output.stdout.splitlines() if line.strip().isdigit()]
-    except Exception:
+        active_pids = rvc_process_ids(model_name)
+    except (OSError, subprocess.SubprocessError):
         active_pids = []
 
     return {
@@ -626,28 +665,44 @@ def voicechanger_status(dataset_id="", model_name=""):
     }
 
 
-def realtime_ready():
-    try:
-        with socket.create_connection(("127.0.0.1", 6970), timeout=0.2):
+class TcpInitialRtoParameters(ctypes.Structure):
+    _fields_ = [("Rtt", ctypes.c_ushort), ("MaxSynRetransmissions", ctypes.c_ubyte)]
+
+
+def port_open(port, timeout=0.2):
+    """True when something accepts connections on 127.0.0.1:port.
+
+    Windows retries a refused connection until the timeout, so each check of a stopped service
+    took the full timeout. With SYN retransmissions turned off, a refusal returns at once."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        if os.name == "nt":
+            # SIO_TCP_INITIAL_RTO with TCP_INITIAL_RTO_UNSPECIFIED_RTT and
+            # TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS, from mstcpip.h. If the call fails, the
+            # connect still works and only waits longer.
+            params = TcpInitialRtoParameters(0xFFFF, 0xFE)
+            ctypes.windll.ws2_32.WSAIoctl(
+                ctypes.c_size_t(sock.fileno()), ctypes.c_ulong(0x98000011),
+                ctypes.byref(params), ctypes.c_ulong(ctypes.sizeof(params)),
+                None, ctypes.c_ulong(0), ctypes.byref(ctypes.c_ulong()), None, None,
+            )
+        sock.settimeout(timeout)
+        try:
+            sock.connect(("127.0.0.1", port))
             return True
-    except Exception:
-        return False
+        except OSError:
+            return False
+
+
+def realtime_ready():
+    return port_open(6970)
 
 
 def api_ready():
-    try:
-        with socket.create_connection(("127.0.0.1", 9880), timeout=0.2):
-            return True
-    except Exception:
-        return False
+    return port_open(9880)
 
 
 def relay_asr_ready():
-    try:
-        with socket.create_connection(("127.0.0.1", 8792), timeout=0.2):
-            return True
-    except Exception:
-        return False
+    return port_open(8792)
 
 
 def start_relay_asr():
@@ -896,6 +951,10 @@ def setup_status():
         gpu["detail"] = str(exc)
 
     return {
+        "config": {
+            "status": "needs_configuration" if CONFIG_ERROR else ("ready" if CONFIG_PATH.exists() else "missing"),
+            "detail": CONFIG_ERROR or str(CONFIG_PATH),
+        },
         "dashboard_python": {
             "status": "ready" if Path(sys.executable).exists() else "missing",
             "detail": sys.executable,
@@ -1091,7 +1150,7 @@ def start_api(gpt_path, sovits_path):
     script = (
         voice_environment() + "ulimit -l 2097152; "
         f"cd {shquote(WSL_GSV_ROOT)} && "
-        f"{shquote(WSL_PYTHON)} api_v2.py -a 0.0.0.0 -p 9880 -c {shquote(config_path)}"
+        f"{shquote(WSL_PYTHON)} api_v2.py -a 127.0.0.1 -p 9880 -c {shquote(config_path)}"
     )
     API_PROCESS = ManagedProcess(
         "inference engine",
@@ -1125,7 +1184,8 @@ def set_api_weights(gpt_path, sovits_path):
         ("set_gpt_weights", gpt_path, API_GPT_PATH),
         ("set_sovits_weights", sovits_path, API_SOVITS_PATH),
     ]:
-        if path == loaded:
+        # No path, as when the page has not listed models yet, keeps the loaded weights.
+        if not path or path == loaded:
             continue
         started = time.time()
         url = API_URL + "/" + endpoint + "?" + urllib.parse.urlencode({"weights_path": path})
@@ -1195,9 +1255,12 @@ def sync_dataset_job(dataset_id):
     summary = dataset_summary(descriptor)
     if not summary["ready"]:
         raise RuntimeError("The selected dataset needs matching audio files and transcript rows before it can be synced.")
+    # ": dataset-sync" is a no-op that puts a name for pkill into this shell's command line. The
+    # brackets in each pkill pattern keep it from matching the command line of the stop shell itself.
     proc = ManagedProcess(
         f"Sync {descriptor['name']}",
-        wsl_command(dataset_sync_script(descriptor)),
+        wsl_command(": dataset-sync; " + dataset_sync_script(descriptor)),
+        stop_script="pkill -f '[d]ataset-sync; ' || true",
     )
     with STATE_LOCK:
         current = JOBS.get("dataset-sync")
@@ -1248,6 +1311,8 @@ def prepare_tts_dataset_job(dataset_id, model_name):
     proc = ManagedProcess(
         f"Prepare {descriptor['name']} for {model_name}",
         wsl_command(script),
+        # Matches this job's shell, whose command line names the scripts, and each running script.
+        stop_script="pkill -f '[G]PT_SoVITS/prepare_datasets/' || true",
     )
     with STATE_LOCK:
         current = JOBS.get("dataset-prepare")
@@ -1302,7 +1367,7 @@ def install_applio_job():
     log("Complete the Applio installer in its terminal, then restart the dashboard.")
 
 
-def start_rvc_training(model_name, epochs=100, batch_size=4, save_every=25, fresh=True):
+def start_rvc_training(model_name, epochs=100, batch_size=1, save_every=25, fresh=True):
     epoch_increment = max(1, min(int(epochs), 200))
     batch_size = max(1, min(int(batch_size), 2))
     model_dir = APPLIO_ROOT / "logs" / model_name
@@ -1314,11 +1379,15 @@ def start_rvc_training(model_name, epochs=100, batch_size=4, save_every=25, fres
     pretrain_d = APPLIO_ROOT / "rvc" / "models" / "pretraineds" / "hifi-gan" / f"f0D{RVC_SAMPLE_RATE // 1000}k.pth"
     if not pretrain_g.exists() or not pretrain_d.exists():
         raise RuntimeError("RVC pretrained files are missing.")
+    # Applio resumes from the G_/D_ checkpoints when they exist. "fresh" is Applio's cleanup
+    # argument, which deletes them, so training starts again at epoch 1 and the target is the
+    # requested epoch count alone.
     current_epoch = 0
-    for checkpoint in model_dir.glob(f"{model_name}_*e_*s.pth"):
-        match = re.search(r"_(\d+)e_\d+s\.pth$", checkpoint.name)
-        if match:
-            current_epoch = max(current_epoch, int(match.group(1)))
+    if not fresh and any(model_dir.glob("G_*.pth")):
+        for checkpoint in model_dir.glob(f"{model_name}_*e_*s.pth"):
+            match = re.search(r"_(\d+)e_\d+s\.pth$", checkpoint.name)
+            if match:
+                current_epoch = max(current_epoch, int(match.group(1)))
     target_epoch = current_epoch + epoch_increment
     save_every = max(1, min(int(save_every), epoch_increment))
     args = [
@@ -1347,7 +1416,7 @@ def start_rvc_training(model_name, epochs=100, batch_size=4, save_every=25, fres
             raise RuntimeError("RVC training is already running.")
         JOBS["train-rvc"] = proc
     proc.start()
-    log(f"RVC training started: +{epoch_increment} epoch(s), target_epoch={target_epoch}, batch={batch_size}, save_every={save_every}.")
+    log(f"RVC training started: {'new run' if fresh else 'resumed'}, target_epoch={target_epoch}, batch={batch_size}, save_every={save_every}.")
 
 
 def start_rvc_index(model_name, index_algorithm="Auto"):
@@ -1370,27 +1439,78 @@ def start_rvc_index(model_name, index_algorithm="Auto"):
     log(f"RVC index generation started: {index_algorithm}.")
 
 
+RVC_PROCESS_SCRIPT = r"""
+$all = @(Get-CimInstance Win32_Process)
+$skip = @($PID, __DASHBOARD_PID__)
+$found = @{}
+foreach ($p in $all) {
+    if ($skip -notcontains $p.ProcessId -and $p.Name -notmatch '^(powershell|pwsh)' -and $p.CommandLine -match '__PATTERN__') {
+        $found[[int]$p.ProcessId] = $p.CreationDate
+    }
+}
+if (__STOP__) {
+    # Add child processes, such as multiprocessing workers. A child must have started after its
+    # parent, so a process whose parent ID was later reused by a matched process is left alone.
+    do {
+        $added = 0
+        foreach ($p in $all) {
+            $id = [int]$p.ProcessId
+            $parent = [int]$p.ParentProcessId
+            if (-not $found.ContainsKey($id) -and $skip -notcontains $id -and $found.ContainsKey($parent) -and $p.CreationDate -ge $found[$parent]) {
+                $found[$id] = $p.CreationDate
+                $added++
+            }
+        }
+    } while ($added)
+    foreach ($id in $found.Keys) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
+}
+$found.Keys
+"""
+
+
+def run_powershell(script, timeout):
+    # -EncodedCommand takes the script as base64 UTF-16, so its quotes and backslashes need no escaping.
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
+def rvc_process_pattern(model_name=""):
+    """Regex for the command lines of Applio training, feature, and index processes.
+
+    It matches Applio's script paths, and the model's logs folder only as a whole path part,
+    never the bare model name, so a short name such as "voice" cannot select other programs."""
+    patterns = [r"rvc[\\/]train[\\/]train\.py", r"extract_index\.py"]
+    model_name = re.sub(r"[^A-Za-z0-9_-]", "", str(model_name or ""))
+    if model_name:
+        patterns.append(rf"(^|[\s\x22\x27\\/])logs[\\/]{model_name}($|[\s\x22\x27\\/])")
+    return "|".join(patterns)
+
+
+def rvc_process_ids(model_name="", stop=False, timeout=4):
+    """PIDs of running Applio training, feature, and index processes. stop=True also ends them and their children."""
+    script = (
+        RVC_PROCESS_SCRIPT.replace("__PATTERN__", rvc_process_pattern(model_name))
+        .replace("__DASHBOARD_PID__", str(os.getpid()))
+        .replace("__STOP__", "$true" if stop else "$false")
+    )
+    result = run_powershell(script, timeout)
+    return [int(line) for line in result.stdout.split() if line.isdigit()]
+
+
 def stop_rvc_training_children(model_name=""):
-    model_name = re.sub(r"[^A-Za-z0-9_-]", "", str(model_name or "")) or "_rvc_"
     try:
-        subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                (
-                    "Get-CimInstance Win32_Process | "
-                    f"Where-Object {{ $_.Name -notmatch 'powershell|pwsh' -and $_.CommandLine -match '{model_name}|rvc\\\\train\\\\train.py|rvc/train/train.py|extract_index.py|zluda.exe' }} | "
-                    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
-                ),
-            ],
-            text=True,
-            capture_output=True,
-            timeout=8,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except Exception as exc:
+        stopped = rvc_process_ids(model_name, stop=True, timeout=8)
+    except (OSError, subprocess.SubprocessError) as exc:
         log(f"Could not clean up RVC child processes: {exc}")
+        return
+    if stopped:
+        log(f"Stopped RVC process(es) {', '.join(map(str, sorted(stopped)))}.")
 
 
 def stop_applio_children():
@@ -1473,15 +1593,11 @@ def read_json(handler):
 
 
 def latest_log_text():
+    # Job output reaches the page in the "jobs" snapshots. The inference engine is not a job,
+    # so its output is added here.
     chunks = []
     with STATE_LOCK:
         chunks.extend(APP_LOG[-80:])
-        for key in ["dataset-build", "dataset-sync", "train-sovits", "train-gpt", "api", "relay-asr"]:
-            proc = JOBS.get(key)
-            if proc:
-                chunks.append("")
-                chunks.append(f"--- {proc.name}: {proc.status} ---")
-                chunks.extend(proc.lines[-180:])
         if API_PROCESS:
             chunks.append("")
             chunks.append(f"--- {API_PROCESS.name}: {API_PROCESS.status} ---")
@@ -1492,6 +1608,18 @@ def latest_log_text():
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
+
+    def request_allowed(self):
+        """Accept requests addressed to this dashboard, sent by its own page or by a local tool.
+
+        The Host check stops DNS rebinding, where another site's name resolves to 127.0.0.1.
+        The Origin check stops other sites' pages; local tools such as ptt_helper.py send no Origin."""
+        port = self.server.server_address[1]
+        hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if self.headers.get("Host", "").lower() not in hosts:
+            return False
+        origin = self.headers.get("Origin")
+        return origin is None or origin.lower() in {f"http://{host}" for host in hosts}
 
     def send_json(self, data, status=200):
         body = json.dumps(data).encode("utf-8")
@@ -1512,6 +1640,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if not self.request_allowed():
+            self.send_error(403)
+            return
         parsed_url = urllib.parse.urlparse(self.path)
         path = parsed_url.path
         if path == "/":
@@ -1563,13 +1694,15 @@ class Handler(BaseHTTPRequestHandler):
             rvc_dataset = query.get("rvc_dataset", [""])[0]
             if rvc_dataset not in dataset_ids:
                 rvc_dataset = dataset_id
-            models = model_files()
+            all_references = parse_references(dataset_id, valid_only=False)
             data = {
+                "config_error": CONFIG_ERROR,
                 "datasets": datasets,
                 "reference_dataset": dataset_id,
-                "models": models,
-                "references": parse_references(dataset_id),
-                "all_references": parse_references(dataset_id, valid_only=False),
+                "models": polled_model_files(),
+                "models_listed": MODEL_LIST["listed"],
+                "references": [ref for ref in all_references if ref["valid_reference"]],
+                "all_references": all_references,
                 "api_ready": api_ready(),
                 "relay_asr_ready": relay_asr_ready(),
                 "voicechanger": voicechanger_status(rvc_dataset, query.get("rvc_model", [""])[0]) if section in ("", "voicechanger") else None,
@@ -1590,6 +1723,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_HEAD(self):
+        if not self.request_allowed():
+            self.send_error(403)
+            return
         path = urllib.parse.urlparse(self.path).path
         if path.startswith("/datasets/"):
             self.serve_file(DATASETS_DIR / path[len("/datasets/") :], send_body=False)
@@ -1603,7 +1739,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             full = path.resolve()
             allowed = [DATASETS_DIR.resolve(), OUTPUT_DIR.resolve()]
-            if not any(str(full).startswith(str(root)) for root in allowed):
+            if not any(full.is_relative_to(root) for root in allowed):
                 self.send_error(403)
                 return
             if not full.exists() or not full.is_file():
@@ -1620,8 +1756,11 @@ class Handler(BaseHTTPRequestHandler):
                 start_text, _, end_text = range_header[6:].partition("-")
                 if start_text:
                     start = int(start_text)
-                if end_text:
-                    end = int(end_text)
+                    if end_text:
+                        end = int(end_text)
+                elif end_text:
+                    # "bytes=-N" asks for the last N bytes.
+                    start = max(file_size - int(end_text), 0)
                 end = min(end, file_size - 1)
                 if start > end:
                     self.send_error(416)
@@ -1649,14 +1788,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(500, str(exc))
 
     def do_POST(self):
+        if not self.request_allowed():
+            self.send_error(403)
+            return
         path = urllib.parse.urlparse(self.path).path
         try:
             body = read_json(self)
             if path == "/api/start-system":
-                models = model_files()
-                gpt = body.get("gpt") or (models["gpt"][0]["path"] if models["gpt"] else "")
-                sovits = body.get("sovits") or (models["sovits"][0]["path"] if models["sovits"] else "")
-                start_system(gpt, sovits, body.get("binding") or "ShiftLeft")
+                # The startup worker picks the newest models when none are given, after WSL is running.
+                start_system(body.get("gpt") or "", body.get("sovits") or "", body.get("binding") or "ShiftLeft")
                 self.send_json({"ok": True})
                 return
             if path == "/api/stop-system":
@@ -1763,7 +1903,7 @@ class Handler(BaseHTTPRequestHandler):
                 start_train(
                     body.get("kind"),
                     int(body.get("epochs", 15)),
-                    int(body.get("batch_size", 8)),
+                    int(body.get("batch_size", 1)),
                     int(body.get("save_every", 5)),
                     body.get("dataset_id") or "",
                     body.get("model_name") or "voice-model",
@@ -1774,7 +1914,7 @@ class Handler(BaseHTTPRequestHandler):
                 start_rvc_training(
                     rvc_model_name(body.get("dataset_id") or default_dataset_id(), body.get("model_name")),
                     int(body.get("epochs", 100)),
-                    int(body.get("batch_size", 4)),
+                    int(body.get("batch_size", 1)),
                     int(body.get("save_every", 25)),
                     bool(body.get("fresh", True)),
                 )
@@ -1787,10 +1927,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/stop-job":
                 key = body.get("key")
                 proc = JOBS.get(key)
+                if key == "train-rvc":
+                    # Stop the trainer's process tree first, while its workers still record it as their
+                    # parent. "stopping" keeps the job from reporting that exit as a failure.
+                    if proc and proc.process and proc.process.poll() is None:
+                        proc.status = "stopping"
+                    stop_rvc_training_children(rvc_model_name(body.get("dataset_id") or default_dataset_id(), body.get("model_name")))
                 if proc:
                     proc.stop()
-                if key == "train-rvc":
-                    stop_rvc_training_children(rvc_model_name(body.get("dataset_id") or default_dataset_id(), body.get("model_name")))
                 if key == "applio":
                     stop_applio_children()
                 self.send_json({"ok": True})
@@ -1799,16 +1943,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not api_ready():
                     self.send_json({"ok": False, "error": "Inference engine is not ready yet."}, 409)
                     return
-                gpt = body["gpt"]
-                sovits = body["sovits"]
-                set_api_weights(gpt, sovits)
+                set_api_weights(body.get("gpt"), body.get("sovits"))
                 payload = {
                     "text": body["text"],
-                    "text_lang": "en",
+                    "text_lang": language_code(body.get("text_lang")),
                     "ref_audio_path": body["ref_audio_path"],
                     "aux_ref_audio_paths": body.get("aux_ref_audio_paths") or [],
                     "prompt_text": body["prompt_text"],
-                    "prompt_lang": "en",
+                    "prompt_lang": language_code(body.get("prompt_lang")),
                     "top_k": int(body.get("top_k", 15)),
                     "top_p": float(body.get("top_p", 0.6)),
                     "temperature": float(body.get("temperature", 0.6)),
@@ -2808,6 +2950,7 @@ HTML = r"""<!doctype html>
             <summary>Generation settings</summary>
             <div class="sub-body">
               <div class="grid3">
+                <div><label for="textLang" title="Language of the text to speak. It follows the voice dataset's language when you choose a dataset.">Text language</label><select id="textLang"><option value="en">English</option><option value="zh">Chinese</option><option value="ja">Japanese</option><option value="ko">Korean</option><option value="yue">Cantonese</option></select></div>
                 <div><label>Slice method</label><select id="splitMethod">
                   <option value="cut5">English punctuation</option>
                   <option value="cut4">Periods only</option>
@@ -2937,7 +3080,7 @@ HTML = r"""<!doctype html>
             <div class="training-project">
               <h4>SoVITS</h4>
               <label for="sovitsEpochs">Total epochs</label><input id="sovitsEpochs" type="number" value="16" min="1" />
-              <label for="sovitsBatch">Batch size</label><input id="sovitsBatch" type="number" value="8" min="1" />
+              <label for="sovitsBatch">Batch size</label><input id="sovitsBatch" type="number" value="1" min="1" />
               <label for="sovitsSave">Save every N epochs</label><input id="sovitsSave" type="number" value="4" min="1" />
               <div class="row" style="margin-top: 10px;">
                 <button id="trainSovits">Train SoVITS</button>
@@ -2948,7 +3091,7 @@ HTML = r"""<!doctype html>
             <div class="training-project">
               <h4>GPT</h4>
               <label for="gptEpochs">Total epochs</label><input id="gptEpochs" type="number" value="32" min="1" />
-              <label for="gptBatch">Batch size</label><input id="gptBatch" type="number" value="8" min="1" />
+              <label for="gptBatch">Batch size</label><input id="gptBatch" type="number" value="1" min="1" />
               <label for="gptSave">Save every N epochs</label><input id="gptSave" type="number" value="5" min="1" />
               <div class="row" style="margin-top: 10px;">
                 <button id="trainGpt">Train GPT</button>
@@ -3206,12 +3349,10 @@ HTML = r"""<!doctype html>
     let liveLastInputDb = null;
     let liveLastOutputDb = null;
     let liveLevelerGain = 1;
-    let relayRecognition = null;
     let relayListening = false;
     let relayQueue = [];
     let relayBusy = false;
     let relayLastUrl = "";
-    let relayFinalTranscript = "";
     let relayNextId = 1;
     let relayStream = null;
     let relayAudioCtx = null;
@@ -3242,6 +3383,8 @@ HTML = r"""<!doctype html>
     let engineBusy = false;
     let logRaw = "";
     let generateOutputs = [];
+    let textLangDataset = "";
+    let configErrorShown = false;
     let relaySavedSettings = {};
     try { relaySavedSettings = JSON.parse(localStorage.getItem("voiceDashboardRelaySettings") || "{}"); }
     catch (_) { relaySavedSettings = {}; }
@@ -3346,8 +3489,7 @@ HTML = r"""<!doctype html>
       if (selected) {
         $("trainingDatasetStatus").textContent = `${selected.wav_count} WAV files / ${selected.list_rows} transcripts · ${selected.ready ? "ready to prepare" : "needs audio or transcripts"}`;
         $("trainingDatasetStatus").className = selected.ready ? "status-line good" : "status-line warn";
-        $("datasetAudioFiles").disabled = selected.builtin;
-        $("uploadDatasetAudio").disabled = selected.builtin || !datasetUploadFiles.length;
+        $("uploadDatasetAudio").disabled = !datasetUploadFiles.length;
       }
     }
 
@@ -3369,7 +3511,7 @@ HTML = r"""<!doctype html>
         list.appendChild(row);
       });
       const selected = state && (state.datasets || []).find(dataset => dataset.id === $("trainingDataset").value);
-      $("uploadDatasetAudio").disabled = !datasetUploadFiles.length || !selected || selected.builtin;
+      $("uploadDatasetAudio").disabled = !datasetUploadFiles.length || !selected;
     }
 
     function fileToBase64(file) {
@@ -3508,7 +3650,9 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
         $("liveVoiceStatus").textContent = "browser audio devices unavailable";
         return;
       }
-      await navigator.mediaDevices.getUserMedia({audio: true});
+      // The stream is only needed for permission, which makes device labels visible.
+      const permissionStream = await navigator.mediaDevices.getUserMedia({audio: true});
+      permissionStream.getTracks().forEach(track => track.stop());
       const devices = await navigator.mediaDevices.enumerateDevices();
       const oldInput = $("liveInputDevice").value;
       const oldOutput = $("liveOutputDevice").value;
@@ -3721,6 +3865,11 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
       if (old && refs.some(ref => ref.id === old)) $("reference").value = old;
       const selected = refs.find(ref => ref.id === $("reference").value) || refs[0];
       if (selected) setReference(selected, false);
+      // Choosing another voice dataset sets the text language to that dataset's language.
+      if (selected && state && state.reference_dataset !== textLangDataset) {
+        textLangDataset = state.reference_dataset;
+        $("textLang").value = selected.lang;
+      }
       renderAuxRefs(state ? state.all_references : refs);
     }
 
@@ -4245,7 +4394,10 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
         ref_audio_path: ref.wsl_path,
         aux_ref_audio_paths: aux,
         prompt_text: ref.text,
+        prompt_lang: ref.lang,
         text,
+        // Speech recognition is English only, so relay lines are English.
+        text_lang: "en",
         text_split_method: "cut5",
         seed: -1,
         top_k: $("relayTopK").value,
@@ -4493,7 +4645,6 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
             relayStatus("no speech recognized");
             return;
           }
-          relayFinalTranscript = text;
           if ($("relayAutoSpeak").checked) {
             enqueueRelayLine(text);
           } else {
@@ -4586,8 +4737,6 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
       relayListening = false;
       relayPushHeld = false;
       $("relayPttButton").classList.remove("active");
-      if (relayRecognition) relayRecognition.stop();
-      relayRecognition = null;
       if (relayProcessor) relayProcessor.disconnect();
       relayProcessor = null;
       if (relaySource) relaySource.disconnect();
@@ -4666,6 +4815,7 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
           checks.audio_output = {status: "needs_configuration", detail: "Allow audio-device access to complete this check."};
         }
         const names = {
+          config: "config.json",
           dashboard_python: "Dashboard Python",
           wsl_files: "GPT-SoVITS / WSL",
           gpt_models: "GPT models",
@@ -4707,6 +4857,10 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
       try {
       const res = await fetch(`/api/state?section=${encodeURIComponent(currentTab)}&dataset=${encodeURIComponent(voiceDataset)}&rvc_dataset=${encodeURIComponent(rvcDataset)}&rvc_model=${encodeURIComponent($("rvcModelName").value.trim())}`);
       state = await res.json();
+      if (state.config_error && !configErrorShown) {
+        configErrorShown = true;
+        showError(state.config_error);
+      }
       fillTrainingDatasets(state.datasets || []);
       fillDatasetSelects(state.datasets || [], state.reference_dataset || "");
       const gptOld = $("gptModel").value;
@@ -4756,10 +4910,7 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
         else if ((vc.indexes || []).length) $("liveRvcIndex").value = vc.indexes[0].applio_path;
         $("rvcModelList").innerHTML = "";
         [...(vc.checkpoints || []).map(row => ({...row, kind: "model"})), ...(vc.indexes || []).map(row => ({...row, kind: "index"}))].forEach(row => {
-          const div = document.createElement("div");
-          div.className = "model-line";
-          div.innerHTML = `<span>${row.kind}: ${row.path}</span><span>${row.size_mb} MB</span>`;
-          $("rvcModelList").appendChild(div);
+          $("rvcModelList").appendChild(modelLine(`${row.kind}: ${row.path}`, row.size_mb));
         });
       }
       if (!engineBusy) {
@@ -4767,12 +4918,6 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
         $("engineStatus").className = state.api_ready ? "status-line good" : "status-line";
       }
       updateSystemView(state.system);
-      const running = Object.values(state.jobs).find(j => j.status === "running");
-      const rvcExternalRunning = state.voicechanger && state.voicechanger.training_pids && state.voicechanger.training_pids.length > 0;
-      if ($("jobChip")) {
-        $("jobChip").textContent = running ? running.name + " running" : (rvcExternalRunning ? "RVC training running" : "no training running");
-        $("jobChip").className = running || rvcExternalRunning ? "chip good" : "chip";
-      }
       const preparation = state.jobs && state.jobs["dataset-prepare"];
       if (preparation) {
         $("datasetPrepareStatus").textContent = preparation.status === "running" ? `${preparation.name} is running...` : `${preparation.name}: ${preparation.status}`;
@@ -4798,16 +4943,22 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
       renderLog();
       $("modelList").innerHTML = "";
       const savedModels = [...state.models.gpt, ...state.models.sovits];
-      $("modelCount").textContent = savedModels.length ? `${savedModels.length} files` : "none yet";
-      savedModels.forEach(row => {
-        const div = document.createElement("div");
-        div.className = "model-line";
-        div.innerHTML = `<span>${row.path}</span><span>${row.size_mb} MB</span>`;
-        $("modelList").appendChild(div);
-      });
+      $("modelCount").textContent = savedModels.length ? `${savedModels.length} files` : (state.models_listed ? "none yet" : "listed once WSL is running");
+      savedModels.forEach(row => $("modelList").appendChild(modelLine(row.path, row.size_mb)));
       } finally {
         refreshBusy = false;
       }
+    }
+
+    function modelLine(label, sizeMb) {
+      const div = document.createElement("div");
+      div.className = "model-line";
+      const name = document.createElement("span");
+      name.textContent = label;
+      const size = document.createElement("span");
+      size.textContent = `${sizeMb} MB`;
+      div.append(name, size);
+      return div;
     }
 
     async function post(path, data = {}) {
@@ -5342,7 +5493,9 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
           ref_audio_path: ref.wsl_path,
           aux_ref_audio_paths: aux,
           prompt_text: $("promptText").value,
+          prompt_lang: ref.lang,
           text: $("targetText").value,
+          text_lang: $("textLang").value,
           text_split_method: $("splitMethod").value,
           seed: $("seed").value,
           top_k: $("topK").value,
@@ -5383,6 +5536,8 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
 def main():
     port = DASHBOARD_PORT
     log(f"Local Voice UI starting on http://localhost:{port}")
+    if CONFIG_ERROR:
+        log(CONFIG_ERROR)
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     try:
         server.serve_forever()

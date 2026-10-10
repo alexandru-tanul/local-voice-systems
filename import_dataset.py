@@ -61,11 +61,10 @@ def main():
         raise SystemExit(f"No audio files found in {audio_dir}")
     transcripts = read_transcripts(args.transcripts) if args.transcripts else {}
 
-    dataset_id = dashboard.slugify(args.name)
     if args.existing:
-        dashboard.dataset_descriptor(dataset_id)
+        dataset_id = dashboard.dataset_descriptor(dashboard.dataset_id_for_name(args.name))["id"]
     else:
-        dashboard.create_dataset(args.name, args.speaker, args.language)
+        dataset_id = dashboard.create_dataset(args.name, args.speaker, args.language)["id"]
 
     added = 0
     missing = []

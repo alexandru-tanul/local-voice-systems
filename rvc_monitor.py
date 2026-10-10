@@ -20,6 +20,7 @@ _parser.add_argument("--dashboard", default="http://localhost:8790")
 _ARGS = _parser.parse_args()
 APPLIO_MODEL_DIR = Path(_ARGS.applio_root) / "logs" / _ARGS.model
 MAIN_STATE_URL = _ARGS.dashboard.rstrip("/") + "/api/state"
+STOP_JOB_URL = _ARGS.dashboard.rstrip("/") + "/api/stop-job"
 
 
 def active_pid(pid):
@@ -179,9 +180,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/stop":
-            data = json.dumps({"key": "train-rvc"}).encode("utf-8")
+            data = json.dumps({"key": "train-rvc", "model_name": _ARGS.model}).encode("utf-8")
             request = urllib.request.Request(
-                "http://localhost:8790/api/stop-job",
+                STOP_JOB_URL,
                 data=data,
                 headers={"Content-Type": "application/json"},
                 method="POST",

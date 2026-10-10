@@ -1,6 +1,14 @@
 # Voice changer
 
-[Clone Applio](https://github.com/IAHispano/Applio), run `run-install.bat` on Windows, then set `applio_root` in `config.json` to its folder.
+Clone [Applio](https://github.com/IAHispano/Applio) at release 3.6.5. The dashboard calls Applio's own scripts, so other versions may not work.
+
+```text
+git clone https://github.com/IAHispano/Applio.git
+cd Applio
+git checkout 55fe0b976a6990bb75261c32ccecf6bfca3198f1
+```
+
+Run `run-install.bat` on Windows, then set `applio_root` in `config.json` to its folder. Write the path with `/` or `\\`, for example `"C:/Applio"`.
 Restart the dashboard. Applio uses its own Python and GPU packages.
 
 | Hardware | Setup |
@@ -24,3 +32,5 @@ On the dashboard's **Voice Changer** page:
 4. Press **Start Live Engine**, choose the microphone, output, model, and index, then **Start Live Voice**.
 
 Use headphones. Stop GPT-SoVITS if GPU memory is tight.
+
+For a separate training status page, run `python rvc_monitor.py --model <model name>` from the dashboard folder and open http://localhost:8791.
