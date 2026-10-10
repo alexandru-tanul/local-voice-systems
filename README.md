@@ -67,6 +67,18 @@ Copy-Item config.example.json config.json
 Edit `config.json`: replace `YOUR_WSL_USER` in the three paths and choose the device and precision from the table.
 For an existing engine, keep its paths. Restart the dashboard after config edits.
 
+Optional keys, for when a port is taken or you want a different setting:
+
+| Key | Default | Use |
+| --- | --- | --- |
+| `dashboard_port` | `8790` | Port of the dashboard page |
+| `asr_port` | `8792` | Port of speech recognition |
+| `tts_port` | `9880` | Port of the voice engine in WSL |
+| `asr_model` | `base.en` | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) model, for example `small.en` for better accuracy |
+| `asr_model_dir` | `.cache/faster-whisper` | Download folder of the speech model |
+| `cache_dir`, `tmp_dir` | `.cache`, `.cache/tmp` | Download caches and temporary files |
+| `dashboard_python` | `relay_env` | Python that runs the dashboard |
+
 Run `Setup-Relay-Env.bat`, then `Launch-Voice-Dashboard.bat`. Open **Setup** to check the selected device.
 Use `Stop-Voice-Dashboard.bat` to stop it. Speech recognition uses CPU and downloads its model on first use.
 
@@ -77,7 +89,7 @@ Use `Stop-Voice-Dashboard.bat` to stop it. Speech recognition uses CPU and downl
 3. On **Relay**, press **Start System**, hold push-to-talk, speak, then release. Choose audio output in **Settings**.
 
 To train a voice, add more clips, prepare the dataset, then train SoVITS and GPT with batch size 1.
-For live microphone conversion, see [Voice Changer](voicechanger/README.md). Use [VB-CABLE](https://vb-audio.com/Cable/) to send audio to another app.
+Use [VB-CABLE](https://vb-audio.com/Cable/) to send the generated voice to another app.
 
 ## Fix
 

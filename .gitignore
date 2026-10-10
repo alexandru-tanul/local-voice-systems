@@ -13,5 +13,3 @@ config.json
 # Voice data never belongs in the repository
 datasets/*
 !datasets/.gitkeep
-voicechanger/rvc_dataset/
-voicechanger/*_rvc_manifest.csv

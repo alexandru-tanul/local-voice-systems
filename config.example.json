@@ -4,6 +4,5 @@
   "wsl_python": "/home/YOUR_WSL_USER/miniforge3/envs/gsv/bin/python",
   "wsl_datasets_root": "/home/YOUR_WSL_USER/voice-datasets",
   "tts_device": "cuda",
-  "tts_precision": "fp32",
-  "applio_root": ""
+  "tts_precision": "fp32"
 }

@@ -98,7 +98,7 @@ def main():
         raise SystemExit("The global PTT helper currently requires Windows.")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dashboard", default="http://127.0.0.1:8790")
+    parser.add_argument("--dashboard", required=True, help="Dashboard address, for example http://127.0.0.1:8790.")
     args = parser.parse_args()
 
     user32 = ctypes.windll.user32

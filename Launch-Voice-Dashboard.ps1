@@ -1,11 +1,32 @@
 $ErrorActionPreference = 'Stop'
 $projectRoot = $PSScriptRoot
-$dashboardUrl = 'http://127.0.0.1:8790'
+
+$config = $null
+$configPath = Join-Path $projectRoot 'config.json'
+if (Test-Path -LiteralPath $configPath) {
+    try {
+        $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    } catch {
+        Write-Warning 'config.json could not be parsed; continuing with the default settings.'
+    }
+}
+
+# Port lookup, the same as in voice_dashboard.py and Stop-Voice-Dashboard.ps1:
+# VOICE_DASHBOARD_PORT, then config.json "dashboard_port", then 8790.
+$port = 8790
+$configuredPort = 0
+if ($config -and [int]::TryParse([string]$config.dashboard_port, [ref]$configuredPort) -and $configuredPort -ge 1 -and $configuredPort -le 65535) {
+    $port = $configuredPort
+}
+if ($env:VOICE_DASHBOARD_PORT) { $port = [int]$env:VOICE_DASHBOARD_PORT }
+$dashboardUrl = "http://127.0.0.1:$port"
+# The browser keeps the page's saved settings under this address, so it stays localhost.
+$pageUrl = "http://localhost:$port"
 
 try {
     $existing = Invoke-WebRequest -UseBasicParsing -Uri "$dashboardUrl/api/system-state" -TimeoutSec 2
     if ($existing.StatusCode -eq 200) {
-        Start-Process 'http://localhost:8790'
+        Start-Process $pageUrl
         Write-Host 'The voice dashboard is already running.'
         exit 0
     }
@@ -15,15 +36,7 @@ try {
 
 # Python lookup order: config.json "dashboard_python", relay_env, a local .venv, then python or py on PATH.
 $pythonCandidates = @()
-$configPath = Join-Path $projectRoot 'config.json'
-if (Test-Path -LiteralPath $configPath) {
-    try {
-        $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-        if ($config.dashboard_python) { $pythonCandidates += [string]$config.dashboard_python }
-    } catch {
-        Write-Warning 'config.json could not be parsed; continuing with the default Python lookup.'
-    }
-}
+if ($config -and $config.dashboard_python) { $pythonCandidates += [string]$config.dashboard_python }
 $pythonCandidates += (Join-Path $projectRoot 'relay_env\Scripts\python.exe')
 $pythonCandidates += (Join-Path $projectRoot '.venv\Scripts\python.exe')
 $python = $pythonCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
@@ -62,8 +75,8 @@ while ((Get-Date) -lt $deadline) {
     try {
         $response = Invoke-WebRequest -UseBasicParsing -Uri "$dashboardUrl/api/system-state" -TimeoutSec 2
         if ($response.StatusCode -eq 200) {
-            Start-Process 'http://localhost:8790'
-            Write-Host 'Dashboard ready at http://localhost:8790'
+            Start-Process $pageUrl
+            Write-Host "Dashboard ready at $pageUrl"
             exit 0
         }
     } catch {

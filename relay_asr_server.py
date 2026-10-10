@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -85,7 +86,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/warmup":
             started = time.time()
-            load_model()
+            try:
+                load_model()
+            except Exception as exc:
+                # For example, the first download of the model failed. The dashboard shows this text.
+                self.send_json({"ok": False, "error": f"Could not load the {MODEL_NAME} speech model: {exc}"}, 500)
+                return
             self.send_json({"ok": True, "model": MODEL_NAME, "loaded": True, "duration": round(time.time() - started, 3)})
             return
         self.send_error(404)
@@ -106,8 +112,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": str(exc)}, 500)
 
 
+class Server(ThreadingHTTPServer):
+    # On Windows, SO_REUSEADDR lets a second server bind a port that is already in use, and the
+    # two then share its requests. SO_EXCLUSIVEADDRUSE makes the second bind fail instead.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("RELAY_ASR_PORT", "8792"))
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server = Server(("127.0.0.1", port), Handler)
     print(f"Relay ASR server starting on http://127.0.0.1:{port} with {MODEL_NAME}", flush=True)
     server.serve_forever()

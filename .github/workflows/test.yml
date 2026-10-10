@@ -18,6 +18,8 @@ jobs:
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $parseErrors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/Launch-Voice-Dashboard.ps1", [ref]$null, [ref]$parseErrors) > $null
-          if ($parseErrors) { throw ($parseErrors | Out-String) }
+          foreach ($script in 'Launch-Voice-Dashboard.ps1', 'Stop-Voice-Dashboard.ps1') {
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile("$PWD/$script", [ref]$null, [ref]$parseErrors) > $null
+            if ($parseErrors) { throw "${script}: $($parseErrors | Out-String)" }
+          }

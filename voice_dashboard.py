@@ -1,11 +1,11 @@
 import json
 import base64
+import contextlib
 import ctypes
 import hashlib
 import io
 import os
 import re
-import signal
 import socket
 import subprocess
 import sys
@@ -22,7 +22,6 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-DASHBOARD_PORT = int(os.environ.get("VOICE_DASHBOARD_PORT", "8790"))
 CONFIG_PATH = ROOT / "config.json"
 
 
@@ -42,36 +41,58 @@ def load_config(path):
     return config, ""
 
 
+def config_port(config, key, default):
+    """A port from config.json, and an error message for the page when the value is not a port."""
+    value = config.get(key, default)
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        port = 0
+    if isinstance(value, bool) or not 1 <= port <= 65535:
+        return default, f"config.json: {key} must be a port number from 1 to 65535, so {default} is used."
+    return port, ""
+
+
 APP_CONFIG, CONFIG_ERROR = load_config(CONFIG_PATH)
+DASHBOARD_PORT, _port_error = config_port(APP_CONFIG, "dashboard_port", 8790)
+RELAY_ASR_PORT, _asr_port_error = config_port(APP_CONFIG, "asr_port", 8792)
+TTS_PORT, _tts_port_error = config_port(APP_CONFIG, "tts_port", 9880)
+CONFIG_ERROR = " ".join(filter(None, [CONFIG_ERROR, _port_error, _asr_port_error, _tts_port_error]))
+# For running a second copy beside the installed one, for example while testing.
+if os.environ.get("VOICE_DASHBOARD_PORT"):
+    DASHBOARD_PORT = int(os.environ["VOICE_DASHBOARD_PORT"])
 DATASETS_DIR = ROOT / "datasets"
 DATASETS_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR = ROOT / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
-VOICECHANGER_DIR = ROOT / "voicechanger"
-RVC_DATASETS_DIR = VOICECHANGER_DIR / "rvc_dataset"
 CACHE_DIR = Path(APP_CONFIG.get("cache_dir") or ROOT / ".cache")
 TMP_DIR = Path(APP_CONFIG.get("tmp_dir") or CACHE_DIR / "tmp")
-APPLIO_ROOT = Path(APP_CONFIG.get("applio_root") or ROOT.parent / "Applio")
-APPLIO_ENV_PYTHON = Path(APP_CONFIG["applio_python"]) if APP_CONFIG.get("applio_python") else next(
-    (path for path in [APPLIO_ROOT / "env" / "python.exe", APPLIO_ROOT / "env" / "Scripts" / "python.exe"] if path.exists()),
-    APPLIO_ROOT / "env" / "python.exe",
-)
-APPLIO_TORCH_LIB = APPLIO_ROOT / "env" / "Lib" / "site-packages" / "torch" / "lib"
-AMD_HIP_BIN = Path(APP_CONFIG["amd_hip_bin"]) if APP_CONFIG.get("amd_hip_bin") else None
-RVC_SAMPLE_RATE = 32000
 
 WSL_DISTRO = APP_CONFIG.get("wsl_distro") or "Ubuntu-24.04"
 WSL_GSV_ROOT = APP_CONFIG.get("wsl_gpt_sovits_root") or "/root/GPT-SoVITS"
 WSL_PYTHON = APP_CONFIG.get("wsl_python") or "/root/gsv-venv/bin/python"
 WSL_DATASETS_ROOT = APP_CONFIG.get("wsl_datasets_root") or "/root/datasets"
 WSL_GSV_WIN = Path(f"\\\\wsl.localhost\\{WSL_DISTRO}{WSL_GSV_ROOT.replace('/', os.sep)}")
-API_URL = "http://localhost:9880"
-RELAY_ASR_URL = "http://127.0.0.1:8792"
+# 127.0.0.1, not localhost: Windows tries localhost as ::1 first, where the forwarded WSL port is
+# not listening, and each request then waited about 2 seconds before it fell back to IPv4.
+API_URL = f"http://127.0.0.1:{TTS_PORT}"
+RELAY_ASR_URL = f"http://127.0.0.1:{RELAY_ASR_PORT}"
 RELAY_ASR_PYTHON = ROOT / "relay_env" / "Scripts" / "python.exe"
+RELAY_ASR_MODEL = APP_CONFIG.get("asr_model") or "base.en"
 RELAY_ASR_MODEL_DIR = Path(APP_CONFIG.get("asr_model_dir") or CACHE_DIR / "faster-whisper")
 RELAY_ASR_TMP = OUTPUT_DIR / "relay_asr_tmp"
-RVC_REALTIME_URL = "http://127.0.0.1:6970"
-RVC_REALTIME_WS = "ws://127.0.0.1:6970/api/ws-audio"
+# Relay lines are played once, so only the newest are kept. Generate page output is kept.
+RELAY_OUTPUT_DIR = OUTPUT_DIR / "relay"
+RELAY_OUTPUT_LIMIT = 200
+# pkill patterns for jobs that run inside WSL. They also work after a dashboard restart, when the
+# job is no longer known. The brackets keep a pattern from matching the stop command's own shell.
+WSL_STOP_SCRIPTS = {
+    "dataset-sync": "pkill -f '[d]ataset-sync; ' || true",
+    "dataset-prepare": "pkill -f '[G]PT_SoVITS/prepare_datasets/' || true",
+    "train-gpt": "pkill -f '[G]PT_SoVITS/s1_train.py' || true",
+    "train-sovits": "pkill -f '[G]PT_SoVITS/s2_train.py' || true",
+    "api": f"pkill -f '[a]pi_v2.py.*-p {TTS_PORT} ' || true",
+}
 MIN_REFERENCE_SECONDS = 3.0
 MAX_REFERENCE_SECONDS = 10.0
 LANGUAGES = {"en", "zh", "ja", "ko", "yue"}
@@ -83,19 +104,23 @@ API_PROCESS = None
 API_GPT_PATH = None
 API_SOVITS_PATH = None
 STATE_LOCK = threading.Lock()
+# Held while a startup step checks that its run is still current and starts a service, so
+# Stop Everything cannot fall between the check and the start.
+SYSTEM_LOCK = threading.Lock()
+# The voice engine handles one generation at a time, including its model switch.
+GENERATION_LOCK = threading.Lock()
+ENGINE_LOCK = threading.Lock()
 PTT_CONDITION = threading.Condition()
 PTT_STATE = {
     "binding": "ShiftLeft",
     "held": False,
     "sequence": 0,
-    "last_event_at": None,
 }
 SYSTEM_STATE = {
     "status": "stopped",
     "phase": "stopped",
     "message": "System is stopped.",
     "error": "",
-    "started_at": None,
 }
 SYSTEM_THREAD = None
 SYSTEM_RUN_ID = 0
@@ -136,7 +161,9 @@ def wsl_command(script):
         f'export LD_LIBRARY_PATH={shquote(lib_dir)}"${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"; '
         + script
     )
-    return ["wsl", "-d", WSL_DISTRO, "--", "bash", "-lc", script]
+    # --exec hands the script to bash unchanged. With "--", wsl.exe first runs the command line
+    # through the default shell, which expands the script's own variables before bash sets them.
+    return ["wsl", "-d", WSL_DISTRO, "--exec", "bash", "-lc", script]
 
 
 def run_wsl(script, **kwargs):
@@ -146,6 +173,17 @@ def run_wsl(script, **kwargs):
         capture_output=True,
         **kwargs,
     )
+
+
+def stop_in_wsl(script):
+    """Run a pkill stop script in WSL. A stopped distro runs nothing to stop, and starting it
+    only for this took longer than the timeout, so it is skipped."""
+    if not wsl_distro_running():
+        return
+    try:
+        run_wsl(script, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"Could not run the stop command in WSL: {exc}")
 
 
 def voice_runtime():
@@ -169,41 +207,6 @@ def voice_environment():
     )
 
 
-def applio_environment():
-    env = os.environ.copy()
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-    env.update({
-        "PYTHONNOUSERSITE": "1", "PYTHONUNBUFFERED": "1",
-        "OMP_NUM_THREADS": "4", "MKL_NUM_THREADS": "4", "NUMEXPR_MAX_THREADS": "4",
-        "UV_CACHE_DIR": str(CACHE_DIR / "uv"), "PIP_CACHE_DIR": str(CACHE_DIR / "pip"),
-        "TEMP": str(TMP_DIR), "TMP": str(TMP_DIR),
-    })
-    paths = [APPLIO_ENV_PYTHON.parent, APPLIO_ROOT / "env" / "Library" / "bin", APPLIO_TORCH_LIB]
-    if AMD_HIP_BIN:
-        paths.insert(0, AMD_HIP_BIN)
-    env["PATH"] = os.pathsep.join(str(path) for path in paths if path.exists()) + os.pathsep + env.get("PATH", "")
-    backend = APP_CONFIG.get("applio_backend", "auto")
-    if backend == "cpu":
-        env.update({"CUDA_VISIBLE_DEVICES": "-1", "HIP_VISIBLE_DEVICES": "-1"})
-    elif backend == "zluda":
-        env["DISABLE_ADDMM_CUDA_LT"] = "1"
-    elif backend != "auto":
-        raise ValueError("applio_backend must be auto, cpu, or zluda.")
-    return env
-
-
-def applio_command(*args):
-    if not APPLIO_ENV_PYTHON.exists():
-        raise RuntimeError("Applio Python is missing. Run Applio's run-install.bat, then restart the dashboard.")
-    command = [str(APPLIO_ENV_PYTHON), *args]
-    if APP_CONFIG.get("applio_backend") == "zluda":
-        zluda = APPLIO_ROOT / "zluda" / "zluda.exe"
-        if not zluda.exists():
-            raise RuntimeError("ZLUDA is missing. Complete Applio's AMD setup first.")
-        command = [str(zluda), "--", *command]
-    return command
-
-
 class ManagedProcess:
     def __init__(self, name, command, stop_script=None, cwd=ROOT, env=None):
         self.name = name
@@ -212,17 +215,14 @@ class ManagedProcess:
         self.cwd = cwd
         self.env = env
         self.process = None
-        self.started_at = None
-        self.ended_at = None
         self.returncode = None
         self.lines = []
         self.status = "idle"
+        self.reader = None
 
     def start(self):
         if self.process and self.process.poll() is None:
             return False
-        self.started_at = time.time()
-        self.ended_at = None
         self.returncode = None
         self.status = "running"
         self.lines = []
@@ -238,9 +238,16 @@ class ManagedProcess:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             env=self.env,
         )
-        threading.Thread(target=self._read_output, daemon=True).start()
+        self.reader = threading.Thread(target=self._read_output, daemon=True)
+        self.reader.start()
         threading.Thread(target=self._wait, daemon=True).start()
         return True
+
+    def last_lines(self, count):
+        # Output can still be in the pipe when the process ends, so read it first.
+        if self.reader and not self.running():
+            self.reader.join(timeout=1)
+        return self.lines[-count:]
 
     def _read_output(self):
         if not self.process or not self.process.stdout:
@@ -255,28 +262,31 @@ class ManagedProcess:
         if not self.process:
             return
         self.returncode = self.process.wait()
-        self.ended_at = time.time()
         if self.status == "stopping":
             self.status = "stopped"
             return
         self.status = "done" if self.returncode == 0 else "failed"
         log(f"{self.name} {self.status} with exit code {self.returncode}.")
 
+    def running(self):
+        return self.process is not None and self.process.poll() is None
+
     def stop(self):
         if self.stop_script:
-            run_wsl(self.stop_script, timeout=8)
-        if self.process and self.process.poll() is None:
-            self.status = "stopping"
+            stop_in_wsl(self.stop_script)
+        if not self.running():
+            # Already ended: keep "done" or "failed" instead of reporting "stopped".
+            return
+        self.status = "stopping"
+        try:
+            self.process.terminate()
+            self.process.wait(timeout=5)
+        except Exception:
             try:
-                self.process.terminate()
-                self.process.wait(timeout=5)
+                self.process.kill()
             except Exception:
-                try:
-                    self.process.kill()
-                except Exception:
-                    pass
+                pass
         self.status = "stopped"
-        self.ended_at = time.time()
         log(f"{self.name} stopped.")
 
     def snapshot(self):
@@ -285,8 +295,6 @@ class ManagedProcess:
             "name": self.name,
             "status": "running" if running else self.status,
             "returncode": self.returncode,
-            "started_at": self.started_at,
-            "ended_at": self.ended_at,
             "lines": self.lines[-250:],
         }
 
@@ -408,28 +416,6 @@ def dataset_id_for_name(name):
     return slugify(clean, "") or "dataset-" + hashlib.sha1(clean.encode("utf-8")).hexdigest()[:8]
 
 
-def rvc_dataset_name(dataset_id):
-    return slugify(dataset_id, "voice").replace("-", "") or "voice"
-
-
-def rvc_model_name(dataset_id="", explicit=""):
-    clean = re.sub(r"[^A-Za-z0-9_-]", "", str(explicit or ""))[:64]
-    return clean or f"{rvc_dataset_name(dataset_id)}_rvc_{RVC_SAMPLE_RATE // 1000}k"
-
-
-def rvc_dataset_dir(dataset_id):
-    return RVC_DATASETS_DIR / rvc_dataset_name(dataset_id)
-
-
-def rvc_manifest_path(dataset_id):
-    return VOICECHANGER_DIR / f"{rvc_dataset_name(dataset_id)}_rvc_manifest.csv"
-
-
-def default_dataset_id():
-    rows = list_datasets()
-    return rows[0]["id"] if rows else ""
-
-
 def dataset_descriptor(dataset_id):
     dataset_id = slugify(dataset_id)
     root = (DATASETS_DIR / dataset_id).resolve()
@@ -445,22 +431,25 @@ def dataset_descriptor(dataset_id):
         "root": root,
         "list_path": root / f"{dataset_id}.list",
         "wsl_root": f"{WSL_DATASETS_ROOT}/{dataset_id}",
+        "entries": manifest.get("entries") or [],
     }
 
 
 def dataset_summary(descriptor):
+    # dataset.json lists the clips. Other WAV files in the folder are not part of the dataset.
     root = descriptor["root"]
+    entries = descriptor["entries"]
     list_path = descriptor["list_path"]
     rows = []
     if list_path.exists():
         rows = [line for line in list_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    wavs = list((root / "wavs").glob("*.wav")) if (root / "wavs").exists() else []
+    wav_count = sum((root / "wavs" / str(entry.get("wav", ""))).is_file() for entry in entries)
     return {
         "id": descriptor["id"],
         "name": descriptor["name"],
-        "wav_count": len(wavs),
+        "wav_count": wav_count,
         "list_rows": len(rows),
-        "ready": bool(wavs and len(wavs) == len(rows)),
+        "ready": bool(entries) and wav_count == len(entries) == len(rows),
         "path": str(root),
         "wsl_root": descriptor["wsl_root"],
     }
@@ -493,11 +482,54 @@ def create_dataset(name, speaker="speaker", language="en"):
         "created_at": time.time(),
         "entries": [],
     }
-    (root / "dataset.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    (root / f"{dataset_id}.list").write_text("", encoding="utf-8")
-    (root / "metadata.csv").write_text("", encoding="utf-8")
+    write_text_atomic(root / "dataset.json", json.dumps(manifest, indent=2))
+    write_text_atomic(root / f"{dataset_id}.list", "")
+    write_text_atomic(root / "metadata.csv", "")
     log(f"Created dataset {clean_name} ({dataset_id}).")
     return dataset_summary(dataset_descriptor(dataset_id))
+
+
+def write_text_atomic(path, text):
+    # Readers see the old file or the new one, never a half-written one. LF line endings keep
+    # carriage returns out of the transcripts that GPT-SoVITS reads in WSL.
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(text, encoding="utf-8", newline="\n")
+    os.replace(temp, path)
+
+
+@contextlib.contextmanager
+def dataset_lock(root):
+    """Let one change to a dataset run at a time, also across processes, such as an
+    import_dataset.py run during an upload from the page."""
+    with open(root / ".lock", "a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def clean_transcript(text):
+    # One line per clip: "|" separates the .list columns, and a line break would start a new row.
+    return " ".join(str(text or "").replace("|", " ").split())
 
 
 def write_dataset_manifest(root, manifest):
@@ -507,20 +539,32 @@ def write_dataset_manifest(root, manifest):
     metadata_rows = []
     for entry in entries:
         wav_name = entry["wav"]
-        text = str(entry["text"]).replace("|", " ").strip()
+        text = clean_transcript(entry["text"])
         speaker = slugify(entry.get("speaker"), "speaker")
         language = language_code(entry.get("language"))
         list_rows.append(f"wavs/{wav_name}|{speaker}|{language}|{text}")
         metadata_rows.append(f"{Path(wav_name).stem}|{text}|{text}")
     ending = "\n" if list_rows else ""
-    (root / f"{dataset_id}.list").write_text("\n".join(list_rows) + ending, encoding="utf-8")
-    (root / "metadata.csv").write_text("\n".join(metadata_rows) + ending, encoding="utf-8")
-    (root / "dataset.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    write_text_atomic(root / f"{dataset_id}.list", "\n".join(list_rows) + ending)
+    write_text_atomic(root / "metadata.csv", "\n".join(metadata_rows) + ending)
+    write_text_atomic(root / "dataset.json", json.dumps(manifest, indent=2))
+
+
+def convert_audio(source, target):
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-ar", "44100", "-ac", "1", "-sample_fmt", "s16", str(target)],
+        text=True,
+        capture_output=True,
+        timeout=180,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "ffmpeg could not convert this audio file.")
 
 
 def add_dataset_audio(dataset_id, filename, audio_base64, text, speaker="", language="en"):
     descriptor = dataset_descriptor(dataset_id)
-    transcript = str(text or "").replace("|", " ").strip()
+    transcript = clean_transcript(text)
     if not transcript:
         raise RuntimeError("Every audio file needs a transcript.")
     try:
@@ -530,139 +574,44 @@ def add_dataset_audio(dataset_id, filename, audio_base64, text, speaker="", lang
     if not audio or len(audio) > 100 * 1024 * 1024:
         raise RuntimeError("Audio files must be between 1 byte and 100 MB.")
     root = descriptor["root"]
-    manifest_path = root / "dataset.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     filename = str(filename or "clip.audio")
     stem = slugify(Path(filename).stem, "clip")
-    existing = {entry.get("wav") for entry in manifest.get("entries", [])}
-    wav_name = f"{stem}.wav"
-    counter = 2
-    while wav_name in existing:
-        wav_name = f"{stem}-{counter}.wav"
-        counter += 1
     suffix = Path(filename).suffix.lower() or ".audio"
-    fd, temp_name = tempfile.mkstemp(prefix="upload-", suffix=suffix, dir=str(OUTPUT_DIR))
+    fd, source_name = tempfile.mkstemp(prefix="upload-", suffix=suffix, dir=str(OUTPUT_DIR))
     os.close(fd)
-    temp_path = Path(temp_name)
-    output_path = root / "wavs" / wav_name
+    source = Path(source_name)
+    converted = source.with_name(source.stem + "-converted.wav")
     try:
-        temp_path.write_bytes(audio)
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-i", str(temp_path), "-ar", "44100", "-ac", "1", "-sample_fmt", "s16", str(output_path)],
-            text=True,
-            capture_output=True,
-            timeout=180,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "ffmpeg could not convert this audio file.")
+        # The slow conversion runs before the lock, and a failed one leaves nothing in wavs/.
+        source.write_bytes(audio)
+        convert_audio(source, converted)
+        with dataset_lock(root):
+            manifest = json.loads((root / "dataset.json").read_text(encoding="utf-8"))
+            taken = {entry.get("wav") for entry in manifest.get("entries", [])}
+            wav_name = f"{stem}.wav"
+            counter = 2
+            while wav_name in taken or (root / "wavs" / wav_name).exists():
+                wav_name = f"{stem}-{counter}.wav"
+                counter += 1
+            os.replace(converted, root / "wavs" / wav_name)
+            manifest.setdefault("entries", []).append(
+                {
+                    "wav": wav_name,
+                    "source_name": Path(filename).name,
+                    "text": transcript,
+                    "speaker": speaker or manifest.get("default_speaker") or "speaker",
+                    "language": language or manifest.get("default_language") or "en",
+                }
+            )
+            write_dataset_manifest(root, manifest)
     finally:
-        try:
-            temp_path.unlink()
-        except OSError:
-            pass
-    manifest.setdefault("entries", []).append(
-        {
-            "wav": wav_name,
-            "source_name": Path(filename).name,
-            "text": transcript,
-            "speaker": speaker or manifest.get("default_speaker") or "speaker",
-            "language": language or manifest.get("default_language") or "en",
-        }
-    )
-    write_dataset_manifest(root, manifest)
+        for path in (source, converted):
+            try:
+                path.unlink()
+            except OSError:
+                pass
     log(f"Added {wav_name} to dataset {descriptor['name']}.")
-    return dataset_summary(descriptor)
-
-
-def voicechanger_status(dataset_id="", model_name=""):
-    dataset_id = dataset_id or default_dataset_id()
-    model_name = rvc_model_name(dataset_id, model_name)
-    dataset_dir = rvc_dataset_dir(dataset_id)
-    manifest_path = rvc_manifest_path(dataset_id)
-    wav_count = len(list(dataset_dir.glob("*.wav"))) if dataset_dir.exists() else 0
-    manifest_rows = 0
-    total_seconds = 0.0
-    if manifest_path.exists():
-        try:
-            import csv
-
-            with manifest_path.open("r", newline="", encoding="utf-8") as file:
-                for row in csv.DictReader(file):
-                    manifest_rows += 1
-                    try:
-                        total_seconds += float(row.get("duration_seconds") or 0)
-                    except ValueError:
-                        pass
-        except Exception:
-            manifest_rows = 0
-            total_seconds = 0.0
-    model_dir = APPLIO_ROOT / "logs" / model_name
-    def file_count(folder, pattern="*"):
-        path = model_dir / folder
-        return len(list(path.glob(pattern))) if path.exists() else 0
-
-    checkpoint_files = []
-    index_files = []
-    if model_dir.exists():
-        for path in model_dir.glob("*.pth"):
-            if path.name.startswith(("G_", "D_")):
-                continue
-            checkpoint_files.append(
-                {
-                    "name": path.name,
-                    "path": str(path),
-                    "applio_path": str(path.relative_to(APPLIO_ROOT)).replace("\\", "/"),
-                    "size_mb": round(path.stat().st_size / (1024 * 1024), 1),
-                    "mtime": path.stat().st_mtime,
-                }
-            )
-        for path in model_dir.glob("*.index"):
-            index_files.append(
-                {
-                    "name": path.name,
-                    "path": str(path),
-                    "applio_path": str(path.relative_to(APPLIO_ROOT)).replace("\\", "/"),
-                    "size_mb": round(path.stat().st_size / (1024 * 1024), 1),
-                    "mtime": path.stat().st_mtime,
-                }
-            )
-    checkpoint_files.sort(key=lambda row: row["mtime"], reverse=True)
-    index_files.sort(key=lambda row: row["mtime"], reverse=True)
-
-    try:
-        active_pids = rvc_process_ids(model_name)
-    except (OSError, subprocess.SubprocessError):
-        active_pids = []
-
-    return {
-        "dataset_id": dataset_id,
-        "dataset_name": rvc_dataset_name(dataset_id),
-        "model_name": model_name,
-        "dataset_dir": str(dataset_dir),
-        "manifest": str(manifest_path),
-        "wav_count": wav_count,
-        "manifest_rows": manifest_rows,
-        "minutes": round(total_seconds / 60.0, 2),
-        "applio_root": str(APPLIO_ROOT),
-        "applio_cloned": (APPLIO_ROOT / ".git").exists(),
-        "applio_launcher": (APPLIO_ROOT / "run-applio.bat").exists(),
-        "applio_amd_launcher": (APPLIO_ROOT / "run-applio-amd.bat").exists(),
-        "applio_backend": APP_CONFIG.get("applio_backend", "auto"),
-        "applio_installed": APPLIO_ENV_PYTHON.exists(),
-        "applio_dataset": (APPLIO_ROOT / "assets" / "datasets" / rvc_dataset_name(dataset_id)).exists(),
-        "rvc_model_dir": str(model_dir),
-        "sliced_count": file_count("sliced_audios", "*.wav"),
-        "feature_count": file_count("extracted", "*.npy"),
-        "f0_count": file_count("f0", "*.npy"),
-        "filelist_rows": len((model_dir / "filelist.txt").read_text(encoding="utf-8").splitlines()) if (model_dir / "filelist.txt").exists() else 0,
-        "training_pids": active_pids,
-        "checkpoints": checkpoint_files[:10],
-        "indexes": index_files[:10],
-        "realtime_url": RVC_REALTIME_URL,
-        "realtime_ws": RVC_REALTIME_WS,
-        "realtime_ready": realtime_ready(),
-    }
+    return dataset_summary(dataset_descriptor(dataset_id))
 
 
 class TcpInitialRtoParameters(ctypes.Structure):
@@ -693,16 +642,12 @@ def port_open(port, timeout=0.2):
             return False
 
 
-def realtime_ready():
-    return port_open(6970)
-
-
 def api_ready():
-    return port_open(9880)
+    return port_open(TTS_PORT)
 
 
 def relay_asr_ready():
-    return port_open(8792)
+    return port_open(RELAY_ASR_PORT)
 
 
 def start_relay_asr():
@@ -726,7 +671,8 @@ def start_relay_asr():
             "TMP": str(TMP_DIR),
             "RELAY_ASR_MODEL_DIR": str(RELAY_ASR_MODEL_DIR),
             "RELAY_ASR_TMP": str(RELAY_ASR_TMP),
-            "RELAY_ASR_MODEL": "base.en",
+            "RELAY_ASR_MODEL": RELAY_ASR_MODEL,
+            "RELAY_ASR_PORT": str(RELAY_ASR_PORT),
         }
     )
     proc = ManagedProcess(
@@ -737,12 +683,28 @@ def start_relay_asr():
     )
     with STATE_LOCK:
         current = JOBS.get("relay-asr")
-        if current and current.process and current.process.poll() is None:
-            raise RuntimeError("Relay ASR is already running.")
+        if current and current.running():
+            # Started, but not listening yet. The caller waits for the port.
+            return True
         JOBS["relay-asr"] = proc
     proc.start()
-    log("Relay ASR starting on http://127.0.0.1:8792.")
+    log(f"Relay ASR starting on {RELAY_ASR_URL}.")
     return True
+
+
+def warm_up_relay_asr():
+    # The server answers a failed model load with JSON that names the cause.
+    try:
+        with urllib.request.urlopen(RELAY_ASR_URL + "/warmup", timeout=180) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read()
+    try:
+        warmup = json.loads(body.decode("utf-8", errors="replace"))
+    except ValueError:
+        warmup = {}
+    if not warmup.get("ok"):
+        raise RuntimeError(warmup.get("error") or "Speech recognition model failed to load.")
 
 
 def ptt_helper_ready():
@@ -769,20 +731,34 @@ def start_ptt_helper():
     return True
 
 
-def wait_until(check, timeout, run_id, description):
+def wait_until(check, timeout, run_id, description, proc=None):
     deadline = time.time() + timeout
     while time.time() < deadline:
         if run_id != SYSTEM_RUN_ID:
             raise RuntimeError("Startup was cancelled.")
         if check():
             return
+        if proc and proc.process and proc.process.poll() is not None:
+            # The process ended before it became ready. Its last lines usually name the cause.
+            output = "\n".join(proc.last_lines(6))
+            raise RuntimeError(
+                f"{description} exited with code {proc.process.poll()} before it became ready."
+                + (f"\n{output}" if output else "")
+            )
         time.sleep(0.5)
     raise RuntimeError(f"{description} did not become ready within {int(timeout)} seconds.")
 
 
+def startup_step(run_id, phase, message):
+    # Call with SYSTEM_LOCK held, so Stop Everything cannot cancel the run between this
+    # check and the service the step starts.
+    if run_id != SYSTEM_RUN_ID:
+        raise RuntimeError("Startup was cancelled.")
+    set_system_state("starting", phase, message)
+
+
 def _start_system_worker(gpt_path, sovits_path, run_id):
     try:
-        set_system_state("starting", "wsl", "Starting the local model environment...")
         result = run_wsl("true", timeout=30)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "WSL failed to start.").replace("\x00", "").strip()
@@ -793,67 +769,85 @@ def _start_system_worker(gpt_path, sovits_path, run_id):
         if not gpt_path or not sovits_path:
             raise RuntimeError("No compatible GPT and SoVITS model pair was found.")
 
-        set_system_state("starting", "asr", "Starting local speech recognition...")
-        start_relay_asr()
-        wait_until(relay_asr_ready, 120, run_id, "Speech recognition")
-        set_system_state("starting", "asr", "Loading the speech recognition model...")
-        with urllib.request.urlopen(RELAY_ASR_URL + "/warmup", timeout=180) as response:
-            warmup = json.loads(response.read().decode("utf-8"))
-            if not warmup.get("ok"):
-                raise RuntimeError(warmup.get("error") or "Speech recognition model failed to load.")
+        with SYSTEM_LOCK:
+            startup_step(run_id, "asr", "Starting local speech recognition...")
+            start_relay_asr()
+        wait_until(relay_asr_ready, 120, run_id, "Speech recognition", JOBS.get("relay-asr"))
+        with SYSTEM_LOCK:
+            startup_step(run_id, "asr", "Loading the speech recognition model...")
+        warm_up_relay_asr()
 
-        set_system_state("starting", "tts", "Starting the selected voice engine...")
-        start_api(gpt_path, sovits_path)
-        wait_until(api_ready, 240, run_id, "Voice engine")
+        with SYSTEM_LOCK:
+            startup_step(run_id, "tts", "Starting the selected voice engine...")
+            engine_running = api_ready()
+            if not engine_running:
+                start_api(gpt_path, sovits_path)
+        if engine_running:
+            # Only applies the selected models, which can take minutes, so it runs outside the lock.
+            start_api(gpt_path, sovits_path)
+        wait_until(api_ready, 240, run_id, "Voice engine", API_PROCESS)
 
-        set_system_state("starting", "ptt", "Starting global push-to-talk...")
-        start_ptt_helper()
+        with SYSTEM_LOCK:
+            startup_step(run_id, "ptt", "Starting global push-to-talk...")
+            start_ptt_helper()
         wait_until(ptt_helper_ready, 15, run_id, "Global push-to-talk")
 
-        if run_id != SYSTEM_RUN_ID:
-            raise RuntimeError("Startup was cancelled.")
-        set_system_state("ready", "ready", "System ready. Press your push-to-talk key.")
+        with SYSTEM_LOCK:
+            if run_id != SYSTEM_RUN_ID:
+                raise RuntimeError("Startup was cancelled.")
+            set_system_state("ready", "ready", "System ready. Press your push-to-talk key.")
     except Exception as exc:
-        if run_id == SYSTEM_RUN_ID:
-            set_system_state("failed", "failed", "System startup failed.", str(exc))
+        with SYSTEM_LOCK:
+            if run_id == SYSTEM_RUN_ID:
+                set_system_state("failed", "failed", "System startup failed.", str(exc))
 
 
 def start_system(gpt_path, sovits_path, binding="ShiftLeft"):
     global SYSTEM_THREAD, SYSTEM_RUN_ID
-    if SYSTEM_THREAD and SYSTEM_THREAD.is_alive():
-        return False
-    with PTT_CONDITION:
-        PTT_STATE["binding"] = binding or "ShiftLeft"
-        PTT_CONDITION.notify_all()
-    SYSTEM_RUN_ID += 1
-    run_id = SYSTEM_RUN_ID
-    with STATE_LOCK:
-        SYSTEM_STATE["started_at"] = time.time()
-        SYSTEM_STATE["error"] = ""
-    SYSTEM_THREAD = threading.Thread(
-        target=_start_system_worker,
-        args=(gpt_path, sovits_path, run_id),
-        daemon=True,
+    with SYSTEM_LOCK:
+        # A startup that Stop Everything cancelled can still be waiting, but it can no longer
+        # change the status or start a service, so only the current run's state matters here.
+        if SYSTEM_STATE["status"] == "starting":
+            raise RuntimeError("The system is already starting.")
+        if SYSTEM_STATE["status"] == "stopping":
+            raise RuntimeError("The system is still stopping. Try again in a moment.")
+        with PTT_CONDITION:
+            PTT_STATE["binding"] = binding or "ShiftLeft"
+            PTT_CONDITION.notify_all()
+        SYSTEM_RUN_ID += 1
+        run_id = SYSTEM_RUN_ID
+        set_system_state("starting", "wsl", "Starting the local model environment...")
+        SYSTEM_THREAD = threading.Thread(
+            target=_start_system_worker,
+            args=(gpt_path, sovits_path, run_id),
+            daemon=True,
+        )
+        SYSTEM_THREAD.start()
+
+
+def run_powershell(script, timeout):
+    # -EncodedCommand takes the script as base64 UTF-16, so its quotes and backslashes need no escaping.
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    SYSTEM_THREAD.start()
-    return True
 
 
-def kill_port_listener(port, label):
+def kill_port_listener(port, label, marker):
     # JOBS only knows processes this dashboard instance launched; a service started
     # by an earlier instance survives a dashboard restart, so stop it by port owner.
+    # Only an owner whose command line contains the marker is stopped, so another
+    # program that uses the same port is left alone.
     try:
-        result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                f"Get-NetTCPConnection -LocalPort {port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess",
-            ],
-            text=True,
-            capture_output=True,
-            timeout=6,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        result = run_powershell(
+            f"Get-NetTCPConnection -LocalPort {int(port)} -State Listen -ErrorAction SilentlyContinue | "
+            "ForEach-Object { Get-CimInstance Win32_Process -Filter \"ProcessId=$($_.OwningProcess)\" } | "
+            f"Where-Object {{ $_.CommandLine -like '*{marker}*' }} | Select-Object -ExpandProperty ProcessId",
+            timeout=10,
         )
         pids = {int(line.strip()) for line in result.stdout.splitlines() if line.strip().isdigit()}
         for pid in pids:
@@ -889,24 +883,32 @@ def kill_orphan_ptt_helpers():
 
 def stop_system():
     global SYSTEM_RUN_ID
-    SYSTEM_RUN_ID += 1
-    set_system_state("stopping", "stopping", "Stopping managed services...")
-    asr = JOBS.get("relay-asr")
-    if asr:
-        asr.stop()
-    if relay_asr_ready():
-        kill_port_listener(8792, "speech recognition")
-    helper = JOBS.get("ptt-helper")
-    if helper:
-        helper.stop()
-    kill_orphan_ptt_helpers()
-    stop_api()
-    with PTT_CONDITION:
-        PTT_STATE["held"] = False
-        PTT_STATE["sequence"] += 1
-        PTT_STATE["last_event_at"] = time.time()
-        PTT_CONDITION.notify_all()
-    set_system_state("stopped", "stopped", "System is stopped.")
+    with SYSTEM_LOCK:
+        SYSTEM_RUN_ID += 1
+        stop_id = SYSTEM_RUN_ID
+        set_system_state("stopping", "stopping", "Stopping managed services...")
+    try:
+        asr = JOBS.get("relay-asr")
+        if asr:
+            asr.stop()
+        if relay_asr_ready():
+            kill_port_listener(RELAY_ASR_PORT, "speech recognition", "relay_asr_server.py")
+            if relay_asr_ready():
+                log(f"Another program listens on port {RELAY_ASR_PORT}. It was left running.")
+        helper = JOBS.get("ptt-helper")
+        if helper:
+            helper.stop()
+        kill_orphan_ptt_helpers()
+        stop_api()
+    finally:
+        with PTT_CONDITION:
+            PTT_STATE["held"] = False
+            PTT_STATE["sequence"] += 1
+            PTT_CONDITION.notify_all()
+        with SYSTEM_LOCK:
+            # A second Stop that started meanwhile reports the result itself.
+            if SYSTEM_RUN_ID == stop_id:
+                set_system_state("stopped", "stopped", "System is stopped.")
 
 
 def system_snapshot():
@@ -1139,28 +1141,26 @@ def write_s2_config(epochs, batch_size, save_every, model_name="voice-model", in
 
 def start_api(gpt_path, sovits_path):
     global API_PROCESS, API_GPT_PATH, API_SOVITS_PATH
-    if api_ready() and not (API_PROCESS and API_PROCESS.process and API_PROCESS.process.poll() is None):
-        log("A voice engine is already accepting connections; applying the selected models.")
-        set_api_weights(gpt_path, sovits_path)
-        return True
-    if API_PROCESS and API_PROCESS.process and API_PROCESS.process.poll() is None:
-        log("Inference engine is already running.")
-        return True
-    config_path = write_tts_config(gpt_path, sovits_path)
-    script = (
-        voice_environment() + "ulimit -l 2097152; "
-        f"cd {shquote(WSL_GSV_ROOT)} && "
-        f"{shquote(WSL_PYTHON)} api_v2.py -a 127.0.0.1 -p 9880 -c {shquote(config_path)}"
-    )
-    API_PROCESS = ManagedProcess(
-        "inference engine",
-        wsl_command(script),
-        stop_script="pkill -f 'api_v2.py.*9880' || true",
-    )
-    API_PROCESS.start()
-    API_GPT_PATH = gpt_path
-    API_SOVITS_PATH = sovits_path
-    log("Starting inference engine on http://localhost:9880.")
+    # The page and Start System can both start the engine; one check-and-start runs at a time.
+    with ENGINE_LOCK:
+        if API_PROCESS and API_PROCESS.running():
+            log("Inference engine is already running.")
+            return True
+        if not api_ready():
+            config_path = write_tts_config(gpt_path, sovits_path)
+            script = (
+                voice_environment() + "ulimit -l 2097152; "
+                f"cd {shquote(WSL_GSV_ROOT)} && "
+                f"{shquote(WSL_PYTHON)} api_v2.py -a 127.0.0.1 -p {TTS_PORT} -c {shquote(config_path)}"
+            )
+            API_PROCESS = ManagedProcess("inference engine", wsl_command(script), stop_script=WSL_STOP_SCRIPTS["api"])
+            API_PROCESS.start()
+            API_GPT_PATH = gpt_path
+            API_SOVITS_PATH = sovits_path
+            log(f"Starting inference engine on {API_URL}.")
+            return True
+    log("A voice engine is already accepting connections; applying the selected models.")
+    set_api_weights(gpt_path, sovits_path)
     return True
 
 
@@ -1170,9 +1170,11 @@ def stop_api():
         urllib.request.urlopen(API_URL + "/control?command=exit", timeout=1)
     except Exception:
         pass
-    run_wsl("pkill -f 'api_v2.py.*9880' || true", timeout=8)
     if API_PROCESS:
         API_PROCESS.stop()
+    else:
+        # An engine left by an earlier dashboard run.
+        stop_in_wsl(WSL_STOP_SCRIPTS["api"])
     API_PROCESS = None
     API_GPT_PATH = None
     API_SOVITS_PATH = None
@@ -1227,25 +1229,20 @@ def repair_streamed_wav(data):
     return out.getvalue()
 
 
-def windows_to_wsl(path):
-    path = Path(path).resolve()
-    drive = path.drive.rstrip(":").lower()
-    if not drive:
-        raise RuntimeError(f"Cannot map {path} into WSL.")
-    relative = path.as_posix().split(":", 1)[1].lstrip("/")
-    return f"/mnt/{drive}/{relative}"
-
-
 def dataset_sync_script(descriptor):
-    source = windows_to_wsl(descriptor["root"])
     target = descriptor["wsl_root"]
     list_name = descriptor["list_path"].name
+    # "&", "|" and "\" have a meaning in a sed replacement, so they are escaped.
+    sed_target = target.replace("\\", "\\\\").replace("&", "\\&").replace("|", "\\|")
     return (
         "set -e; "
+        # wslpath maps the Windows folder the way this distro mounts drives.
+        f"source_dir=$(wslpath -u {shquote(str(descriptor['root']))}); "
         f"mkdir -p {shquote(target)}/wavs; "
-        f"cp -r {shquote(source)}/wavs/. {shquote(target)}/wavs/; "
-        f"cp {shquote(source + '/' + list_name)} {shquote(target)}/source.list; "
-        f"sed 's|^wavs/|{target}/wavs/|' {shquote(target)}/source.list > {shquote(target)}/training.list; "
+        # -u copies only clips that are new or changed since the last sync.
+        f'cp -ru "$source_dir"/wavs/. {shquote(target)}/wavs/; '
+        f'cp "$source_dir"/{shquote(list_name)} {shquote(target)}/source.list; '
+        f"sed {shquote(f's|^wavs/|{sed_target}/wavs/|')} {shquote(target)}/source.list > {shquote(target)}/training.list; "
         f"echo Dataset synced; wc -l {shquote(target + '/training.list')}"
     )
 
@@ -1255,12 +1252,11 @@ def sync_dataset_job(dataset_id):
     summary = dataset_summary(descriptor)
     if not summary["ready"]:
         raise RuntimeError("The selected dataset needs matching audio files and transcript rows before it can be synced.")
-    # ": dataset-sync" is a no-op that puts a name for pkill into this shell's command line. The
-    # brackets in each pkill pattern keep it from matching the command line of the stop shell itself.
+    # ": dataset-sync" is a no-op that puts a name for pkill into this shell's command line.
     proc = ManagedProcess(
         f"Sync {descriptor['name']}",
         wsl_command(": dataset-sync; " + dataset_sync_script(descriptor)),
-        stop_script="pkill -f '[d]ataset-sync; ' || true",
+        stop_script=WSL_STOP_SCRIPTS["dataset-sync"],
     )
     with STATE_LOCK:
         current = JOBS.get("dataset-sync")
@@ -1312,7 +1308,7 @@ def prepare_tts_dataset_job(dataset_id, model_name):
         f"Prepare {descriptor['name']} for {model_name}",
         wsl_command(script),
         # Matches this job's shell, whose command line names the scripts, and each running script.
-        stop_script="pkill -f '[G]PT_SoVITS/prepare_datasets/' || true",
+        stop_script=WSL_STOP_SCRIPTS["dataset-prepare"],
     )
     with STATE_LOCK:
         current = JOBS.get("dataset-prepare")
@@ -1321,225 +1317,6 @@ def prepare_tts_dataset_job(dataset_id, model_name):
         JOBS["dataset-prepare"] = proc
     proc.start()
     log(f"Preparing dataset {descriptor['name']} for model {model_name}.")
-
-
-def prepare_voicechanger_job(dataset_id, copy_to_applio=True):
-    descriptor = dataset_descriptor(dataset_id)
-    command = [sys.executable, "prepare_voicechanger_dataset.py", "--dataset", descriptor["id"]]
-    if copy_to_applio and APPLIO_ROOT.exists():
-        command.extend(["--applio-root", str(APPLIO_ROOT)])
-    proc = ManagedProcess("voice changer dataset prep", command)
-    with STATE_LOCK:
-        current = JOBS.get("voicechanger-dataset")
-        if current and current.process and current.process.poll() is None:
-            raise RuntimeError("Voice changer dataset prep is already running.")
-        JOBS["voicechanger-dataset"] = proc
-    proc.start()
-    log("Voice changer dataset prep started.")
-
-
-def start_applio():
-    if realtime_ready():
-        log(f"Live voice changer engine is already running at {RVC_REALTIME_URL}.")
-        return
-    proc = ManagedProcess(
-        "live voice changer engine",
-        applio_command("app.py", "--client", "--server-name", "127.0.0.1", "--port", "6970"),
-        cwd=APPLIO_ROOT, env=applio_environment(),
-    )
-    with STATE_LOCK:
-        current = JOBS.get("applio")
-        if current and current.process and current.process.poll() is None:
-            raise RuntimeError("Applio is already running.")
-        JOBS["applio"] = proc
-    proc.start()
-    log(f"Starting live voice changer engine at {RVC_REALTIME_URL}.")
-
-
-def install_applio_job():
-    installer = APPLIO_ROOT / "run-install.bat"
-    if not installer.exists():
-        raise RuntimeError(f"Applio is not installed at {APPLIO_ROOT}. See voicechanger/README.md.")
-    subprocess.Popen(
-        ["cmd", "/c", str(installer)], cwd=APPLIO_ROOT,
-        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
-    )
-    log("Complete the Applio installer in its terminal, then restart the dashboard.")
-
-
-def start_rvc_training(model_name, epochs=100, batch_size=1, save_every=25, fresh=True):
-    epoch_increment = max(1, min(int(epochs), 200))
-    batch_size = max(1, min(int(batch_size), 2))
-    model_dir = APPLIO_ROOT / "logs" / model_name
-    if not APPLIO_ENV_PYTHON.exists():
-        raise RuntimeError("Applio is not installed.")
-    if not (model_dir / "filelist.txt").exists() or (model_dir / "filelist.txt").stat().st_size == 0:
-        raise RuntimeError("RVC filelist is empty. Run preprocessing and extraction first.")
-    pretrain_g = APPLIO_ROOT / "rvc" / "models" / "pretraineds" / "hifi-gan" / f"f0G{RVC_SAMPLE_RATE // 1000}k.pth"
-    pretrain_d = APPLIO_ROOT / "rvc" / "models" / "pretraineds" / "hifi-gan" / f"f0D{RVC_SAMPLE_RATE // 1000}k.pth"
-    if not pretrain_g.exists() or not pretrain_d.exists():
-        raise RuntimeError("RVC pretrained files are missing.")
-    # Applio resumes from the G_/D_ checkpoints when they exist. "fresh" is Applio's cleanup
-    # argument, which deletes them, so training starts again at epoch 1 and the target is the
-    # requested epoch count alone.
-    current_epoch = 0
-    if not fresh and any(model_dir.glob("G_*.pth")):
-        for checkpoint in model_dir.glob(f"{model_name}_*e_*s.pth"):
-            match = re.search(r"_(\d+)e_\d+s\.pth$", checkpoint.name)
-            if match:
-                current_epoch = max(current_epoch, int(match.group(1)))
-    target_epoch = current_epoch + epoch_increment
-    save_every = max(1, min(int(save_every), epoch_increment))
-    args = [
-        model_name,
-        str(save_every),
-        str(target_epoch),
-        str(pretrain_g.relative_to(APPLIO_ROOT)),
-        str(pretrain_d.relative_to(APPLIO_ROOT)),
-        "0",
-        str(batch_size),
-        str(RVC_SAMPLE_RATE),
-        "True",
-        "True",
-        "False",
-        "True" if fresh else "False",
-        "HiFi-GAN",
-        "False",
-    ]
-    proc = ManagedProcess(
-        "RVC training", applio_command("-u", "rvc/train/train.py", *args),
-        cwd=APPLIO_ROOT, env=applio_environment(),
-    )
-    with STATE_LOCK:
-        current = JOBS.get("train-rvc")
-        if current and current.process and current.process.poll() is None:
-            raise RuntimeError("RVC training is already running.")
-        JOBS["train-rvc"] = proc
-    proc.start()
-    log(f"RVC training started: {'new run' if fresh else 'resumed'}, target_epoch={target_epoch}, batch={batch_size}, save_every={save_every}.")
-
-
-def start_rvc_index(model_name, index_algorithm="Auto"):
-    model_dir = APPLIO_ROOT / "logs" / model_name
-    if not APPLIO_ENV_PYTHON.exists():
-        raise RuntimeError("Applio is not installed.")
-    if not (model_dir / "extracted").exists():
-        raise RuntimeError("RVC features are missing. Run preprocessing and extraction first.")
-    proc = ManagedProcess(
-        "RVC index",
-        applio_command("-u", "rvc/train/process/extract_index.py", f"logs/{model_name}", index_algorithm),
-        cwd=APPLIO_ROOT, env=applio_environment(),
-    )
-    with STATE_LOCK:
-        current = JOBS.get("rvc-index")
-        if current and current.process and current.process.poll() is None:
-            raise RuntimeError("RVC index generation is already running.")
-        JOBS["rvc-index"] = proc
-    proc.start()
-    log(f"RVC index generation started: {index_algorithm}.")
-
-
-RVC_PROCESS_SCRIPT = r"""
-$all = @(Get-CimInstance Win32_Process)
-$skip = @($PID, __DASHBOARD_PID__)
-$found = @{}
-foreach ($p in $all) {
-    if ($skip -notcontains $p.ProcessId -and $p.Name -notmatch '^(powershell|pwsh)' -and $p.CommandLine -match '__PATTERN__') {
-        $found[[int]$p.ProcessId] = $p.CreationDate
-    }
-}
-if (__STOP__) {
-    # Add child processes, such as multiprocessing workers. A child must have started after its
-    # parent, so a process whose parent ID was later reused by a matched process is left alone.
-    do {
-        $added = 0
-        foreach ($p in $all) {
-            $id = [int]$p.ProcessId
-            $parent = [int]$p.ParentProcessId
-            if (-not $found.ContainsKey($id) -and $skip -notcontains $id -and $found.ContainsKey($parent) -and $p.CreationDate -ge $found[$parent]) {
-                $found[$id] = $p.CreationDate
-                $added++
-            }
-        }
-    } while ($added)
-    foreach ($id in $found.Keys) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }
-}
-$found.Keys
-"""
-
-
-def run_powershell(script, timeout):
-    # -EncodedCommand takes the script as base64 UTF-16, so its quotes and backslashes need no escaping.
-    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-    return subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-
-
-def rvc_process_pattern(model_name=""):
-    """Regex for the command lines of Applio training, feature, and index processes.
-
-    It matches Applio's script paths, and the model's logs folder only as a whole path part,
-    never the bare model name, so a short name such as "voice" cannot select other programs."""
-    patterns = [r"rvc[\\/]train[\\/]train\.py", r"extract_index\.py"]
-    model_name = re.sub(r"[^A-Za-z0-9_-]", "", str(model_name or ""))
-    if model_name:
-        patterns.append(rf"(^|[\s\x22\x27\\/])logs[\\/]{model_name}($|[\s\x22\x27\\/])")
-    return "|".join(patterns)
-
-
-def rvc_process_ids(model_name="", stop=False, timeout=4):
-    """PIDs of running Applio training, feature, and index processes. stop=True also ends them and their children."""
-    script = (
-        RVC_PROCESS_SCRIPT.replace("__PATTERN__", rvc_process_pattern(model_name))
-        .replace("__DASHBOARD_PID__", str(os.getpid()))
-        .replace("__STOP__", "$true" if stop else "$false")
-    )
-    result = run_powershell(script, timeout)
-    return [int(line) for line in result.stdout.split() if line.isdigit()]
-
-
-def stop_rvc_training_children(model_name=""):
-    try:
-        stopped = rvc_process_ids(model_name, stop=True, timeout=8)
-    except (OSError, subprocess.SubprocessError) as exc:
-        log(f"Could not clean up RVC child processes: {exc}")
-        return
-    if stopped:
-        log(f"Stopped RVC process(es) {', '.join(map(str, sorted(stopped)))}.")
-
-
-def stop_applio_children():
-    try:
-        subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                (
-                    "$ports = Get-NetTCPConnection -State Listen,Established -ErrorAction SilentlyContinue | "
-                    "Where-Object { $_.LocalPort -eq 6970 -or $_.RemotePort -eq 6970 }; "
-                    "$ids = @(); "
-                    "foreach ($p in $ports) { if ($p.OwningProcess) { $ids += [int]$p.OwningProcess } }; "
-                    "$ids = $ids | Sort-Object -Unique; "
-                    "foreach ($id in $ids) { "
-                    "$proc = Get-CimInstance Win32_Process -Filter \"ProcessId=$id\" -ErrorAction SilentlyContinue; "
-                    "if ($proc -and ($proc.Name -notmatch 'powershell|pwsh') -and "
-                    "($proc.CommandLine -like '*app.py --client*' -or $proc.CommandLine -like '*Applio-ROCm*app.py*')) { "
-                    "Stop-Process -Id $id -Force } }"
-                ),
-            ],
-            text=True,
-            capture_output=True,
-            timeout=8,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except Exception as exc:
-        log(f"Could not clean up live voice changer engine: {exc}")
 
 
 def start_train(kind, epochs, batch_size, save_every, dataset_id="", model_name="voice-model"):
@@ -1559,7 +1336,6 @@ def start_train(kind, epochs, batch_size, save_every, dataset_id="", model_name=
             f"cd {shquote(WSL_GSV_ROOT)} && "
             f"{shquote(WSL_PYTHON)} -s GPT_SoVITS/s1_train.py --config_file {shquote(config_path)}"
         )
-        stop_script = "pkill -f 'GPT_SoVITS/s1_train.py' || true"
         name = f"GPT training: {model_name}"
     elif kind == "sovits":
         config_path = write_s2_config(epochs, batch_size, save_every, model_name)
@@ -1568,12 +1344,11 @@ def start_train(kind, epochs, batch_size, save_every, dataset_id="", model_name=
             f"cd {shquote(WSL_GSV_ROOT)} && "
             f"{shquote(WSL_PYTHON)} -s GPT_SoVITS/s2_train.py --config {shquote(config_path)}"
         )
-        stop_script = "pkill -f 'GPT_SoVITS/s2_train.py' || true"
         name = f"SoVITS training: {model_name}"
     else:
         raise ValueError("Unknown training kind.")
-    proc = ManagedProcess(name, wsl_command(script), stop_script=stop_script)
     key = f"train-{kind}"
+    proc = ManagedProcess(name, wsl_command(script), stop_script=WSL_STOP_SCRIPTS[key])
     with STATE_LOCK:
         current = JOBS.get(key)
         if current and current.process and current.process.poll() is None:
@@ -1605,9 +1380,48 @@ def latest_log_text():
     return "\n".join(chunks)
 
 
+def new_output_path(folder, voice):
+    # Call with GENERATION_LOCK held, so no other generation takes the same name meanwhile.
+    folder.mkdir(parents=True, exist_ok=True)
+    stem = slugify(voice, "voice") + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    path = folder / f"{stem}.wav"
+    counter = 2
+    while path.exists():
+        path = folder / f"{stem}-{counter}.wav"
+        counter += 1
+    return path
+
+
+def prune_relay_outputs(keep=RELAY_OUTPUT_LIMIT):
+    files = sorted(RELAY_OUTPUT_DIR.glob("*.wav"), key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+    for path in files[keep:]:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+class DashboardServer(ThreadingHTTPServer):
+    # On Windows, SO_REUSEADDR lets a second server bind a port that is already in use, and the
+    # two then share its requests. SO_EXCLUSIVEADDRUSE makes the second bind fail instead.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
+
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            # The browser closed the connection, as an audio element does when it seeks.
+            pass
 
     def request_allowed(self):
         """Accept requests addressed to this dashboard, sent by its own page or by a local tool.
@@ -1681,19 +1495,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(setup_status())
             return
         if path == "/api/system-state":
-            self.send_json({"system": system_snapshot(), "ptt": dict(PTT_STATE)})
+            self.send_json({"system": system_snapshot()})
             return
         if path == "/api/state":
             query = urllib.parse.parse_qs(parsed_url.query)
-            section = query.get("section", [""])[0]
             datasets = list_datasets()
             dataset_ids = {row["id"] for row in datasets}
             dataset_id = query.get("dataset", [""])[0]
             if dataset_id not in dataset_ids:
                 dataset_id = datasets[0]["id"] if datasets else ""
-            rvc_dataset = query.get("rvc_dataset", [""])[0]
-            if rvc_dataset not in dataset_ids:
-                rvc_dataset = dataset_id
             all_references = parse_references(dataset_id, valid_only=False)
             data = {
                 "config_error": CONFIG_ERROR,
@@ -1705,11 +1515,8 @@ class Handler(BaseHTTPRequestHandler):
                 "all_references": all_references,
                 "api_ready": api_ready(),
                 "relay_asr_ready": relay_asr_ready(),
-                "voicechanger": voicechanger_status(rvc_dataset, query.get("rvc_model", [""])[0]) if section in ("", "voicechanger") else None,
                 "jobs": {key: proc.snapshot() for key, proc in JOBS.items()},
-                "api_process": API_PROCESS.snapshot() if API_PROCESS else None,
                 "system": system_snapshot(),
-                "ptt": dict(PTT_STATE),
                 "log": latest_log_text(),
             }
             self.send_json(data)
@@ -1784,6 +1591,9 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            # No answer can reach a closed connection. handle() ends the request quietly.
+            raise
         except Exception as exc:
             self.send_error(500, str(exc))
 
@@ -1813,7 +1623,6 @@ class Handler(BaseHTTPRequestHandler):
                 with PTT_CONDITION:
                     PTT_STATE["held"] = bool(body.get("held"))
                     PTT_STATE["sequence"] += 1
-                    PTT_STATE["last_event_at"] = time.time()
                     PTT_CONDITION.notify_all()
                 self.send_json({"ok": True})
                 return
@@ -1849,18 +1658,6 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("dataset_id") or "",
                     body.get("model_name") or "voice-model",
                 )
-                self.send_json({"ok": True})
-                return
-            if path == "/api/prepare-voicechanger":
-                prepare_voicechanger_job(body.get("dataset_id") or default_dataset_id(), copy_to_applio=True)
-                self.send_json({"ok": True})
-                return
-            if path == "/api/install-applio":
-                install_applio_job()
-                self.send_json({"ok": True})
-                return
-            if path == "/api/start-applio":
-                start_applio()
                 self.send_json({"ok": True})
                 return
             if path == "/api/start-api":
@@ -1910,40 +1707,20 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"ok": True})
                 return
-            if path == "/api/start-rvc-training":
-                start_rvc_training(
-                    rvc_model_name(body.get("dataset_id") or default_dataset_id(), body.get("model_name")),
-                    int(body.get("epochs", 100)),
-                    int(body.get("batch_size", 1)),
-                    int(body.get("save_every", 25)),
-                    bool(body.get("fresh", True)),
-                )
-                self.send_json({"ok": True})
-                return
-            if path == "/api/start-rvc-index":
-                start_rvc_index(rvc_model_name(body.get("dataset_id") or default_dataset_id(), body.get("model_name")), body.get("algorithm", "Auto"))
-                self.send_json({"ok": True})
-                return
             if path == "/api/stop-job":
                 key = body.get("key")
                 proc = JOBS.get(key)
-                if key == "train-rvc":
-                    # Stop the trainer's process tree first, while its workers still record it as their
-                    # parent. "stopping" keeps the job from reporting that exit as a failure.
-                    if proc and proc.process and proc.process.poll() is None:
-                        proc.status = "stopping"
-                    stop_rvc_training_children(rvc_model_name(body.get("dataset_id") or default_dataset_id(), body.get("model_name")))
                 if proc:
                     proc.stop()
-                if key == "applio":
-                    stop_applio_children()
+                elif key in WSL_STOP_SCRIPTS:
+                    # Started before the dashboard restarted, so only WSL still knows the job.
+                    stop_in_wsl(WSL_STOP_SCRIPTS[key])
                 self.send_json({"ok": True})
                 return
             if path == "/api/generate":
                 if not api_ready():
                     self.send_json({"ok": False, "error": "Inference engine is not ready yet."}, 409)
                     return
-                set_api_weights(body.get("gpt"), body.get("sovits"))
                 payload = {
                     "text": body["text"],
                     "text_lang": language_code(body.get("text_lang")),
@@ -1970,32 +1747,39 @@ class Handler(BaseHTTPRequestHandler):
                 if generation_id:
                     with STATE_LOCK:
                         CANCELLED_GENERATIONS.discard(generation_id)
-                started = time.time()
                 req = urllib.request.Request(
                     API_URL + "/tts",
                     data=json.dumps(payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
-                with urllib.request.urlopen(req, timeout=240) as resp:
-                    data = resp.read()
-                    if "application/json" in resp.headers.get("Content-Type", ""):
-                        self.send_json({"ok": False, "error": data.decode("utf-8", errors="replace")}, 400)
-                        return
-                if generation_id:
-                    with STATE_LOCK:
-                        cancelled = generation_id in CANCELLED_GENERATIONS
-                        CANCELLED_GENERATIONS.discard(generation_id)
-                    if cancelled:
-                        log(f"Discarded cancelled relay generation {generation_id}.")
-                        self.send_json({"ok": False, "cancelled": True, "error": "Generation cancelled."}, 409)
-                        return
-                if int(payload.get("streaming_mode", 0)):
-                    data = repair_streamed_wav(data)
-                name = slugify(body.get("voice"), "voice") + "_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".wav"
-                (OUTPUT_DIR / name).write_bytes(data)
-                log(f"Generated {name} in {time.time() - started:.1f}s.")
-                self.send_json({"ok": True, "url": "/outputs/" + name, "name": name})
+                # The Generate page and Relay can ask at the same time. One at a time keeps one
+                # request from switching the models while the other is generating.
+                with GENERATION_LOCK:
+                    started = time.time()
+                    set_api_weights(body.get("gpt"), body.get("sovits"))
+                    with urllib.request.urlopen(req, timeout=240) as resp:
+                        data = resp.read()
+                        if "application/json" in resp.headers.get("Content-Type", ""):
+                            self.send_json({"ok": False, "error": data.decode("utf-8", errors="replace")}, 400)
+                            return
+                    if generation_id:
+                        with STATE_LOCK:
+                            cancelled = generation_id in CANCELLED_GENERATIONS
+                            CANCELLED_GENERATIONS.discard(generation_id)
+                        if cancelled:
+                            log(f"Discarded cancelled relay generation {generation_id}.")
+                            self.send_json({"ok": False, "cancelled": True, "error": "Generation cancelled."}, 409)
+                            return
+                    if int(payload.get("streaming_mode", 0)):
+                        data = repair_streamed_wav(data)
+                    output = new_output_path(RELAY_OUTPUT_DIR if body.get("relay") else OUTPUT_DIR, body.get("voice"))
+                    output.write_bytes(data)
+                if body.get("relay"):
+                    prune_relay_outputs()
+                log(f"Generated {output.name} in {time.time() - started:.1f}s.")
+                url = "/outputs/" + output.relative_to(OUTPUT_DIR).as_posix()
+                self.send_json({"ok": True, "url": url, "name": output.name})
                 return
             self.send_error(404)
         except urllib.error.HTTPError as exc:
@@ -2065,7 +1849,6 @@ HTML = r"""<!doctype html>
     }
     h1 { margin: 0; font-size: 16px; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
     h2 { margin: 0 0 var(--space-3); font-size: 15px; letter-spacing: 0; }
-    .subtitle { color: var(--muted); font-size: 13px; margin-top: 2px; }
     .chip {
       border: 1px solid var(--line);
       background: var(--panel);
@@ -2116,7 +1899,6 @@ HTML = r"""<!doctype html>
       padding: var(--space-5);
       box-shadow: 0 8px 24px rgba(0,0,0,.12);
     }
-    .stack { display: grid; gap: var(--space-4); align-content: start; }
     .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
     .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-4); }
     label { display: block; color: var(--muted); font-size: 12px; margin-bottom: var(--space-2); }
@@ -2188,7 +1970,6 @@ HTML = r"""<!doctype html>
     .row > * { flex: 1; }
     .row > button { flex: 0 0 auto; }
     .small { color: var(--muted); font-size: 12px; }
-    .ptt-button.active { background: #2b5839; border-color: var(--accent); color: #eef8f1; }
     .mini-button {
       min-height: 32px;
       padding: 5px 9px;
@@ -2272,19 +2053,8 @@ HTML = r"""<!doctype html>
       font-size: 12px;
     }
     audio { width: 100%; margin-top: 8px; }
-    .relay-capture-row { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; padding-bottom: var(--space-4); margin-bottom: var(--space-4); border-bottom: 1px solid var(--line-subtle); }
-    .relay-capture-row .ptt-button { flex: 0 0 200px; width: 200px; min-height: var(--control-height); font-size: 14px; }
-    .relay-capture-row label { margin: 0; }
-    .relay-key-display { display: inline-flex; align-items: center; justify-content: center; min-width: 128px; min-height: var(--control-height); padding: 0 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--field); font-size: 13px; text-align: center; }
-    .relay-listen-status { margin-left: auto; }
-    /* One shared grid for both columns keeps every row pair at the same height. */
-    .relay-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2) var(--space-5); }
-    .relay-grid > * { min-width: 0; }
-    .relay-grid > .col2 { grid-column: 2; }
-    .relay-cell { display: grid; gap: var(--space-2); align-content: start; min-width: 0; }
     .relay-block-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); min-height: 32px; }
     .relay-block-head label { margin: 0; }
-    .relay-actions { display: flex; gap: var(--space-2); }
     .relay-volume-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--space-3); }
     .relay-volume-row label { margin: 0; }
     #tab-generate audio { display: block; width: 100%; min-width: 0; height: 40px; margin: 0; }
@@ -2292,34 +2062,11 @@ HTML = r"""<!doctype html>
     #targetText { min-height: 88px; }
     #tab-generate .check-list { height: 190px; margin-top: 0; }
     #tab-generate .selected-list { margin-top: 0; min-height: var(--control-height); }
-    .page-heading { margin-bottom: var(--space-5); padding-bottom: var(--space-4); border-bottom: 1px solid var(--line-subtle); }
-    .page-heading h2 { font-size: 20px; letter-spacing: .08em; text-transform: uppercase; }
-    .ptt-button { letter-spacing: .04em; }
-    .ptt-button.active { box-shadow: 0 0 0 4px var(--accent-soft); }
-    .chip.stat strong { color: var(--muted); font-weight: 700; margin-left: 6px; }
-    .chip.stat.ready { border-color: var(--accent-dark); }
-    .chip.stat.ready strong { color: var(--good); }
-    .chip.stat.starting strong { color: var(--warn); }
-    .chip.stat.failed { border-color: #743333; }
-    .chip.stat.failed strong { color: var(--bad); }
     .cancel-generation { display: none; }
     .cancel-generation.visible { display: inline-block; }
-    details.advanced { border: 1px solid var(--line-subtle); background: var(--field); margin-top: var(--space-4); }
-    details.advanced > summary { cursor: pointer; padding: var(--space-3) var(--space-4); color: var(--text); font-weight: 700; letter-spacing: .04em; }
-    details.advanced > .advanced-body { border-top: 1px solid var(--line-subtle); padding: var(--space-4); }
     .global-error { display: none; max-width: 1680px; margin: 12px auto 0; border: 1px solid #7e4944; background: #2c1d1b; color: #e5b8b3; padding: 12px 16px; }
     .global-error.visible { display: flex; align-items: center; justify-content: space-between; gap: 15px; }
-    .experimental-label { color: var(--muted); font-size: 10px; margin-left: 5px; }
     .setup-list { display: grid; gap: var(--space-2); }
-    .setup-intro {
-      margin-bottom: var(--space-4);
-      padding: var(--space-4);
-      border: 1px solid var(--line-subtle);
-      border-radius: var(--radius);
-      background: var(--field);
-    }
-    .setup-intro > strong { display: block; margin-bottom: var(--space-1); font-size: 14px; }
-    .setup-intro p { margin: 0; color: var(--muted); }
     .setup-scope-grid {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2334,21 +2081,6 @@ HTML = r"""<!doctype html>
       background: var(--panel);
     }
     .setup-scope-item strong { display: block; margin-bottom: var(--space-2); }
-    .setup-safety {
-      margin-top: var(--space-4);
-      padding-top: var(--space-3);
-      border-top: 1px solid var(--line-subtle);
-      color: var(--muted);
-    }
-    .setup-safety strong { color: var(--text); }
-    .setup-actions {
-      display: flex;
-      align-items: center;
-      gap: var(--space-3);
-      flex-wrap: wrap;
-      margin-bottom: var(--space-4);
-    }
-    .setup-actions button { min-width: 210px; }
     .setup-legend {
       display: flex;
       gap: var(--space-3);
@@ -2367,17 +2099,6 @@ HTML = r"""<!doctype html>
     .upload-list { display: grid; gap: var(--space-2); max-height: 310px; overflow: auto; margin-top: var(--space-3); }
     .upload-row { display: grid; grid-template-columns: minmax(150px,.7fr) minmax(260px,1.5fr); gap: var(--space-2); align-items: center; border: 1px solid var(--line-subtle); padding: var(--space-2); background: #101214; }
     .upload-row .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
-    .relay-transcript {
-      min-height: 150px;
-      max-height: 260px;
-      overflow: auto;
-      white-space: pre-wrap;
-      background: var(--field);
-      border: 1px solid var(--line-subtle);
-      border-radius: var(--radius);
-      padding: var(--space-3);
-      color: var(--text);
-    }
     .models {
       display: grid;
       gap: 8px;
@@ -2389,7 +2110,6 @@ HTML = r"""<!doctype html>
     }
     .model-line { color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; gap: 12px; }
     .output-name { color: var(--good); font-weight: 700; }
-    .error-text { color: var(--bad); }
     /* ---------- Relay page: history sidebar, central workspace ---------- */
     :root { --rec: #e0524a; --rec-soft: rgba(224, 82, 74, .18); --header-height: 56px; --island-height: 112px; }
     section.relay-page {
@@ -2755,7 +2475,7 @@ HTML = r"""<!doctype html>
     .settings-body { padding: 18px; display: grid; gap: 20px; overflow: auto; max-height: calc(100vh - 130px); }
     .settings-body h3 { margin: 0 0 10px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
     .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
-    /* ---------- Secondary pages: Generate, Training, Voice Changer, Logs, Setup ---------- */
+    /* ---------- Secondary pages: Generate, Training, Logs, Setup ---------- */
     section.page {
       background: transparent;
       border: 0;
@@ -2832,8 +2552,6 @@ HTML = r"""<!doctype html>
       .setup-scope-grid { grid-template-columns: 1fr; }
       header { grid-template-columns: 1fr; }
       header .tablist { justify-content: flex-start; }
-      .relay-grid { grid-template-columns: 1fr; }
-      .relay-grid > .col2 { grid-column: 1; }
       section.relay-page { grid-template-columns: 1fr; gap: var(--space-3); }
       .history-toggle { display: inline-flex; gap: 4px; justify-self: start; }
       .history {
@@ -2854,8 +2572,6 @@ HTML = r"""<!doctype html>
     @media (max-width: 760px) {
       :root { --island-height: 150px; }
       body { padding-bottom: 160px; }
-      .relay-capture-row .ptt-button { flex: 1 1 100%; width: 100%; }
-      .relay-listen-status { margin-left: 0; flex-basis: 100%; }
       .island { border-radius: 18px; gap: 6px; }
       .island-group + .island-group { border-left: 0; padding-left: 0; margin-left: 0; }
       .island-system-state { max-width: 160px; }
@@ -2886,7 +2602,6 @@ HTML = r"""<!doctype html>
       <button class="tab-button active" data-tab="relay" role="tab" aria-selected="true">Relay</button>
       <button class="tab-button" data-tab="generate" role="tab" aria-selected="false">Generate</button>
       <button class="tab-button" data-tab="training" role="tab" aria-selected="false">TTS Training</button>
-      <button class="tab-button" data-tab="voicechanger" role="tab" aria-selected="false">Voice Changer <span class="experimental-label">Experimental</span></button>
       <button class="tab-button" data-tab="logs" role="tab" aria-selected="false">Logs</button>
       <button class="tab-button" data-tab="setup" role="tab" aria-selected="false">Setup</button>
     </nav>
@@ -3110,84 +2825,6 @@ HTML = r"""<!doctype html>
         </div>
       </section>
 
-      <section id="tab-voicechanger" class="tab-panel page" role="tabpanel">
-        <div class="page-head"><h2>Live Voice Changer <span class="experimental-label">Experimental</span></h2><span class="small">Converts your microphone in real time with an RVC model running in Applio.</span></div>
-
-        <div class="panel">
-          <div class="panel-head"><h3>Live voice</h3><span class="status-line" id="liveVoiceStatus">stopped</span></div>
-          <div class="field-row">
-            <div><label for="liveInputDevice">Microphone</label><select id="liveInputDevice"></select></div>
-            <div><label for="liveOutputDevice">Output</label><select id="liveOutputDevice"></select></div>
-            <div><label for="liveRvcModel">Live model</label><select id="liveRvcModel"></select></div>
-            <div><label for="liveRvcIndex">Live index</label><select id="liveRvcIndex"></select></div>
-          </div>
-          <div class="row" style="margin-top: 12px;">
-            <button class="primary-big" id="startLiveVoice">Start Live Voice</button>
-            <button class="danger" id="stopLiveVoice">Stop Live Voice</button>
-            <button class="secondary" id="refreshLiveDevices">Refresh Devices</button>
-            <span class="status-line" id="liveAudioStats">mic: idle | output: idle</span>
-          </div>
-          <details class="sub">
-            <summary>Tuning</summary>
-            <div class="sub-body">
-              <div class="grid3">
-                <div><label for="livePitch">Pitch</label><input id="livePitch" type="number" value="-3" min="-24" max="24" /></div>
-                <div><label for="liveIndexRate">Index rate</label><input id="liveIndexRate" type="number" value="0.90" min="0" max="1" step="0.05" /></div>
-                <div><label for="liveProtect">Protect</label><input id="liveProtect" type="number" value="0.45" min="0" max="0.5" step="0.01" /></div>
-                <div><label for="liveChunkMs">Chunk ms</label><input id="liveChunkMs" type="number" value="120" min="40" max="300" step="10" /></div>
-                <div><label for="liveExtraSec">Extra seconds</label><input id="liveExtraSec" type="number" value="0.5" min="0.1" max="2" step="0.1" /></div>
-                <div><label for="liveSilenceDb">Silence dB</label><input id="liveSilenceDb" type="number" value="-90" min="-90" max="-60" /></div>
-                <div><label for="liveInputGain">Mic gain</label><input id="liveInputGain" type="number" value="100" min="25" max="300" step="5" /></div>
-                <div><label for="liveOutputGain">Monitor volume <span id="liveOutputGainLabel">2.0x</span></label><input id="liveOutputGain" type="range" value="2" min="0" max="6" step="0.25" /></div>
-                <div><label><input id="liveMonitorLeveler" type="checkbox" checked /> Steady monitor volume</label></div>
-              </div>
-            </div>
-          </details>
-        </div>
-
-        <div class="panel">
-          <div class="panel-head"><h3>Engine</h3><span class="status-line" id="applioChip">not installed</span></div>
-          <div class="row">
-            <button class="secondary" id="startApplio">Start Live Engine</button>
-            <button class="danger" data-stop="applio">Stop Engine</button>
-            <button class="secondary" id="installApplio">Install Applio</button>
-            <span class="small">The live engine must be running before Start Live Voice.</span>
-          </div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-head"><h3>Train an RVC model</h3><span class="status-line" id="rvcTrainStatus">not running</span></div>
-          <div class="field-row" style="margin-bottom: 12px;">
-            <div><label for="rvcDataset">Source dataset</label><select id="rvcDataset"></select></div>
-            <div><label for="rvcModelName">RVC model name</label><input id="rvcModelName" placeholder="voice_rvc_32k" /></div>
-          </div>
-          <div class="row" style="margin-bottom: 12px;">
-            <span class="status-line" id="vcDatasetChip">not prepared</span>
-            <button class="secondary" id="prepareVoiceChanger">Prepare RVC Dataset</button>
-          </div>
-          <div class="grid3">
-            <div><label for="rvcEpochs">RVC epochs</label><input id="rvcEpochs" type="number" value="50" min="1" max="200" /></div>
-            <div><label for="rvcBatch">Batch size</label><input id="rvcBatch" type="number" value="1" min="1" max="2" /></div>
-            <div><label for="rvcSave">Save every N epochs</label><input id="rvcSave" type="number" value="10" min="1" max="50" /></div>
-          </div>
-          <div class="row" style="margin-top: 12px;">
-            <button id="trainRvc">Start RVC Training</button>
-            <button class="secondary" id="buildRvcIndex">Build Index</button>
-            <button class="danger" data-stop="train-rvc">Stop RVC</button>
-          </div>
-          <details class="sub">
-            <summary>Features, checkpoints, and files</summary>
-            <div class="sub-body">
-              <div class="small" id="rvcFeatureStatus"></div>
-              <div class="small" id="rvcCheckpointStatus"></div>
-              <div class="small" id="rvcIndexStatus"></div>
-              <div class="models" id="rvcModelList" style="border-top: 0; padding-top: 0; margin-top: 0;"></div>
-              <div class="small" id="vcPath"></div>
-            </div>
-          </details>
-        </div>
-      </section>
-
       <section id="tab-logs" class="tab-panel page page-wide" role="tabpanel">
         <div class="page-head">
           <h2>Logs</h2>
@@ -3322,13 +2959,13 @@ HTML = r"""<!doctype html>
         if (old !== null && localStorage.getItem("voiceDashboard" + key) === null) localStorage.setItem("voiceDashboard" + key, old);
       } catch (_) {}
     });
+    // Settings of the removed voice changer page.
+    try { ["voiceDashboardRvcDataset", "voiceDashboardRvcModelName"].forEach(key => localStorage.removeItem(key)); }
+    catch (_) {}
     let state = null;
     let voiceDataset = "";
-    let rvcDataset = "";
-    try {
-      voiceDataset = localStorage.getItem("voiceDashboardVoiceDataset") || "";
-      rvcDataset = localStorage.getItem("voiceDashboardRvcDataset") || "";
-    } catch (_) {}
+    try { voiceDataset = localStorage.getItem("voiceDashboardVoiceDataset") || ""; }
+    catch (_) {}
     let auxSelected = new Set();
     let relayAuxSelected = new Set();
     try { relayAuxSelected = new Set(JSON.parse(localStorage.getItem("voiceDashboardRelayAuxSelected") || "[]")); }
@@ -3336,19 +2973,7 @@ HTML = r"""<!doctype html>
     let refsSignature = "";
     let modelsSignature = "";
     let refreshBusy = false;
-    let currentTab = "relay";
     const $ = id => document.getElementById(id);
-    let liveStream = null;
-    let liveAudioCtx = null;
-    let liveInputNode = null;
-    let liveInputKeepAlive = null;
-    let livePlaybackNode = null;
-    let liveWs = null;
-    let liveOutputRoute = null;
-    let liveLastSend = 0;
-    let liveLastInputDb = null;
-    let liveLastOutputDb = null;
-    let liveLevelerGain = 1;
     let relayListening = false;
     let relayQueue = [];
     let relayBusy = false;
@@ -3464,19 +3089,16 @@ HTML = r"""<!doctype html>
     }
 
     function fillDatasetSelects(datasets, activeId) {
-      ["voiceDataset", "relayDataset", "rvcDataset"].forEach(id => {
+      ["voiceDataset", "relayDataset"].forEach(id => {
         const select = $(id);
-        const wanted = id === "rvcDataset" ? (rvcDataset || activeId) : activeId;
         select.innerHTML = "";
         datasets.forEach(dataset => option(select, dataset.id, `${dataset.name} — ${dataset.wav_count} clips`));
-        if (datasets.some(dataset => dataset.id === wanted)) select.value = wanted;
+        if (datasets.some(dataset => dataset.id === activeId)) select.value = activeId;
       });
       if (activeId !== voiceDataset) {
         voiceDataset = activeId;
         try { localStorage.setItem("voiceDashboardVoiceDataset", voiceDataset); } catch (_) {}
       }
-      if (!rvcDataset) rvcDataset = $("rvcDataset").value;
-      $("rvcModelName").placeholder = rvcDataset ? `${rvcDataset.replace(/-/g, "")}_rvc_32k` : "voice_rvc_32k";
     }
 
     function fillTrainingDatasets(datasets) {
@@ -3530,7 +3152,6 @@ HTML = r"""<!doctype html>
     }
     function activateTab(name) {
       if (!$(`tab-${name}`)) name = "relay";
-      currentTab = name;
       document.body.dataset.tab = name;
       document.querySelectorAll(".tab-button").forEach(button => {
         const active = button.dataset.tab === name;
@@ -3549,124 +3170,11 @@ HTML = r"""<!doctype html>
       };
     });
     activateTab((location.hash || "#relay").slice(1));
-    const inputWorkletSource = `
-class InputProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this.buffer = new Float32Array(48000);
-    this.write = 0;
-    this.read = 0;
-    this.available = 0;
-    this.blockFrame = 5760;
-    this.port.onmessage = event => {
-      if (event.data && event.data.blockFrame) this.blockFrame = event.data.blockFrame;
-    };
-  }
-  process(inputs) {
-    const input = inputs[0];
-    if (!input || !input[0]) return true;
-    const frame = input[0];
-    if (this.available + frame.length <= this.buffer.length) {
-      for (let i = 0; i < frame.length; i++) {
-        this.buffer[this.write] = frame[i];
-        this.write = (this.write + 1) % this.buffer.length;
-      }
-      this.available += frame.length;
-    }
-    while (this.available >= this.blockFrame) {
-      const chunk = new Float32Array(this.blockFrame);
-      for (let i = 0; i < this.blockFrame; i++) {
-        chunk[i] = this.buffer[this.read];
-        this.read = (this.read + 1) % this.buffer.length;
-      }
-      this.available -= this.blockFrame;
-      this.port.postMessage({chunk}, [chunk.buffer]);
-    }
-    return true;
-  }
-}
-registerProcessor("dashboard-input", InputProcessor);
-`;
-    const playbackWorkletSource = `
-class PlaybackProcessor extends AudioWorkletProcessor {
-  constructor(options) {
-    super(options);
-    const size = options.processorOptions && options.processorOptions.bufferSize ? options.processorOptions.bufferSize : 24000;
-    this.buffer = new Float32Array(size);
-    this.write = 0;
-    this.read = 0;
-    this.available = 0;
-    this.port.onmessage = event => {
-      if (!event.data || !event.data.chunk) return;
-      const chunk = new Float32Array(event.data.chunk);
-      if (this.available + chunk.length > this.buffer.length) return;
-      for (let i = 0; i < chunk.length; i++) {
-        this.buffer[this.write] = chunk[i];
-        this.write = (this.write + 1) % this.buffer.length;
-      }
-      this.available += chunk.length;
-    };
-  }
-  process(inputs, outputs) {
-    const output = outputs[0];
-    if (!output || !output[0]) return true;
-    const frameLength = output[0].length;
-    if (this.available >= frameLength) {
-      for (let i = 0; i < frameLength; i++) {
-        const sample = this.buffer[this.read];
-        this.read = (this.read + 1) % this.buffer.length;
-        for (let ch = 0; ch < output.length; ch++) {
-          output[ch][i] = sample;
-        }
-      }
-      this.available -= frameLength;
-    } else {
-      for (let ch = 0; ch < output.length; ch++) output[ch].fill(0);
-    }
-    return true;
-  }
-}
-registerProcessor("dashboard-playback", PlaybackProcessor);
-`;
-
     function option(select, value, label) {
       const opt = document.createElement("option");
       opt.value = value;
       opt.textContent = label;
       select.appendChild(opt);
-    }
-
-    async function addWorklet(ctx, source) {
-      const url = URL.createObjectURL(new Blob([source], {type: "application/javascript"}));
-      try {
-        await ctx.audioWorklet.addModule(url);
-      } finally {
-        URL.revokeObjectURL(url);
-      }
-    }
-
-    async function refreshLiveDevices() {
-      if (!navigator.mediaDevices) {
-        $("liveVoiceStatus").textContent = "browser audio devices unavailable";
-        return;
-      }
-      // The stream is only needed for permission, which makes device labels visible.
-      const permissionStream = await navigator.mediaDevices.getUserMedia({audio: true});
-      permissionStream.getTracks().forEach(track => track.stop());
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const oldInput = $("liveInputDevice").value;
-      const oldOutput = $("liveOutputDevice").value;
-      $("liveInputDevice").innerHTML = "";
-      $("liveOutputDevice").innerHTML = "";
-      devices.filter(device => device.kind === "audioinput").forEach(device => {
-        option($("liveInputDevice"), device.deviceId, device.label || `Input ${$("liveInputDevice").length + 1}`);
-      });
-      devices.filter(device => device.kind === "audiooutput").forEach(device => {
-        option($("liveOutputDevice"), device.deviceId, device.label || `Output ${$("liveOutputDevice").length + 1}`);
-      });
-      if (oldInput) $("liveInputDevice").value = oldInput;
-      if (oldOutput) $("liveOutputDevice").value = oldOutput;
-      $("liveVoiceStatus").textContent = "devices ready";
     }
 
     function dbFromChunk(chunk) {
@@ -3675,179 +3183,6 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
       for (let i = 0; i < chunk.length; i++) sum += chunk[i] * chunk[i];
       const rms = Math.sqrt(sum / chunk.length);
       return 20 * Math.log10(Math.max(rms, 0.000001));
-    }
-
-    function updateLiveAudioStats() {
-      const mic = liveLastInputDb === null ? "idle" : `${liveLastInputDb.toFixed(1)} dB`;
-      const out = liveLastOutputDb === null ? "idle" : `${liveLastOutputDb.toFixed(1)} dB`;
-      $("liveAudioStats").textContent = `mic: ${mic} | output: ${out}`;
-    }
-
-    function applyOutputGain(buffer) {
-      const chunk = new Float32Array(buffer);
-      let gain = Number($("liveOutputGain").value || 1);
-      if ($("liveMonitorLeveler") && $("liveMonitorLeveler").checked) {
-        const db = dbFromChunk(chunk);
-        if (db !== null && db > -55) {
-          const rms = Math.pow(10, db / 20);
-          const targetRms = 0.08;
-          const wanted = Math.max(0.35, Math.min(4, targetRms / Math.max(rms, 0.0001)));
-          liveLevelerGain = liveLevelerGain * 0.88 + wanted * 0.12;
-          gain *= liveLevelerGain;
-        } else {
-          liveLevelerGain = liveLevelerGain * 0.96 + 1 * 0.04;
-        }
-      }
-      for (let i = 0; i < chunk.length; i++) {
-        const value = chunk[i] * gain;
-        chunk[i] = Math.tanh(value * 1.2) / 1.2;
-      }
-      return chunk;
-    }
-
-    function updateOutputGainLabel() {
-      const value = Number($("liveOutputGain").value || 1);
-      $("liveOutputGainLabel").textContent = `${value.toFixed(2).replace(/\.00$/, ".0")}x`;
-    }
-
-    async function routeLiveOutput(ctx, playbackNode, deviceId) {
-      const dest = ctx.createMediaStreamDestination();
-      playbackNode.connect(dest);
-      const el = document.createElement("audio");
-      el.autoplay = true;
-      el.srcObject = dest.stream;
-      el.style.display = "none";
-      el.id = "liveVoiceOutput";
-      document.body.appendChild(el);
-      if (deviceId && el.setSinkId) await el.setSinkId(deviceId).catch(() => {});
-      await el.play().catch(() => {
-        $("liveVoiceStatus").textContent = "browser blocked audio output";
-      });
-      return {dest, el};
-    }
-
-    async function stopLiveVoice() {
-      if (liveWs) liveWs.close();
-      liveWs = null;
-      if (liveStream) liveStream.getTracks().forEach(track => track.stop());
-      liveStream = null;
-      if (liveInputNode) liveInputNode.disconnect();
-      liveInputNode = null;
-      if (liveInputKeepAlive) liveInputKeepAlive.disconnect();
-      liveInputKeepAlive = null;
-      if (livePlaybackNode) livePlaybackNode.disconnect();
-      livePlaybackNode = null;
-      if (liveOutputRoute && liveOutputRoute.el) liveOutputRoute.el.remove();
-      liveOutputRoute = null;
-      if (liveAudioCtx) await liveAudioCtx.close();
-      liveAudioCtx = null;
-      liveLastInputDb = null;
-      liveLastOutputDb = null;
-      liveLevelerGain = 1;
-      updateLiveAudioStats();
-      $("liveVoiceStatus").textContent = "stopped";
-    }
-
-    async function startLiveVoice() {
-      if (!state || !state.voicechanger || !state.voicechanger.realtime_ready) {
-        $("liveVoiceStatus").textContent = "start live engine first";
-        throw new Error("Start Live Engine first, then start live voice.");
-      }
-      const modelPath = $("liveRvcModel").value;
-      if (!modelPath) throw new Error("No RVC model selected.");
-      await stopLiveVoice();
-      const sampleRate = 48000;
-      const chunkMs = Number($("liveChunkMs").value || 120);
-      const blockFrame = Math.round(chunkMs * sampleRate / 1000);
-      liveStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          deviceId: $("liveInputDevice").value ? {exact: $("liveInputDevice").value} : undefined,
-          channelCount: {exact: 1},
-          sampleRate: {ideal: sampleRate},
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        }
-      });
-      liveAudioCtx = new AudioContext({sampleRate, latencyHint: "interactive"});
-      await addWorklet(liveAudioCtx, inputWorkletSource);
-      await addWorklet(liveAudioCtx, playbackWorkletSource);
-      const source = liveAudioCtx.createMediaStreamSource(liveStream);
-      liveInputNode = new AudioWorkletNode(liveAudioCtx, "dashboard-input");
-      livePlaybackNode = new AudioWorkletNode(liveAudioCtx, "dashboard-playback", {
-        processorOptions: {bufferSize: Math.max(blockFrame * 3, 24000)}
-      });
-      liveInputNode.port.postMessage({blockFrame});
-      source.connect(liveInputNode);
-      liveInputKeepAlive = liveAudioCtx.createGain();
-      liveInputKeepAlive.gain.value = 0;
-      liveInputNode.connect(liveInputKeepAlive);
-      liveInputKeepAlive.connect(liveAudioCtx.destination);
-      liveOutputRoute = await routeLiveOutput(liveAudioCtx, livePlaybackNode, $("liveOutputDevice").value);
-      liveWs = new WebSocket(state.voicechanger.realtime_ws);
-      const ws = liveWs;
-      liveWs.binaryType = "arraybuffer";
-      liveWs.onopen = () => {
-        if (ws !== liveWs) return;
-        liveWs.send(JSON.stringify({
-          type: "init",
-          block_frame: blockFrame,
-          cross_fade_overlap_size: 0.08,
-          extra_convert_size: Number($("liveExtraSec").value || 0.5),
-          model_path: modelPath,
-          index_path: $("liveRvcIndex").value || "",
-          f0_method: "rmvpe",
-          embedder_model: "contentvec",
-          embedder_model_custom: "",
-          silent_threshold: Number($("liveSilenceDb").value || -90),
-          vad_enabled: true,
-          sid: 0,
-          input_audio_gain: Number($("liveInputGain").value || 100),
-          f0_up_key: Number($("livePitch").value || 0),
-          index_rate: Number($("liveIndexRate").value || 0.65),
-          protect: Number($("liveProtect").value || 0.33),
-          volume_envelope: 1,
-          autotune: false,
-          autotune_strength: 0.1,
-          proposed_pitch: false,
-          proposed_pitch_threshold: 155.0,
-          clean_audio: false,
-          clean_strength: 0.5,
-          post_process: false,
-          kwargs: {}
-        }));
-        $("liveVoiceStatus").textContent = "live";
-      };
-      liveWs.onmessage = event => {
-        if (ws !== liveWs) return;
-        if (typeof event.data === "string") {
-          const msg = JSON.parse(event.data);
-          if (msg.type === "latency") {
-            $("liveVoiceStatus").textContent = `live, ${msg.value.toFixed(0)} ms, engine volume ${msg.volume.toFixed(4)}`;
-          }
-          return;
-        }
-        const outputChunk = applyOutputGain(event.data);
-        liveLastOutputDb = dbFromChunk(outputChunk);
-        updateLiveAudioStats();
-        livePlaybackNode.port.postMessage({chunk: outputChunk.buffer}, [outputChunk.buffer]);
-      };
-      liveWs.onerror = () => {
-        if (ws === liveWs) $("liveVoiceStatus").textContent = "live websocket error";
-      };
-      liveWs.onclose = () => {
-        if (ws === liveWs && liveAudioCtx) $("liveVoiceStatus").textContent = "disconnected";
-      };
-      liveInputNode.port.onmessage = event => {
-        const chunk = event.data && event.data.chunk;
-        if (chunk && liveWs && liveWs.readyState === WebSocket.OPEN) {
-          liveLastInputDb = dbFromChunk(chunk);
-          updateLiveAudioStats();
-          liveLastSend = performance.now();
-          liveWs.send(chunk);
-        }
-      };
-      if (liveAudioCtx.state === "suspended") await liveAudioCtx.resume();
     }
 
     function fillSelect(select, rows, oldValue) {
@@ -4410,7 +3745,9 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
         overlap_length: 2,
         min_chunk_length: 8,
         generation_id: generationId,
-        voice: voiceDataset
+        voice: voiceDataset,
+        // Relay lines are played once; the server keeps only the newest ones.
+        relay: true
       });
     }
 
@@ -4855,7 +4192,7 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
       if (refreshBusy) return;
       refreshBusy = true;
       try {
-      const res = await fetch(`/api/state?section=${encodeURIComponent(currentTab)}&dataset=${encodeURIComponent(voiceDataset)}&rvc_dataset=${encodeURIComponent(rvcDataset)}&rvc_model=${encodeURIComponent($("rvcModelName").value.trim())}`);
+      const res = await fetch(`/api/state?dataset=${encodeURIComponent(voiceDataset)}`);
       state = await res.json();
       if (state.config_error && !configErrorShown) {
         configErrorShown = true;
@@ -4881,37 +4218,6 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
         fillReferences(state.references);
         fillRelayReferences(state.references);
         renderRelayAuxRefs();
-      }
-      if (state.voicechanger) {
-        const vc = state.voicechanger;
-        const liveModelOld = $("liveRvcModel").value;
-        const liveIndexOld = $("liveRvcIndex").value;
-        $("vcDatasetChip").textContent = `RVC dataset: ${vc.wav_count} wavs / ${vc.minutes} min`;
-        $("vcDatasetChip").className = vc.wav_count > 0 && vc.wav_count === vc.manifest_rows ? "status-line good" : "status-line bad";
-        $("applioChip").textContent = vc.realtime_ready ? "Live engine ready" : (vc.applio_installed ? `Engine off (${vc.applio_backend})` : (vc.applio_cloned ? "Applio needs install" : "Applio not cloned"));
-        $("applioChip").className = vc.realtime_ready ? "status-line good" : (vc.applio_installed ? "status-line" : "status-line warn");
-        $("vcPath").textContent = vc.applio_dataset ? `Copied to ${vc.applio_root}\\assets\\datasets\\${vc.dataset_name}` : vc.dataset_dir;
-        $("rvcFeatureStatus").textContent = `RVC features: ${vc.sliced_count} audio / ${vc.feature_count} embeddings / ${vc.f0_count} pitch / ${vc.filelist_rows} filelist rows`;
-        const rvcRunning = (vc.training_pids || []).length > 0;
-        $("rvcTrainStatus").textContent = rvcRunning ? `running, PID ${vc.training_pids.join(", ")}` : "not running";
-        $("rvcCheckpointStatus").textContent = vc.checkpoints && vc.checkpoints.length
-          ? `Latest RVC checkpoint: ${vc.checkpoints[0].name} (${vc.checkpoints[0].size_mb} MB)`
-          : "No RVC checkpoint saved yet.";
-        $("rvcIndexStatus").textContent = vc.indexes && vc.indexes.length
-          ? `Latest RVC index: ${vc.indexes[0].name} (${vc.indexes[0].size_mb} MB)`
-          : "No RVC index built yet.";
-        $("liveRvcModel").innerHTML = "";
-        (vc.checkpoints || []).forEach(row => option($("liveRvcModel"), row.applio_path, `${row.name} (${row.size_mb} MB)`));
-        if (liveModelOld && (vc.checkpoints || []).some(row => row.applio_path === liveModelOld)) $("liveRvcModel").value = liveModelOld;
-        $("liveRvcIndex").innerHTML = "";
-        option($("liveRvcIndex"), "", "No index");
-        (vc.indexes || []).forEach(row => option($("liveRvcIndex"), row.applio_path, `${row.name} (${row.size_mb} MB)`));
-        if (liveIndexOld && (vc.indexes || []).some(row => row.applio_path === liveIndexOld)) $("liveRvcIndex").value = liveIndexOld;
-        else if ((vc.indexes || []).length) $("liveRvcIndex").value = vc.indexes[0].applio_path;
-        $("rvcModelList").innerHTML = "";
-        [...(vc.checkpoints || []).map(row => ({...row, kind: "model"})), ...(vc.indexes || []).map(row => ({...row, kind: "index"}))].forEach(row => {
-          $("rvcModelList").appendChild(modelLine(`${row.kind}: ${row.path}`, row.size_mb));
-        });
       }
       if (!engineBusy) {
         $("engineStatus").textContent = state.api_ready ? "Engine ready" : "Engine off";
@@ -5370,37 +4676,12 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
       } catch (error) { showError(error.message); }
       finally { $("prepareDataset").disabled = false; }
     };
-    $("prepareVoiceChanger").onclick = async () => {
-      try { await post("/api/prepare-voicechanger", {dataset_id: rvcDataset}); }
-      catch (e) { alert(e.message); }
-      refresh();
-    };
     ["voiceDataset", "relayDataset"].forEach(id => $(id).addEventListener("change", () => {
       voiceDataset = $(id).value;
       try { localStorage.setItem("voiceDashboardVoiceDataset", voiceDataset); } catch (_) {}
       refsSignature = "";
       refresh();
     }));
-    $("rvcDataset").addEventListener("change", () => {
-      rvcDataset = $("rvcDataset").value;
-      try { localStorage.setItem("voiceDashboardRvcDataset", rvcDataset); } catch (_) {}
-      refresh();
-    });
-    try { $("rvcModelName").value = localStorage.getItem("voiceDashboardRvcModelName") || ""; } catch (_) {}
-    $("rvcModelName").addEventListener("change", () => {
-      try { localStorage.setItem("voiceDashboardRvcModelName", $("rvcModelName").value.trim()); } catch (_) {}
-      refresh();
-    });
-    $("installApplio").onclick = async () => {
-      try { await post("/api/install-applio"); }
-      catch (e) { alert(e.message); }
-      refresh();
-    };
-    $("startApplio").onclick = async () => {
-      try { await post("/api/start-applio"); }
-      catch (e) { alert(e.message); }
-      refresh();
-    };
     $("trainSovits").onclick = async () => {
       try {
         await post("/api/start-train", {kind: "sovits", dataset_id: $("trainingDataset").value, model_name: $("trainingModelName").value, epochs: $("sovitsEpochs").value, batch_size: $("sovitsBatch").value, save_every: $("sovitsSave").value});
@@ -5413,55 +4694,8 @@ registerProcessor("dashboard-playback", PlaybackProcessor);
         refresh();
       } catch (error) { showError(error.message); }
     };
-    $("trainRvc").onclick = async () => {
-      $("trainRvc").disabled = true;
-      try {
-        await post("/api/start-rvc-training", {dataset_id: rvcDataset, model_name: $("rvcModelName").value.trim(), epochs: $("rvcEpochs").value, batch_size: $("rvcBatch").value, save_every: $("rvcSave").value, fresh: true});
-      } catch (e) {
-        alert(e.message);
-      } finally {
-        $("trainRvc").disabled = false;
-        refresh();
-      }
-    };
-    $("buildRvcIndex").onclick = async () => {
-      $("buildRvcIndex").disabled = true;
-      try {
-        await post("/api/start-rvc-index", {dataset_id: rvcDataset, model_name: $("rvcModelName").value.trim(), algorithm: "Auto"});
-      } catch (e) {
-        alert(e.message);
-      } finally {
-        $("buildRvcIndex").disabled = false;
-        refresh();
-      }
-    };
-    $("refreshLiveDevices").onclick = async () => {
-      try {
-        await refreshLiveDevices();
-      } catch (e) {
-        $("liveVoiceStatus").textContent = "device refresh failed";
-        alert(e.message);
-      }
-    };
-    $("startLiveVoice").onclick = async () => {
-      $("startLiveVoice").disabled = true;
-      try {
-        await refreshLiveDevices();
-        await refresh();
-        await startLiveVoice();
-      } catch (e) {
-        alert(e.message);
-      } finally {
-        $("startLiveVoice").disabled = false;
-      }
-    };
-    $("stopLiveVoice").onclick = async () => {
-      await stopLiveVoice();
-    };
-    $("liveOutputGain").oninput = updateOutputGainLabel;
-    updateOutputGainLabel();
     document.querySelectorAll("[data-stop]").forEach(btn => {
-      btn.onclick = async () => { await post("/api/stop-job", {key: btn.dataset.stop, dataset_id: rvcDataset, model_name: $("rvcModelName").value.trim()}); refresh(); };
+      btn.onclick = async () => { await post("/api/stop-job", {key: btn.dataset.stop}); refresh(); };
     });
     $("generate").onclick = async () => {
       const ref = state.references.find(r => r.id === $("reference").value);
@@ -5538,7 +4772,7 @@ def main():
     log(f"Local Voice UI starting on http://localhost:{port}")
     if CONFIG_ERROR:
         log(CONFIG_ERROR)
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server = DashboardServer(("127.0.0.1", port), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
