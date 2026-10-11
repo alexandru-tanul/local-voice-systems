@@ -2,7 +2,7 @@
 
 Speak or type, then hear the words in a reference voice. Runs locally after model downloads.
 
-![Generate screen in Local Voice Systems](docs/screenshot.png)
+![Text to Voice screen in Local Voice Systems](docs/screenshot.png)
 
 Requires **Windows 10/11 x64 + WSL2**, Python 3.12, FFmpeg on PATH, and Chrome or Edge.
 The dashboard does not support native Linux, macOS, or Windows ARM. CPU mode works but is slow.
@@ -79,20 +79,24 @@ Optional keys, for when a port is taken or you want a different setting:
 | `cache_dir`, `tmp_dir` | `.cache`, `cache_dir/tmp` | Download caches and temporary files |
 | `dashboard_python` | `relay_env` | Python that runs the dashboard |
 
-Run `Setup-Relay-Env.bat`, then `Launch-Voice-Dashboard.bat`. Open **Setup** to check the selected device.
+Run `Setup-Relay-Env.bat`, then `Launch-Voice-Dashboard.bat`. Open **System Check** to check the selected device.
 Use `Stop-Voice-Dashboard.bat` to stop it. Speech recognition uses CPU and downloads its model on first use.
 
 ## Use
 
-1. On **TTS Training**, create a dataset with a clear 3 to 10 second clip and its exact transcript. Press **Sync & Prepare**.
-   Generate reads clips from the copy in WSL, so sync again after adding clips. **Sync Only** is enough for Generate.
-2. On **Generate**, choose the dataset, reference clip, and pretrained `s1v3.ckpt` / `s2Gv2Pro.pth` models. Enter text and generate audio.
-   **Text language** under **Generation settings** follows the dataset's language.
-3. On **Relay**, press **Start System**, hold push-to-talk, speak, then release. Choose audio output in **Settings**.
-   Relay understands English speech and speaks it in the selected voice, whatever the dataset's language.
+The first time, the dashboard offers a short tour that explains each page. **Guide** starts it again.
+
+1. On **Voice Training**, create a dataset with a clear 3 to 10 second clip and its exact transcript. Press **Sync Only**.
+   The other tabs read clips from the copy in WSL, so sync again after adding clips.
+2. On **Text to Voice**, choose the voice and reference clip, enter text, and press **Generate**.
+   **Settings** holds the models, such as the pretrained `s1v3.ckpt` / `s2Gv2Pro.pth`, and **Text language**, which follows the dataset's language.
+3. On **Mic to Voice**, hold push-to-talk, speak, then release. Choose audio output in **Settings**.
+   Opening the tab starts speech recognition, the voice engine, and the global push-to-talk key. **Stop Everything** stops them.
+   **Sync & Prepare** and training stop them first to free GPU memory, and nothing starts by itself while those run.
+   Mic to Voice understands English speech and speaks it in the selected voice, whatever the dataset's language.
 
 Datasets can be English, Chinese, Japanese, Korean, or Cantonese.
-To train a voice, add more clips, prepare the dataset, then train SoVITS and GPT with batch size 1.
+To train a voice, add more clips, press **Sync & Prepare**, then train SoVITS and GPT with batch size 1.
 To import a folder of clips at once, with transcripts from a CSV with the columns `file,text`:
 
 ```text
@@ -101,7 +105,7 @@ python import_dataset.py --name "My Voice" --audio-dir C:\clips --transcripts C:
 
 Without `--transcripts`, each transcript comes from the file name. Add `--language` for a dataset that is not English.
 
-Generated audio is saved in `outputs`. Relay keeps only its newest 200 lines, in `outputs\relay`.
+Generated audio is saved in `outputs`. Mic to Voice keeps only its newest 200 lines, in `outputs\relay`.
 Use [VB-CABLE](https://vb-audio.com/Cable/) to send the generated voice to another app.
 
 ## Fix

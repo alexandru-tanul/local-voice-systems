@@ -160,6 +160,69 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(status, 200)
         stop_in_wsl.assert_called_once_with(dashboard.WSL_STOP_SCRIPTS["train-gpt"])
 
+    @unittest.skipUnless(os.name == "nt", "Stops Windows processes")
+    def test_orphan_cleanup_stops_only_this_dashboards_helper(self):
+        sleeper = "import time; time.sleep(60)"
+        marker = ["ptt_helper.py", "--dashboard", "http://127.0.0.1:18799"]
+        quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        processes = {
+            "helper": subprocess.Popen([sys.executable, "-c", sleeper, *marker], **quiet),
+            "names the file": subprocess.Popen([sys.executable, "-c", sleeper, "ptt_helper.py"], **quiet),
+            "other dashboard": subprocess.Popen([sys.executable, "-c", sleeper, *marker[:2], "http://127.0.0.1:187990"], **quiet),
+            # PowerShell joins its arguments into one command, and "#" makes the rest a comment.
+            "not python": subprocess.Popen(["powershell", "-NoProfile", "-Command", "Start-Sleep 60 #", *marker], **quiet),
+        }
+        for proc in processes.values():
+            self.addCleanup(proc.kill)
+        with patch.object(dashboard, "DASHBOARD_PORT", 18799):
+            dashboard.kill_orphan_ptt_helpers()
+        self.assertIsNotNone(processes["helper"].wait(timeout=10))
+        for name in ("names the file", "other dashboard", "not python"):
+            with self.subTest(process=name):
+                self.assertIsNone(processes[name].poll())
+
+    def test_gpu_jobs_stop_the_voice_first(self):
+        running = MagicMock(**{"running.return_value": True})
+        with (
+            patch.object(dashboard, "stop_system") as stop_system,
+            patch.object(dashboard, "stop_api") as stop_api,
+            patch.object(dashboard, "api_ready", return_value=True),
+            patch.object(dashboard, "API_PROCESS", None),
+        ):
+            # In CPU mode the voice and training do not share a GPU.
+            dashboard.free_gpu_for("training")
+            dashboard.JOBS["train-gpt"] = running
+            self.assertFalse(dashboard.gpu_busy())
+            stop_system.assert_not_called()
+            stop_api.assert_not_called()
+            dashboard.APP_CONFIG["tts_device"] = "cuda"
+            self.assertTrue(dashboard.gpu_busy())
+            # A running Mic to Voice stops as a whole, so its status stays true.
+            dashboard.SYSTEM_STATE["status"] = "ready"
+            dashboard.free_gpu_for("training")
+            stop_system.assert_called_once()
+            # An engine started from Text to Voice stops alone.
+            dashboard.SYSTEM_STATE["status"] = "stopped"
+            dashboard.free_gpu_for("training")
+            stop_api.assert_called_once()
+
+    def test_training_frees_the_gpu_only_when_it_can_start(self):
+        missing = subprocess.CompletedProcess([], 1, "", "")
+        with (
+            patch.object(dashboard, "dataset_descriptor", return_value={"name": "Test"}),
+            patch.object(dashboard, "run_wsl", return_value=missing),
+            patch.object(dashboard, "free_gpu_for") as free_gpu_for,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Training features are missing"):
+                dashboard.start_train("gpt", 1, 1, 1, "test")
+            free_gpu_for.assert_not_called()
+            with (
+                patch.object(dashboard, "run_wsl", return_value=subprocess.CompletedProcess([], 0, "", "")),
+                patch.object(dashboard.ManagedProcess, "start"),
+            ):
+                dashboard.start_train("gpt", 1, 1, 1, "test")
+            free_gpu_for.assert_called_once_with("training")
+
     def test_stop_skips_wsl_when_the_distro_is_stopped(self):
         with (
             patch.object(dashboard, "wsl_distro_running", return_value=False),

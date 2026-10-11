@@ -107,6 +107,8 @@ WSL_STOP_SCRIPTS = {
     "train-sovits": "pkill -f '[G]PT_SoVITS/s2_train.py' || true",
     "api": f"pkill -f '[a]pi_v2.py.*-p {TTS_PORT} ' || true",
 }
+# Jobs that use the GPU, and with it the memory the voice engine also needs.
+GPU_JOBS = ("dataset-prepare", "train-sovits", "train-gpt")
 MIN_REFERENCE_SECONDS = 3.0
 MAX_REFERENCE_SECONDS = 10.0
 LANGUAGES = {"en", "zh", "ja", "ko", "yue"}
@@ -677,10 +679,10 @@ def relay_asr_ready():
 
 def start_relay_asr():
     if relay_asr_ready():
-        log("Relay ASR is already running.")
+        log("Speech recognition is already running.")
         return True
     if not RELAY_ASR_PYTHON.exists():
-        raise RuntimeError("Relay ASR environment is missing.")
+        raise RuntimeError("The speech recognition environment is missing. Run Setup-Relay-Env.bat.")
     RELAY_ASR_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     RELAY_ASR_TMP.mkdir(parents=True, exist_ok=True)
     TMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -701,7 +703,7 @@ def start_relay_asr():
         }
     )
     proc = ManagedProcess(
-        "Relay ASR",
+        "Speech recognition",
         [str(RELAY_ASR_PYTHON), str(ROOT / "relay_asr_server.py")],
         cwd=ROOT,
         env=relay_env,
@@ -713,7 +715,7 @@ def start_relay_asr():
             return True
         JOBS["relay-asr"] = proc
     proc.start()
-    log(f"Relay ASR starting on {RELAY_ASR_URL}.")
+    log(f"Speech recognition starting on {RELAY_ASR_URL}.")
     return True
 
 
@@ -890,19 +892,18 @@ def kill_port_listener(port, label, marker):
 
 
 def kill_orphan_ptt_helpers():
+    """Stop push-to-talk helpers that an earlier run of this dashboard left. Only Python processes
+    whose command line ends with this dashboard's address match, as start_ptt_helper starts them,
+    so editors, shells and other dashboards that name ptt_helper.py are left alone."""
+    marker = f"--dashboard http://127.0.0.1:{DASHBOARD_PORT}"
+    script = (
+        "Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | "
+        f"Where-Object {{ $_.CommandLine -like '*ptt_helper.py*' -and $_.CommandLine.TrimEnd().EndsWith('{marker}') }} | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+    )
     try:
-        subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'ptt_helper\\.py' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
-            ],
-            capture_output=True,
-            timeout=8,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except Exception as exc:
+        run_powershell(script, timeout=8)
+    except (OSError, subprocess.SubprocessError) as exc:
         log(f"Could not stop orphaned PTT helpers: {exc}")
 
 
@@ -1166,7 +1167,7 @@ def write_s2_config(epochs, batch_size, save_every, model_name="voice-model", in
 
 def start_api(gpt_path, sovits_path):
     global API_PROCESS, API_GPT_PATH, API_SOVITS_PATH
-    # The page and Start System can both start the engine; one check-and-start runs at a time.
+    # Text to Voice and Mic to Voice can both start the engine; one check-and-start runs at a time.
     with ENGINE_LOCK:
         if API_PROCESS and API_PROCESS.running():
             log("Inference engine is already running.")
@@ -1292,11 +1293,38 @@ def sync_dataset_job(dataset_id):
     log(f"Syncing dataset {descriptor['name']} to WSL.")
 
 
+def gpu_busy():
+    """True while a job uses the GPU that the voice engine runs on."""
+    try:
+        if voice_runtime()["device"] != "cuda":
+            return False
+    except ValueError:
+        return False
+    with STATE_LOCK:
+        return any(JOBS.get(key) and JOBS[key].running() for key in GPU_JOBS)
+
+
+def free_gpu_for(job_name):
+    """Stop the voice before a GPU job. Both on one GPU can run out of memory, and the voice
+    starts again when it is used."""
+    if voice_runtime()["device"] != "cuda":
+        return
+    with STATE_LOCK:
+        status = SYSTEM_STATE["status"]
+    if status not in {"stopped", "stopping"}:
+        log(f"Stopping Mic to Voice to free GPU memory for {job_name}.")
+        stop_system()
+    elif api_ready() or (API_PROCESS and API_PROCESS.running()):
+        log(f"Stopping the voice engine to free GPU memory for {job_name}.")
+        stop_api()
+
+
 def prepare_tts_dataset_job(dataset_id, model_name):
     descriptor = dataset_descriptor(dataset_id)
     summary = dataset_summary(descriptor)
     if not summary["ready"]:
         raise RuntimeError("The selected dataset is incomplete. Add matching audio and transcripts first.")
+    free_gpu_for("dataset preparation")
     model_name = slugify(model_name, "voice-model")
     s2_config = write_s2_config(1, 1, 1, model_name, include_model_version=False)
     target = descriptor["wsl_root"]
@@ -1354,6 +1382,7 @@ def start_train(kind, epochs, batch_size, save_every, dataset_id="", model_name=
     )
     if check.returncode != 0:
         raise RuntimeError("Training features are missing. Run Sync & Prepare before starting training.")
+    free_gpu_for("training")
     if kind == "gpt":
         config_path = write_s1_config(epochs, batch_size, save_every, model_name)
         script = (
@@ -1539,6 +1568,7 @@ class Handler(BaseHTTPRequestHandler):
                 "references": [ref for ref in all_references if ref["valid_reference"]],
                 "all_references": all_references,
                 "api_ready": api_ready(),
+                "gpu_busy": gpu_busy(),
                 "relay_asr_ready": relay_asr_ready(),
                 "jobs": {key: proc.snapshot() for key, proc in JOBS.items()},
                 "system": system_snapshot(),
@@ -1656,7 +1686,7 @@ class Handler(BaseHTTPRequestHandler):
                 if generation_id:
                     with STATE_LOCK:
                         CANCELLED_GENERATIONS.add(generation_id)
-                    log(f"Cancelled relay generation {generation_id}.")
+                    log(f"Cancelled Mic to Voice line {generation_id}.")
                 self.send_json({"ok": True})
                 return
             if path == "/api/create-dataset":
@@ -1793,7 +1823,7 @@ class Handler(BaseHTTPRequestHandler):
                             cancelled = generation_id in CANCELLED_GENERATIONS
                             CANCELLED_GENERATIONS.discard(generation_id)
                         if cancelled:
-                            log(f"Discarded cancelled relay generation {generation_id}.")
+                            log(f"Discarded cancelled Mic to Voice line {generation_id}.")
                             self.send_json({"ok": False, "cancelled": True, "error": "Generation cancelled."}, 409)
                             return
                     if int(payload.get("streaming_mode", 0)):
@@ -1900,7 +1930,7 @@ HTML = r"""<!doctype html>
       border: 1px solid transparent;
       border-radius: var(--radius);
       color: var(--muted);
-      min-height: 34px;
+      min-height: var(--control-height);
       padding: 6px 12px;
       text-transform: uppercase;
       letter-spacing: .08em;
@@ -1914,9 +1944,13 @@ HTML = r"""<!doctype html>
       box-shadow: inset 0 -2px 0 var(--accent);
     }
     .tab-button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+    /* Logs and System Check are tools, so a line sets them apart from the three voice pages. */
+    .tab-button.tab-tool { position: relative; margin-left: var(--space-4); }
+    .tab-button.tab-tool::before { content: ""; position: absolute; left: calc(-1 * var(--space-3)); top: 8px; bottom: 8px; border-left: 1px solid var(--line); }
+    header .guide-button { justify-self: end; }
     .tab-panel { display: none; }
     .tab-panel.active { display: block; }
-    section.relay-page.active { display: grid; }
+    section.relay-page.active, section.side-page.active { display: grid; }
     section {
       border: 1px solid var(--line-subtle);
       background: var(--panel);
@@ -1995,12 +2029,9 @@ HTML = r"""<!doctype html>
     .row > * { flex: 1; }
     .row > button { flex: 0 0 auto; }
     .small { color: var(--muted); font-size: 12px; }
-    .mini-button {
-      min-height: 32px;
-      padding: 5px 9px;
-      font-size: 12px;
-      font-weight: 600;
-    }
+    .mini-button { white-space: nowrap; }
+    /* A square button of the standard height, for an icon. */
+    .icon-button { display: inline-grid; place-items: center; width: var(--control-height); padding: 0; }
     .check-list {
       height: 230px;
       overflow: auto;
@@ -2077,14 +2108,19 @@ HTML = r"""<!doctype html>
       font-family: Consolas, "Cascadia Mono", monospace;
       font-size: 12px;
     }
-    audio { width: 100%; margin-top: 8px; }
+    /* The dashboard's own audio player: one row the size of a text field. */
+    .player { display: flex; align-items: center; gap: var(--space-3); width: 100%; min-width: 0; height: var(--control-height); padding-right: 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--field); }
+    audio[hidden] + .player { display: none; }
+    .player .player-toggle { flex: 0 0 auto; display: grid; place-items: center; width: calc(var(--control-height) - 2px); height: 100%; min-height: 0; padding: 0; border: 0; border-right: 1px solid var(--line); border-radius: var(--radius) 0 0 var(--radius); background: transparent; color: var(--text); }
+    .player .player-toggle:hover:not(:disabled) { background: var(--panel-3); border-color: var(--line); }
+    .player .player-seek { flex: 1 1 auto; min-width: 40px; height: auto; min-height: 0; }
+    .player-time { flex: 0 0 auto; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
     .relay-block-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); min-height: 32px; }
     .relay-block-head label { margin: 0; }
     .relay-volume-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--space-3); }
     .relay-volume-row label { margin: 0; }
-    #tab-generate audio { display: block; width: 100%; min-width: 0; height: 40px; margin: 0; }
     #tab-generate textarea { margin: 0; }
-    #targetText { min-height: 88px; }
+    #targetText { min-height: 160px; }
     #tab-generate .check-list { height: 190px; margin-top: 0; }
     #tab-generate .selected-list { margin-top: 0; min-height: var(--control-height); }
     .cancel-generation { display: none; }
@@ -2120,7 +2156,12 @@ HTML = r"""<!doctype html>
     .setup-state.ready { color: var(--good); }
     .setup-state.missing { color: var(--bad); }
     .setup-state.needs_configuration, .setup-state.needs_browser_check { color: var(--warn); }
-    .training-project { border: 1px solid var(--line-subtle); background: var(--field); padding: var(--space-4); }
+    .training-project { display: grid; align-content: start; }
+    .training-project input + label { margin-top: var(--space-3); }
+    /* The file chooser as a plain button, without the field box around it. */
+    #datasetAudioFiles { border: 0; background: transparent; padding: 0; min-height: 0; color: var(--muted); }
+    #datasetAudioFiles::file-selector-button { height: var(--control-height); margin-right: 12px; padding: 0 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-3); color: var(--text); font: inherit; font-weight: 700; cursor: pointer; }
+    #datasetAudioFiles::file-selector-button:hover { background: #2a2f34; border-color: #444a51; }
     .upload-list { display: grid; gap: var(--space-2); max-height: 310px; overflow: auto; margin-top: var(--space-3); }
     .upload-row { display: grid; grid-template-columns: minmax(150px,.7fr) minmax(260px,1.5fr); gap: var(--space-2); align-items: center; border: 1px solid var(--line-subtle); padding: var(--space-2); background: #101214; }
     .upload-row .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
@@ -2333,7 +2374,7 @@ HTML = r"""<!doctype html>
       border-radius: 6px;
       color: var(--muted);
       padding: 6px 10px;
-      min-height: 34px;
+      min-height: var(--control-height);
       font-weight: 500;
       font-size: 13px;
       letter-spacing: 0;
@@ -2373,7 +2414,6 @@ HTML = r"""<!doctype html>
     .result-label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 6px; }
     .result-transcript { font-size: 21px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
     .result-player { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; }
-    #relayAudio { display: block; width: 100%; min-width: 0; height: 40px; margin: 0; }
     .result-meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .result-meta:empty { display: none; }
     .result-actions { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -2392,9 +2432,9 @@ HTML = r"""<!doctype html>
       gap: 4px 6px;
       width: max-content;
       max-width: calc(100vw - 24px);
-      padding: 7px 12px;
+      padding: 0 0 0 12px;
       border: 1px solid var(--line);
-      border-radius: 999px;
+      border-radius: 8px;
       background: rgba(24, 27, 30, .95);
       backdrop-filter: blur(10px);
       box-shadow: 0 10px 30px rgba(0, 0, 0, .4);
@@ -2412,7 +2452,7 @@ HTML = r"""<!doctype html>
       white-space: nowrap;
     }
     .status-pill .dot { width: 8px; height: 8px; border-radius: 50%; background: #565d65; flex: 0 0 8px; }
-    .status-pill strong { font-weight: 600; color: var(--text); }
+    .status-pill strong { font-weight: 600; color: var(--text); display: inline-block; min-width: 50px; }
     .status-pill.ready .dot { background: var(--good); }
     .status-pill.ready strong { color: var(--good); }
     .status-pill.starting .dot { background: var(--warn); animation: rec-blink 1s steps(2, start) infinite; }
@@ -2422,7 +2462,7 @@ HTML = r"""<!doctype html>
     .island-system-state {
       font-size: 12px;
       color: var(--muted);
-      max-width: 220px;
+      width: 180px;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -2430,13 +2470,17 @@ HTML = r"""<!doctype html>
     }
     .island-system-state.good { color: var(--good); }
     .island-system-state.bad { color: var(--bad); }
-    .island .mini-button { min-height: 30px; border-radius: 999px; white-space: nowrap; }
-    .island label.switch {
+    .island button { white-space: nowrap; }
+    /* The bar is one control high. Stop Everything sits flush at its right end, like the play
+       button in a player. */
+    .island .island-group:last-child { align-self: stretch; }
+    .island #stopSystem { border: 0; border-left: 1px solid #704142; border-radius: 0 7px 7px 0; }
+    label.switch {
       position: relative;
       display: inline-flex;
       align-items: center;
       gap: 7px;
-      min-height: 30px;
+      min-height: var(--control-height);
       margin: 0;
       padding: 0 8px;
       border-radius: 999px;
@@ -2445,7 +2489,9 @@ HTML = r"""<!doctype html>
       cursor: pointer;
       white-space: nowrap;
     }
-    .island label.switch:hover { background: var(--panel-3); }
+    label.switch:hover { background: var(--panel-3); }
+    .relay-options { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: var(--space-2); }
+    .workspace[data-view="result"] .relay-options { flex-basis: 100%; justify-content: flex-start; }
     .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
     .switch-track {
       position: relative;
@@ -2500,6 +2546,25 @@ HTML = r"""<!doctype html>
     .settings-body { padding: 18px; display: grid; gap: 20px; overflow: auto; max-height: calc(100vh - 130px); }
     .settings-body h3 { margin: 0 0 10px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
     .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+    .small-dialog { width: min(600px, calc(100vw - 32px)); }
+    .small-dialog h2 { margin: 0; }
+    .small-dialog p { margin: 0; }
+    /* Guided tour. The spot's shadow darkens everything except the highlighted element. */
+    .tour { position: fixed; inset: 0; z-index: 100; }
+    .tour.no-spot { background: rgba(0, 0, 0, .6); }
+    .tour-spot { position: fixed; border-radius: 8px; box-shadow: 0 0 0 9999px rgba(0, 0, 0, .6); outline: 2px solid var(--accent); pointer-events: none; transition: top .2s ease, left .2s ease, width .2s ease, height .2s ease; }
+    .tour-pop { position: fixed; width: min(380px, calc(100vw - 24px)); display: grid; gap: var(--space-3); padding: var(--space-4); border: 1px solid var(--line); border-radius: 8px; background: var(--panel); box-shadow: 0 20px 60px rgba(0, 0, 0, .5); }
+    .tour-pop h2 { margin: 0; font-size: 16px; }
+    .tour-pop p { margin: 0; line-height: 1.5; }
+    .tour-count { font-size: 12px; color: var(--muted); }
+    .tour-actions { display: flex; align-items: center; gap: var(--space-2); }
+    .tour-actions #tourEnd { margin-right: auto; }
+    /* Shown instead of the page's controls while no dataset has clips. */
+    .no-voice-note { display: none; max-width: 460px; text-align: center; }
+    .no-voice-note p { margin: 0 0 var(--space-3); }
+    body[data-voice="no"] .no-voice-note { display: block; }
+    body[data-voice="no"] .compose,
+    body[data-voice="no"] #relayCapture > :not(.no-voice-note) { display: none; }
     /* ---------- Secondary pages: Generate, Training, Logs, Setup ---------- */
     section.page {
       background: transparent;
@@ -2555,31 +2620,57 @@ HTML = r"""<!doctype html>
     details.sub > .sub-body { display: grid; gap: var(--space-3); padding: 0 0 var(--space-3); }
     .field-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--space-3); }
     .field-row > * { min-width: 0; }
-    .field-row audio { display: block; width: 100%; height: 40px; margin: 0; }
-    .primary-big { min-height: 44px; padding: 10px 22px; font-size: 14px; }
-    .generate-actions { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; margin-top: var(--space-3); }
-    .generate-result { margin-top: var(--space-4); padding-top: var(--space-4); border-top: 1px solid var(--line-subtle); }
-    #outputAudio { display: block; width: 100%; height: 40px; margin: 6px 0 8px; }
-    .generate-history { margin-top: var(--space-3); display: grid; gap: 4px; }
-    .history-line { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; font-size: 13px; color: var(--muted); padding: 4px 0; }
-    .history-line span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* Text to Voice and Voice Training use the Mic to Voice layout: a list on the left, open space on the right. */
+    section.side-page {
+      grid-template-columns: 272px minmax(0, 1fr);
+      gap: var(--space-5);
+      align-items: start;
+      background: transparent;
+      border: 0;
+      box-shadow: none;
+      padding: 0;
+      min-height: calc(100vh - var(--header-height) - var(--island-height) - 48px);
+    }
+    /* On wide windows an empty column on the right, as wide as the list on the left, centers the
+       middle of each page on the window, in line with the tabs and the bottom bar. */
+    @media (min-width: 1280px) {
+      section.relay-page, section.side-page { grid-template-columns: 272px minmax(0, 1fr) 272px; }
+    }
+    .compose { display: grid; gap: var(--space-4); width: 100%; max-width: 760px; }
+    .compose textarea { padding: 14px 16px; font-size: 16px; line-height: 1.5; }
+    .voice-line { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--space-3); align-items: end; }
+    .voice-line > * { min-width: 0; }
+    .compose-actions { display: flex; align-items: center; justify-content: center; gap: var(--space-3); flex-wrap: wrap; }
+    .compose-status { text-align: center; min-height: 20px; }
+    .generate-result { display: grid; gap: 6px; }
+    .training-workspace { justify-content: flex-start; align-items: stretch; }
+    .steps { display: grid; gap: 44px; width: 100%; max-width: 920px; margin: 0 auto; }
+    .step { display: grid; gap: var(--space-3); }
+    .step-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; }
+    .step-head h3 { margin: 0; font-size: 15px; display: flex; align-items: center; }
+    .empty-note { max-width: 460px; margin: auto; text-align: center; }
+    .empty-note p { margin: 0 0 var(--space-3); }
+    .settings-body h3 .status-line { margin-left: 8px; text-transform: none; letter-spacing: 0; }
+    section.page .panel { border: 0; background: transparent; padding: 0; }
     .log-tools { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
-    .log-tools input:not([type="checkbox"]) { width: 220px; min-height: 32px; padding: 5px 10px; }
-    .generate-history::before { content: "Earlier this session"; display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 6px 0 2px; }
-    .log-tools label { margin: 0; min-height: 32px; }
+    .log-tools input:not([type="checkbox"]) { width: 220px; }
+    .log-tools label { margin: 0; min-height: var(--control-height); }
     section.page .log { height: calc(100vh - var(--header-height) - var(--island-height) - 120px); min-height: 280px; }
     .setup-list { margin-top: var(--space-3); }
     .setup-list:empty { display: none; }
-    body:not([data-tab="relay"]) .island-relay { display: none; }
     @media (max-width: 1020px) {
       .grid2 { grid-template-columns: 1fr; }
       .grid3 { grid-template-columns: 1fr; }
       .setup-scope-grid { grid-template-columns: 1fr; }
       header { grid-template-columns: 1fr; }
       header .tablist { justify-content: flex-start; }
+      header .guide-button { position: absolute; top: 10px; right: var(--space-5); }
       section.relay-page { grid-template-columns: 1fr; gap: var(--space-3); }
       .history-toggle { display: inline-flex; gap: 4px; justify-self: start; }
-      .history {
+      section.side-page { grid-template-columns: 1fr; gap: var(--space-3); min-height: 0; }
+      section.side-page .history { position: static; max-height: 240px; }
+      section.side-page .workspace { min-height: 0; justify-content: flex-start; padding-top: 0; }
+      .relay-page .history {
         display: none;
         position: fixed;
         left: 12px;
@@ -2590,18 +2681,23 @@ HTML = r"""<!doctype html>
         max-height: none;
         box-shadow: 0 20px 60px rgba(0, 0, 0, .5);
       }
-      .history.open { display: flex; }
+      .relay-page .history.open { display: flex; }
       .workspace { padding: var(--space-3); min-height: calc(100vh - 200px); }
       section.relay-page { min-height: 0; }
     }
     @media (max-width: 760px) {
       :root { --island-height: 150px; }
       body { padding-bottom: 160px; }
-      .island { border-radius: 18px; gap: 6px; }
+      .island { gap: 6px; padding: 7px 12px; }
+      .island .island-group:last-child { align-self: auto; }
+      .island #stopSystem { border: 1px solid #704142; border-radius: var(--radius); }
       .island-group + .island-group { border-left: 0; padding-left: 0; margin-left: 0; }
-      .island-system-state { max-width: 160px; }
+      .island-system-state { width: 160px; }
       header { padding: 8px var(--space-3); gap: var(--space-2); }
-      .tab-button { min-height: 28px; padding: 4px 8px; font-size: 11px; letter-spacing: .04em; }
+      .tab-button { padding: 4px 8px; font-size: 11px; letter-spacing: .04em; }
+      .tab-button.tab-tool { margin-left: 0; }
+      .tab-button.tab-tool::before { display: none; }
+      header .guide-button { top: 8px; right: var(--space-3); }
       .workspace[data-view="result"] .capture { align-items: flex-start; }
       .workspace[data-view="result"] .shortcut-control { margin-left: 0; align-items: flex-start; }
       .talk-button { width: 150px; height: 150px; }
@@ -2624,92 +2720,51 @@ HTML = r"""<!doctype html>
   <header>
     <h1>Local Voice Systems</h1>
     <nav class="tablist" role="tablist" aria-label="Pages">
-      <button class="tab-button active" data-tab="relay" role="tab" aria-selected="true">Relay</button>
-      <button class="tab-button" data-tab="generate" role="tab" aria-selected="false">Generate</button>
-      <button class="tab-button" data-tab="training" role="tab" aria-selected="false">TTS Training</button>
-      <button class="tab-button" data-tab="logs" role="tab" aria-selected="false">Logs</button>
-      <button class="tab-button" data-tab="setup" role="tab" aria-selected="false">Setup</button>
+      <button class="tab-button" data-tab="relay" role="tab" aria-selected="false">Mic to Voice</button>
+      <button class="tab-button" data-tab="generate" role="tab" aria-selected="false">Text to Voice</button>
+      <button class="tab-button" data-tab="training" role="tab" aria-selected="false">Voice Training</button>
+      <button class="tab-button tab-tool" data-tab="logs" role="tab" aria-selected="false">Logs</button>
+      <button class="tab-button" data-tab="setup" role="tab" aria-selected="false">System Check</button>
     </nav>
+    <button class="secondary mini-button guide-button" id="openGuide" title="Take a tour of the dashboard">Guide</button>
     <div class="sr-only" id="recentActivity" aria-live="polite">Dashboard loaded. System is stopped.</div>
   </header>
   <div class="global-error" id="globalError"><span id="globalErrorText"></span><div class="row"><button class="secondary mini-button" id="openErrorLogs">Open Logs</button><button class="danger mini-button" id="dismissError">Dismiss</button></div></div>
 
   <main>
-      <section id="tab-generate" class="tab-panel page" role="tabpanel">
-        <div class="page-head"><h2>Generate a line</h2><span class="small">Type text, choose the reference clip, and generate a WAV in the selected voice.</span></div>
-        <div class="panel">
-          <label for="targetText">Text to speak</label>
-          <textarea id="targetText">Please remain calm. Your message is being processed.</textarea>
-          <div class="generate-actions">
-            <button class="primary-big" id="generate">Generate WAV</button>
-            <span class="status-line" id="generateStatus"></span>
+      <section id="tab-generate" class="tab-panel side-page" role="tabpanel">
+        <aside class="history" aria-label="Generated lines">
+          <button class="secondary history-new" id="generateNewLine">+ New line</button>
+          <div class="history-list" id="generateHistory" role="listbox" aria-label="Lines generated in this session"></div>
+          <div class="history-foot"><span class="small" id="generateHistoryCount">Nothing generated yet</span></div>
+        </aside>
+        <div class="workspace">
+          <div class="no-voice-note">
+            <p>You have no voice yet. On Voice Training, create a dataset, add one clean 3 to 10 second clip with its exact words, and press Sync Only.</p>
+            <button data-go="training">Go to Voice Training</button>
           </div>
-          <div class="generate-result" id="generateResult" hidden>
-            <div class="result-label">Generated voice</div>
-            <audio id="outputAudio" controls></audio>
-            <div class="small output-name" id="outputName"></div>
-            <div class="generate-history" id="generateHistory" hidden></div>
+          <div class="compose">
+            <label class="sr-only" for="targetText">Text to speak</label>
+            <textarea id="targetText" placeholder="Type what the voice should say">Please remain calm. Your message is being processed.</textarea>
+            <div class="voice-line">
+              <div><label for="voiceDataset">Voice</label><select id="voiceDataset"></select></div>
+              <div><label for="reference">Reference clip (3-10 s)</label><select id="reference"></select></div>
+              <div><label>Preview</label><audio id="refAudio" data-label="reference clip"></audio></div>
+            </div>
+            <div class="compose-actions">
+              <button id="generate">Generate</button>
+              <button class="secondary icon-button" id="openGenerateSettings" aria-haspopup="dialog" aria-label="Settings" title="Settings: reference text, extra clips, models, and generation settings"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+            </div>
+            <div class="status-line compose-status" id="generateStatus" role="status"></div>
+            <div class="generate-result" id="generateResult" hidden>
+              <audio id="outputAudio" data-label="generated line"></audio>
+              <div class="small output-name" id="outputName"></div>
+            </div>
           </div>
-        </div>
-        <div class="panel">
-          <div class="panel-head"><h3>Voice</h3><span class="status-line" id="engineStatus"></span></div>
-          <div class="field-row">
-            <div><label for="voiceDataset">Voice dataset</label><select id="voiceDataset"></select></div>
-            <div><label for="reference">Reference clip (3-10 s)</label><select id="reference"></select></div>
-            <div><label for="refAudio">Preview</label><audio id="refAudio" controls></audio></div>
-          </div>
-          <details class="sub">
-            <summary>Text spoken in the reference clip</summary>
-            <div class="sub-body">
-              <textarea id="promptText" aria-label="Text spoken in the reference clip"></textarea>
-              <div class="small">Filled from the clip. Edit it only if the clip says something else.</div>
-            </div>
-          </details>
-          <details class="sub">
-            <summary>Extra reference clips <span class="small" id="auxCount">0 selected</span></summary>
-            <div class="sub-body">
-              <div class="small">Optional additional clips for style. More clips can improve delivery but slow generation.</div>
-              <div class="row"><input id="auxSearch" placeholder="Search clips" aria-label="Search clips" /><button class="secondary mini-button" id="clearAuxRefs">Clear</button></div>
-              <div id="auxRefsList" class="check-list"></div>
-              <div id="auxSelectedList" class="selected-list"></div>
-              <audio id="auxPreview" controls></audio>
-              <div class="small" id="auxPreviewStatus"></div>
-            </div>
-          </details>
-          <details class="sub">
-            <summary>Engine and models</summary>
-            <div class="sub-body">
-              <div class="field-row">
-                <div><label for="gptModel">GPT model</label><select id="gptModel"></select></div>
-                <div><label for="sovitsModel">SoVITS model</label><select id="sovitsModel"></select></div>
-              </div>
-              <div class="row"><button class="secondary" id="startApi">Start Engine</button><button class="secondary" id="stopApi">Stop Engine</button><span class="small">Generate starts the engine on its own when it is off.</span></div>
-            </div>
-          </details>
-          <details class="sub">
-            <summary>Generation settings</summary>
-            <div class="sub-body">
-              <div class="grid3">
-                <div><label for="textLang" title="Language of the text to speak. It follows the voice dataset's language when you choose a dataset.">Text language</label><select id="textLang"><option value="en">English</option><option value="zh">Chinese</option><option value="ja">Japanese</option><option value="ko">Korean</option><option value="yue">Cantonese</option></select></div>
-                <div><label>Slice method</label><select id="splitMethod">
-                  <option value="cut5">English punctuation</option>
-                  <option value="cut4">Periods only</option>
-                  <option value="cut0">Do not split</option>
-                </select></div>
-                <div><label>Seed</label><input id="seed" type="number" value="-1" /></div>
-                <div><label>Top K</label><input id="topK" type="number" min="1" max="100" value="15" /></div>
-                <div><label>Repetition penalty</label><input id="repPenalty" type="number" step="0.05" min="1" max="2" value="1.35" /></div>
-                <div><label>Top P</label><input id="topP" type="number" step="0.05" min="0" max="1" value="0.6" /></div>
-                <div><label>Temperature</label><input id="temperature" type="number" step="0.05" min="0" max="1" value="0.6" /></div>
-                <div><label>Speed</label><input id="speed" type="number" step="0.05" min="0.5" max="1.5" value="1" /></div>
-                <div><label>Pause</label><input id="pause" type="number" step="0.05" min="0" max="2" value="0.3" /></div>
-              </div>
-            </div>
-          </details>
         </div>
       </section>
 
-      <section id="tab-relay" class="tab-panel active relay-page" role="tabpanel">
+      <section id="tab-relay" class="tab-panel relay-page" role="tabpanel">
         <button class="secondary mini-button history-toggle" id="historyToggle" aria-expanded="false" aria-controls="relayHistory">Recordings <span id="historyCount"></span></button>
         <aside class="history" id="relayHistory" aria-label="Recordings">
           <button class="secondary history-new" id="relayNewRecording">+ New recording</button>
@@ -2722,6 +2777,10 @@ HTML = r"""<!doctype html>
 
         <div class="workspace" id="relayWorkspace" data-view="capture">
           <div class="capture" id="relayCapture">
+            <div class="no-voice-note">
+              <p>You have no voice yet. Create one on Voice Training, then come back here to speak through it.</p>
+              <button data-go="training">Go to Voice Training</button>
+            </div>
             <button class="talk-button" id="relayPttButton" aria-label="Hold to talk" aria-describedby="relayStatusText relayStatusHint">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/><path d="M8 21h8"/></svg>
             </button>
@@ -2738,6 +2797,12 @@ HTML = r"""<!doctype html>
               </button>
               <input id="relayPttKey" type="hidden" value="ShiftLeft" />
               <span class="shortcut-note" id="relayShortcutNote"></span>
+            </div>
+            <div class="relay-options">
+              <button class="mini-button" id="startSystem" title="Start speech recognition, the voice engine, and the global push-to-talk key" hidden>Start</button>
+              <label class="switch" title="On: record while the key or button is held. Off: voice activation records whenever speech is heard."><input id="relayPushToTalk" type="checkbox" checked /><span class="switch-track" aria-hidden="true"></span>Hold to talk<span class="switch-state" aria-hidden="true"></span></label>
+              <label class="switch" title="On: each transcript is spoken in the selected voice automatically. Off: transcribe only."><input id="relayAutoSpeak" type="checkbox" checked /><span class="switch-track" aria-hidden="true"></span>Speak automatically<span class="switch-state" aria-hidden="true"></span></label>
+              <button class="secondary icon-button" id="openRelaySettings" aria-haspopup="dialog" aria-label="Settings" title="Settings: output device, volume, voice models, and generation settings"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
             </div>
             <details class="manual-line" id="relayManual">
               <summary>Type a line instead</summary>
@@ -2757,7 +2822,7 @@ HTML = r"""<!doctype html>
             <div id="relayPlayerBlock" hidden>
               <div class="result-label">Generated voice</div>
               <div class="result-player" id="relayPlayer">
-                <audio id="relayAudio" controls></audio>
+                <audio id="relayAudio" data-label="generated line"></audio>
                 <button class="secondary mini-button" id="relayPlayThis" hidden>Play</button>
                 <button class="secondary mini-button" id="relayReplayLast">Replay</button>
               </div>
@@ -2768,85 +2833,78 @@ HTML = r"""<!doctype html>
         </div>
       </section>
 
-      <section id="tab-training" class="tab-panel page" role="tabpanel">
-        <div class="page-head"><h2>TTS Training</h2><span class="small">Build a dataset, prepare its features, and train a named GPT-SoVITS voice.</span></div>
-
-        <div class="panel">
-          <div class="panel-head"><h3><span class="step-number">1</span>Dataset</h3><span class="status-line" id="trainingDatasetStatus">Loading datasets...</span></div>
-          <label for="trainingDataset">Training dataset</label>
-          <select id="trainingDataset"></select>
-          <details class="sub">
-            <summary>Add audio and transcripts</summary>
-            <div class="sub-body">
+      <section id="tab-training" class="tab-panel side-page" role="tabpanel">
+        <aside class="history" aria-label="Datasets">
+          <button class="secondary history-new" id="newDatasetButton" aria-haspopup="dialog">+ New dataset</button>
+          <div class="history-list" id="datasetList" role="listbox" aria-label="Datasets"></div>
+          <div class="history-foot"><span class="small" id="datasetListCount">No datasets yet</span></div>
+        </aside>
+        <div class="workspace training-workspace">
+          <!-- The selected dataset. The list on the left sets it. -->
+          <select id="trainingDataset" hidden></select>
+          <div class="empty-note" id="noDatasets" hidden>
+            <p>No voice yet. A voice starts as a dataset: one clean 3 to 10 second clip and its exact words.</p>
+            <button id="newDatasetEmpty" aria-haspopup="dialog">Create a dataset</button>
+          </div>
+          <div class="steps" id="trainingSteps">
+            <div class="step" id="clipsStep">
+              <div class="step-head"><h3><span class="step-number">1</span>Clips</h3><span class="status-line" id="trainingDatasetStatus"></span></div>
               <input id="datasetAudioFiles" type="file" accept="audio/*,.wav,.ogg,.mp3,.flac,.m4a" multiple aria-label="Audio files to add" />
-              <div class="small">Each selected file receives an editable transcript before upload. Filenames are converted into a starting suggestion.</div>
+              <div class="small">Each file gets a transcript you can edit before it is added. The file name is the first suggestion.</div>
               <div class="upload-list" id="datasetUploadRows"></div>
               <div class="row"><button id="uploadDatasetAudio" disabled>Add Files to Dataset</button><span class="status-line" id="datasetUploadProgress"></span></div>
             </div>
-          </details>
-          <details class="sub">
-            <summary>Create a new dataset</summary>
-            <div class="sub-body">
+
+            <div class="step" id="prepareStep">
+              <div class="step-head"><h3><span class="step-number">2</span>Prepare</h3><span class="status-line" id="datasetPrepareStatus">Not prepared in this session.</span></div>
+              <div class="small">Sync Only copies the clips to WSL, which is all Text to Voice and Mic to Voice need. Sync &amp; Prepare also extracts the features that training needs, on the GPU.</div>
               <div class="field-row">
-                <div><label for="newDatasetName">Dataset name</label><input id="newDatasetName" placeholder="Example: Station Announcer" /></div>
-                <div><label for="newDatasetSpeaker">Default speaker name</label><input id="newDatasetSpeaker" value="speaker" /></div>
-                <div><label for="newDatasetLanguage">Language</label><select id="newDatasetLanguage"><option value="en">English</option><option value="zh">Chinese</option><option value="ja">Japanese</option><option value="ko">Korean</option><option value="yue">Cantonese</option></select></div>
+                <div>
+                  <label for="trainingModelName">Model name</label>
+                  <input id="trainingModelName" value="voice-model" placeholder="Example: station-announcer" />
+                  <div class="small" style="margin-top: 6px;">Saved checkpoints use: <strong id="trainingModelSlug">voice-model</strong></div>
+                </div>
               </div>
-              <div><button class="secondary" id="createDataset">Create Dataset</button></div>
-            </div>
-          </details>
-        </div>
-
-        <div class="panel">
-          <div class="panel-head"><h3><span class="step-number">2</span>Prepare</h3><span class="status-line" id="datasetPrepareStatus">Not prepared in this session.</span></div>
-          <div class="field-row">
-            <div>
-              <label for="trainingModelName">Model name</label>
-              <input id="trainingModelName" value="voice-model" placeholder="Example: station-announcer" />
-              <div class="small" style="margin-top: 6px;">Saved checkpoints use: <strong id="trainingModelSlug">voice-model</strong></div>
-            </div>
-          </div>
-          <div class="small" style="margin: 12px 0;">Syncs audio to WSL, normalizes transcripts, extracts voice features on the GPU, and creates the files required by both trainers.</div>
-          <div class="row">
-            <button id="prepareDataset">Sync &amp; Prepare</button>
-            <button class="secondary" id="syncDataset">Sync Only</button>
-            <button class="danger" data-stop="dataset-prepare">Stop Preparation</button>
-          </div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-head"><h3><span class="step-number">3</span>Train</h3><span class="status-line" id="trainingJobsStatus"></span></div>
-          <div class="grid2">
-            <div class="training-project">
-              <h4>SoVITS</h4>
-              <label for="sovitsEpochs">Total epochs</label><input id="sovitsEpochs" type="number" value="16" min="1" />
-              <label for="sovitsBatch">Batch size</label><input id="sovitsBatch" type="number" value="1" min="1" />
-              <label for="sovitsSave">Save every N epochs</label><input id="sovitsSave" type="number" value="4" min="1" />
-              <div class="row" style="margin-top: 10px;">
-                <button id="trainSovits">Train SoVITS</button>
-                <button class="danger" data-stop="train-sovits">Stop</button>
+              <div class="row">
+                <button class="secondary" id="syncDataset">Sync Only</button>
+                <button id="prepareDataset">Sync &amp; Prepare</button>
+                <button class="danger" data-stop="dataset-prepare">Stop Preparation</button>
               </div>
-              <div class="status-line" id="trainSovitsStatus" style="margin-top: 8px;"></div>
             </div>
-            <div class="training-project">
-              <h4>GPT</h4>
-              <label for="gptEpochs">Total epochs</label><input id="gptEpochs" type="number" value="32" min="1" />
-              <label for="gptBatch">Batch size</label><input id="gptBatch" type="number" value="1" min="1" />
-              <label for="gptSave">Save every N epochs</label><input id="gptSave" type="number" value="5" min="1" />
-              <div class="row" style="margin-top: 10px;">
-                <button id="trainGpt">Train GPT</button>
-                <button class="danger" data-stop="train-gpt">Stop</button>
-              </div>
-              <div class="status-line" id="trainGptStatus" style="margin-top: 8px;"></div>
-            </div>
-          </div>
-        </div>
 
-        <div class="panel">
-          <details class="sub" style="border-top: 0; margin-top: 0;">
-            <summary>Saved models <span class="small" id="modelCount"></span></summary>
-            <div class="sub-body"><div class="models" id="modelList" style="border-top: 0; padding-top: 0; margin-top: 0;"></div></div>
-          </details>
+            <div class="step" id="trainPanel">
+              <div class="step-head"><h3><span class="step-number">3</span>Train</h3><span class="status-line" id="trainingJobsStatus"></span></div>
+              <div class="grid2">
+                <div class="training-project">
+                  <h4>SoVITS</h4>
+                  <label for="sovitsEpochs">Total epochs</label><input id="sovitsEpochs" type="number" value="16" min="1" />
+                  <label for="sovitsBatch">Batch size</label><input id="sovitsBatch" type="number" value="1" min="1" />
+                  <label for="sovitsSave">Save every N epochs</label><input id="sovitsSave" type="number" value="4" min="1" />
+                  <div class="row" style="margin-top: 10px;">
+                    <button id="trainSovits">Train SoVITS</button>
+                    <button class="danger" data-stop="train-sovits">Stop</button>
+                  </div>
+                  <div class="status-line" id="trainSovitsStatus" style="margin-top: 8px;"></div>
+                </div>
+                <div class="training-project">
+                  <h4>GPT</h4>
+                  <label for="gptEpochs">Total epochs</label><input id="gptEpochs" type="number" value="32" min="1" />
+                  <label for="gptBatch">Batch size</label><input id="gptBatch" type="number" value="1" min="1" />
+                  <label for="gptSave">Save every N epochs</label><input id="gptSave" type="number" value="5" min="1" />
+                  <div class="row" style="margin-top: 10px;">
+                    <button id="trainGpt">Train GPT</button>
+                    <button class="danger" data-stop="train-gpt">Stop</button>
+                  </div>
+                  <div class="status-line" id="trainGptStatus" style="margin-top: 8px;"></div>
+                </div>
+              </div>
+            </div>
+
+            <details class="sub">
+              <summary>Saved models <span class="small" id="modelCount"></span></summary>
+              <div class="sub-body"><div class="models" id="modelList" style="border-top: 0; padding-top: 0; margin-top: 0;"></div></div>
+            </details>
+          </div>
         </div>
       </section>
 
@@ -2864,7 +2922,7 @@ HTML = r"""<!doctype html>
       </section>
 
       <section id="tab-setup" class="tab-panel page" role="tabpanel">
-        <div class="page-head"><h2>System Setup</h2><span class="small">A read-only check of the software, models, GPU access, and audio devices the voice tools need. It starts nothing and changes nothing.</span></div>
+        <div class="page-head"><h2>System Check</h2><span class="small">A read-only check of the software, models, GPU access, and audio devices the voice tools need. It starts nothing and changes nothing.</span></div>
         <div class="panel">
           <div class="row">
             <button id="runSetupCheck">Run System Check</button>
@@ -2903,13 +2961,7 @@ HTML = r"""<!doctype html>
     </div>
     <div class="island-group">
       <span class="island-system-state" id="systemChip" role="status">system stopped</span>
-      <button class="mini-button system-start" id="startSystem" title="Start speech recognition, the voice engine, and the global push-to-talk helper">Start System</button>
-      <button class="danger mini-button system-stop" id="stopSystem" title="Stop all managed services and the microphone. Recordings stay listed.">Stop Everything</button>
-    </div>
-    <div class="island-group island-relay">
-      <label class="switch" title="On: record while the key or button is held. Off: voice activation records whenever speech is heard."><input id="relayPushToTalk" type="checkbox" checked /><span class="switch-track" aria-hidden="true"></span>Hold to talk<span class="switch-state" aria-hidden="true"></span></label>
-      <label class="switch" title="On: each transcript is spoken in the selected voice automatically. Off: transcribe only."><input id="relayAutoSpeak" type="checkbox" checked /><span class="switch-track" aria-hidden="true"></span>Speak automatically<span class="switch-state" aria-hidden="true"></span></label>
-      <button class="secondary mini-button" id="openRelaySettings" aria-haspopup="dialog" title="Output device, volume, voice models, and generation settings">Settings</button>
+      <button class="danger mini-button" id="stopSystem" title="Stop all managed services and the microphone. Recordings stay listed.">Stop Everything</button>
     </div>
   </div>
 
@@ -2941,7 +2993,7 @@ HTML = r"""<!doctype html>
           <div>
             <label title="The main example clip used for voice character and delivery.">Reference style</label>
             <select id="relayReference"></select>
-            <audio id="relayRefAudio" controls></audio>
+            <audio id="relayRefAudio" data-label="reference clip"></audio>
           </div>
         </div>
         <details class="sub">
@@ -2951,7 +3003,7 @@ HTML = r"""<!doctype html>
             <div class="row"><input id="relayAuxSearch" placeholder="Search clips" aria-label="Search clips" /><button class="secondary mini-button" id="relayClearAuxRefs">Clear</button></div>
             <div id="relayAuxRefsList" class="check-list" style="height: 190px; margin-top: 0;"></div>
             <div id="relayAuxSelectedList" class="selected-list" style="margin-top: 0;"></div>
-            <audio id="relayAuxPreview" controls style="display: block; width: 100%; height: 40px; margin: 0;"></audio>
+            <audio id="relayAuxPreview" data-label="clip"></audio>
             <div class="small" id="relayAuxPreviewStatus"></div>
           </div>
         </details>
@@ -2960,7 +3012,7 @@ HTML = r"""<!doctype html>
         <h3>Generation</h3>
         <label>Voice preset</label>
         <div class="preset-row">
-          <button class="secondary mini-button" type="button" data-relay-profile="fast">Fast Relay</button>
+          <button class="secondary mini-button" type="button" data-relay-profile="fast">Fast</button>
           <button class="secondary mini-button" type="button" data-relay-profile="balanced">Balanced</button>
           <button class="secondary mini-button" type="button" data-relay-profile="quality">Best Quality</button>
         </div>
@@ -2976,6 +3028,99 @@ HTML = r"""<!doctype html>
     </div>
   </dialog>
 
+  <dialog class="settings-dialog" id="generateSettingsDialog" aria-labelledby="generateSettingsTitle">
+    <form method="dialog" class="settings-head">
+      <h2 id="generateSettingsTitle">Text to Voice settings</h2>
+      <button class="secondary mini-button" value="close">Close</button>
+    </form>
+    <div class="settings-body">
+      <div>
+        <h3>Reference clip</h3>
+        <label for="promptText">Text spoken in the reference clip</label>
+        <textarea id="promptText"></textarea>
+        <div class="small">Filled from the clip. Edit it only if the clip says something else.</div>
+      </div>
+      <details class="sub">
+        <summary>Extra reference clips <span class="small" id="auxCount">0 selected</span></summary>
+        <div class="sub-body">
+          <div class="small">Optional additional clips for style. More clips can improve delivery but slow generation.</div>
+          <div class="row"><input id="auxSearch" placeholder="Search clips" aria-label="Search clips" /><button class="secondary mini-button" id="clearAuxRefs">Clear</button></div>
+          <div id="auxRefsList" class="check-list"></div>
+          <div id="auxSelectedList" class="selected-list"></div>
+          <audio id="auxPreview" data-label="clip"></audio>
+          <div class="small" id="auxPreviewStatus"></div>
+        </div>
+      </details>
+      <div>
+        <h3>Engine and models <span class="status-line" id="engineStatus"></span></h3>
+        <div class="field-row">
+          <div><label for="gptModel">GPT model</label><select id="gptModel"></select></div>
+          <div><label for="sovitsModel">SoVITS model</label><select id="sovitsModel"></select></div>
+        </div>
+        <div class="row" style="margin-top: 10px;"><button class="secondary" id="startApi">Start Engine</button><button class="secondary" id="stopApi">Stop Engine</button><span class="small">Generate starts the engine on its own when it is off.</span></div>
+      </div>
+      <div>
+        <h3>Generation</h3>
+        <div class="grid3">
+          <div><label for="textLang" title="Language of the text to speak. It follows the voice dataset's language when you choose a dataset.">Text language</label><select id="textLang"><option value="en">English</option><option value="zh">Chinese</option><option value="ja">Japanese</option><option value="ko">Korean</option><option value="yue">Cantonese</option></select></div>
+          <div><label for="splitMethod">Slice method</label><select id="splitMethod">
+            <option value="cut5">English punctuation</option>
+            <option value="cut4">Periods only</option>
+            <option value="cut0">Do not split</option>
+          </select></div>
+          <div><label for="seed">Seed</label><input id="seed" type="number" value="-1" /></div>
+          <div><label for="topK">Top K</label><input id="topK" type="number" min="1" max="100" value="15" /></div>
+          <div><label for="repPenalty">Repetition penalty</label><input id="repPenalty" type="number" step="0.05" min="1" max="2" value="1.35" /></div>
+          <div><label for="topP">Top P</label><input id="topP" type="number" step="0.05" min="0" max="1" value="0.6" /></div>
+          <div><label for="temperature">Temperature</label><input id="temperature" type="number" step="0.05" min="0" max="1" value="0.6" /></div>
+          <div><label for="speed">Speed</label><input id="speed" type="number" step="0.05" min="0.5" max="1.5" value="1" /></div>
+          <div><label for="pause">Pause</label><input id="pause" type="number" step="0.05" min="0" max="2" value="0.3" /></div>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog class="settings-dialog small-dialog" id="createDatasetDialog" aria-labelledby="createDatasetTitle">
+    <form method="dialog" class="settings-head">
+      <h2 id="createDatasetTitle">New dataset</h2>
+      <button class="secondary mini-button" value="close">Close</button>
+    </form>
+    <div class="settings-body">
+      <div class="field-row">
+        <div><label for="newDatasetName">Dataset name</label><input id="newDatasetName" placeholder="Example: Station Announcer" /></div>
+        <div><label for="newDatasetLanguage">Language</label><select id="newDatasetLanguage"><option value="en">English</option><option value="zh">Chinese</option><option value="ja">Japanese</option><option value="ko">Korean</option><option value="yue">Cantonese</option></select></div>
+      </div>
+      <div><label for="newDatasetSpeaker">Default speaker name</label><input id="newDatasetSpeaker" value="speaker" /></div>
+      <div><button id="createDataset">Create Dataset</button></div>
+    </div>
+  </dialog>
+
+  <dialog class="settings-dialog small-dialog" id="welcomeDialog" aria-labelledby="welcomeTitle">
+    <div class="settings-body">
+      <h2 id="welcomeTitle">Welcome to Local Voice Systems</h2>
+      <p>Looks like this is your first time here. Do you want a quick rundown?</p>
+      <div class="row">
+        <button id="welcomeYes">Show me</button>
+        <button class="secondary" id="welcomeNo">No thanks</button>
+      </div>
+      <div class="small">You can take the tour later with the Guide button at the top.</div>
+    </div>
+  </dialog>
+
+  <div class="tour" id="tour" hidden>
+    <div class="tour-spot" id="tourSpot"></div>
+    <div class="tour-pop" id="tourPop" role="dialog" aria-modal="true" aria-labelledby="tourTitle" aria-describedby="tourText">
+      <div class="tour-count" id="tourCount"></div>
+      <h2 id="tourTitle"></h2>
+      <p id="tourText"></p>
+      <div class="tour-actions">
+        <button class="secondary" id="tourEnd">End tour</button>
+        <button class="secondary" id="tourBack">Back</button>
+        <button id="tourNext">Next</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     // Settings saved by earlier versions used a different key prefix.
     ["RelaySettings", "RelayAuxSelected", "RelayPttKey", "RelayOutputDevice", "TrainingDataset", "TrainingModelName"].forEach(key => {
@@ -2985,7 +3130,7 @@ HTML = r"""<!doctype html>
       } catch (_) {}
     });
     // Settings of the removed voice changer page.
-    try { ["voiceDashboardRvcDataset", "voiceDashboardRvcModelName"].forEach(key => localStorage.removeItem(key)); }
+    try { ["voiceDashboardRvcDataset", "voiceDashboardRvcModelName", "voiceDashboardGuide"].forEach(key => localStorage.removeItem(key)); }
     catch (_) {}
     let state = null;
     let voiceDataset = "";
@@ -2999,6 +3144,53 @@ HTML = r"""<!doctype html>
     let modelsSignature = "";
     let refreshBusy = false;
     const $ = id => document.getElementById(id);
+
+    // The dashboard's own audio player in place of the browser's: a play button, a position bar
+    // and the time. Hiding an audio element hides its player too.
+    const PLAY_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>';
+    const PAUSE_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg>';
+    function clockTime(seconds) {
+      if (!Number.isFinite(seconds)) return "0:00";
+      return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
+    }
+    function attachPlayer(audio) {
+      const label = audio.dataset.label || "audio";
+      const bar = document.createElement("div");
+      bar.className = "player";
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "player-toggle";
+      const seek = document.createElement("input");
+      seek.type = "range";
+      seek.className = "player-seek";
+      seek.min = "0";
+      seek.max = "1000";
+      seek.value = "0";
+      seek.setAttribute("aria-label", `Position in the ${label}`);
+      const time = document.createElement("span");
+      time.className = "player-time";
+      bar.append(toggle, seek, time);
+      audio.after(bar);
+      let seeking = false;
+      const update = () => {
+        const loaded = Boolean(audio.currentSrc || audio.getAttribute("src"));
+        toggle.disabled = !loaded;
+        toggle.innerHTML = audio.paused ? PLAY_ICON : PAUSE_ICON;
+        toggle.setAttribute("aria-label", `${audio.paused ? "Play" : "Pause"} the ${label}`);
+        seek.disabled = !loaded || !Number.isFinite(audio.duration);
+        if (!seeking) seek.value = audio.duration ? String(Math.round(audio.currentTime / audio.duration * 1000)) : "0";
+        time.textContent = `${clockTime(audio.currentTime)} / ${clockTime(audio.duration)}`;
+      };
+      toggle.onclick = () => { if (audio.paused) audio.play().catch(() => {}); else audio.pause(); };
+      seek.addEventListener("input", () => {
+        seeking = true;
+        if (Number.isFinite(audio.duration)) audio.currentTime = seek.value / 1000 * audio.duration;
+      });
+      seek.addEventListener("change", () => { seeking = false; });
+      ["play", "pause", "ended", "timeupdate", "loadedmetadata", "durationchange", "emptied", "loadstart"].forEach(name => audio.addEventListener(name, update));
+      update();
+    }
+    document.querySelectorAll("audio").forEach(attachPlayer);
     let relayListening = false;
     let relayQueue = [];
     let relayBusy = false;
@@ -3019,6 +3211,11 @@ HTML = r"""<!doctype html>
     let relayCurrentItem = null;
     let relayPlaybackResolve = null;
     let armRelayWhenReady = false;
+    // Mic to Voice starts its services once each time the tab opens. After Stop Everything they
+    // stay off until the tab is opened again or Start is pressed.
+    let autoStartPending = false;
+    let systemStartBusy = false;
+    let welcomeChecked = false;
     let lastSystemMessage = "";
     let datasetUploadFiles = [];
     // Relay workspace view: "capture" shows the recording control alone; "result" shows one queue item.
@@ -3033,6 +3230,8 @@ HTML = r"""<!doctype html>
     let engineBusy = false;
     let logRaw = "";
     let generateOutputs = [];
+    // The generated line shown in the player.
+    let generateShown = null;
     let textLangDataset = "";
     let configErrorShown = false;
     let relaySavedSettings = {};
@@ -3113,11 +3312,15 @@ HTML = r"""<!doctype html>
       return /[.!?]$/.test(text) ? text : text + ".";
     }
 
+    function datasetLabel(dataset) {
+      return `${dataset.name} — ${dataset.wav_count} ${dataset.wav_count === 1 ? "clip" : "clips"}`;
+    }
+
     function fillDatasetSelects(datasets, activeId) {
       ["voiceDataset", "relayDataset"].forEach(id => {
         const select = $(id);
         select.innerHTML = "";
-        datasets.forEach(dataset => option(select, dataset.id, `${dataset.name} — ${dataset.wav_count} clips`));
+        datasets.forEach(dataset => option(select, dataset.id, datasetLabel(dataset)));
         if (datasets.some(dataset => dataset.id === activeId)) select.value = activeId;
       });
       if (activeId !== voiceDataset) {
@@ -3130,15 +3333,59 @@ HTML = r"""<!doctype html>
       const select = $("trainingDataset");
       const old = select.value || localStorage.getItem("voiceDashboardTrainingDataset") || "";
       select.innerHTML = "";
-      (datasets || []).forEach(dataset => option(select, dataset.id, `${dataset.name} — ${dataset.wav_count} clips`));
+      (datasets || []).forEach(dataset => option(select, dataset.id, datasetLabel(dataset)));
       if ((datasets || []).some(dataset => dataset.id === old)) select.value = old;
       const selected = (datasets || []).find(dataset => dataset.id === select.value);
       if (selected) {
-        $("trainingDatasetStatus").textContent = `${selected.wav_count} WAV files / ${selected.list_rows} transcripts · ${selected.ready ? "ready to prepare" : "needs audio or transcripts"}`;
+        $("trainingDatasetStatus").textContent = `${selected.name}: ${selected.wav_count} WAV files / ${selected.list_rows} transcripts · ${selected.ready ? "ready" : "needs audio or transcripts"}`;
         $("trainingDatasetStatus").className = selected.ready ? "status-line good" : "status-line warn";
         $("uploadDatasetAudio").disabled = !datasetUploadFiles.length;
       }
+      renderDatasetList(datasets || [], select.value);
     }
+
+    // Redrawn only when a dataset or the choice changes, so keyboard focus stays in the list.
+    let datasetListSignature = null;
+    function renderDatasetList(datasets, selectedId) {
+      const signature = selectedId + "|" + datasets.map(row => `${row.id}:${row.name}:${row.wav_count}:${row.ready}`).join("|");
+      if (signature === datasetListSignature) return;
+      datasetListSignature = signature;
+      const list = $("datasetList");
+      list.innerHTML = "";
+      datasets.forEach(dataset => {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "history-item";
+        row.setAttribute("role", "option");
+        row.setAttribute("aria-selected", dataset.id === selectedId ? "true" : "false");
+        const name = document.createElement("span");
+        name.className = "history-text";
+        name.textContent = dataset.name;
+        const meta = document.createElement("span");
+        meta.className = "history-meta";
+        const clips = document.createElement("span");
+        clips.textContent = `${dataset.wav_count} ${dataset.wav_count === 1 ? "clip" : "clips"}`;
+        const ready = document.createElement("span");
+        ready.textContent = dataset.ready ? "ready" : (dataset.wav_count ? "incomplete" : "no clips yet");
+        meta.append(clips, ready);
+        row.append(name, meta);
+        row.onclick = () => {
+          $("trainingDataset").value = dataset.id;
+          $("trainingDataset").onchange();
+        };
+        list.appendChild(row);
+      });
+      $("datasetListCount").textContent = datasets.length ? `${datasets.length} ${datasets.length === 1 ? "dataset" : "datasets"}` : "No datasets yet";
+      $("noDatasets").hidden = datasets.length > 0;
+      $("trainingSteps").hidden = !datasets.length;
+    }
+
+    function openCreateDataset() {
+      $("createDatasetDialog").showModal();
+      $("newDatasetName").focus();
+    }
+    $("newDatasetButton").onclick = openCreateDataset;
+    $("newDatasetEmpty").onclick = openCreateDataset;
 
     function renderDatasetUploads() {
       const list = $("datasetUploadRows");
@@ -3175,7 +3422,7 @@ HTML = r"""<!doctype html>
     if (relaySavedSettings.relayVolume !== undefined && Number(relaySavedSettings.relayVolume) <= 4) {
       $("relayVolume").value = Math.round(Number(relaySavedSettings.relayVolume) / 4 * 100);
     }
-    function activateTab(name) {
+    function activateTab(name, autoStart = true) {
       if (!$(`tab-${name}`)) name = "relay";
       document.body.dataset.tab = name;
       document.querySelectorAll(".tab-button").forEach(button => {
@@ -3187,14 +3434,22 @@ HTML = r"""<!doctype html>
         panel.classList.toggle("active", panel.id === `tab-${name}`);
       });
       if (location.hash !== `#${name}`) history.replaceState(null, "", `#${name}`);
+      try { localStorage.setItem("voiceDashboardTab", name); } catch (_) {}
+      autoStartPending = name === "relay" && autoStart;
+      autoStartSystem();
+      renderStartButton();
     }
-    document.querySelectorAll(".tab-button").forEach(button => {
+    document.querySelectorAll(".tab-button, [data-go]").forEach(button => {
       button.onclick = () => {
-        activateTab(button.dataset.tab);
+        activateTab(button.dataset.tab || button.dataset.go);
         refresh();
       };
     });
-    activateTab((location.hash || "#relay").slice(1));
+    // The page opens on the tab used last, and the first time on Mic to Voice. Without a voice,
+    // that page points to Voice Training.
+    let savedTab = "";
+    try { savedTab = localStorage.getItem("voiceDashboardTab") || ""; } catch (_) {}
+    activateTab(location.hash.slice(1) || savedTab || "relay");
     function option(select, value, label) {
       const opt = document.createElement("option");
       opt.value = value;
@@ -3663,7 +3918,9 @@ HTML = r"""<!doctype html>
       if (!hint && relayCurrentItem && item && item !== relayCurrentItem) hint = "Another line is still being generated or played.";
       if (!hint) {
         if (relayListening && !relayAudioCtx) hint = "Speech recognition is starting.";
-        else if (system.status === "stopped" && !relayListening) hint = "Services start on first use. Start System also enables the global key while this page is not focused.";
+        else if (system.status === "stopped" && (systemStartBusy || autoStartPending)) hint = "Starting speech recognition and the voice engine.";
+        else if (system.status === "stopped" && !relayListening && state && state.gpu_busy) hint = "Training is using the GPU, so nothing started by itself. Press Start to load the voice anyway.";
+        else if (system.status === "stopped" && !relayListening) hint = "Everything is stopped. Press Start to turn it back on.";
         else if (system.status === "starting") hint = system.message || "Starting the system.";
         else if (system.status === "failed" || system.status === "degraded") hint = system.message || "";
       }
@@ -3746,7 +4003,7 @@ HTML = r"""<!doctype html>
 
     async function generateRelayLine(text, generationId) {
       const ref = relayRef();
-      if (!ref) throw new Error("Pick a relay reference clip.");
+      if (!ref) throw new Error("Pick a reference clip in Settings.");
       const aux = relayAuxRefs().map(item => item.wsl_path);
       return await post("/api/generate", {
         gpt: $("relayGptModel").value,
@@ -4120,12 +4377,12 @@ HTML = r"""<!doctype html>
       $("systemChip").textContent = status === "ready" ? "System ready" : (status === "stopped" ? "System stopped" : (system.message || status));
       $("systemChip").title = system.error ? `${system.message} ${system.error}` : (system.message || status);
       $("systemChip").className = status === "ready" ? "island-system-state good" : (status === "failed" || status === "degraded" ? "island-system-state bad" : "island-system-state");
-      $("startSystem").disabled = status === "starting" || status === "ready";
       if (status !== lastSystemStatus) {
         lastSystemStatus = status;
         renderRelayCenter();
       }
-      $("startSystem").textContent = status === "failed" || status === "degraded" ? "Retry System" : "Start System";
+      autoStartSystem();
+      renderStartButton();
       // Stop Everything stays clickable: services can be running even while the
       // system status reads "stopped", and stop-system is safe to call at any time.
       const components = system.components || {};
@@ -4140,6 +4397,53 @@ HTML = r"""<!doctype html>
       if (status === "ready" && armRelayWhenReady && !relayListening) {
         armRelayWhenReady = false;
         startRelayListening();
+      }
+    }
+
+    function hasVoice() {
+      return Boolean(state && (state.datasets || []).some(dataset => dataset.wav_count > 0));
+    }
+
+    // Start shows only on Mic to Voice: as Retry after a failed start, and as Start after Stop Everything.
+    function renderStartButton() {
+      const status = (lastSystemSnapshot || {}).status || "";
+      const failed = status === "failed" || status === "degraded";
+      $("startSystem").hidden = document.body.dataset.tab !== "relay" || systemStartBusy || autoStartPending
+        || !hasVoice() || !(failed || status === "stopped");
+      $("startSystem").textContent = failed ? "Retry" : "Start";
+    }
+
+    function autoStartSystem() {
+      if (!autoStartPending || document.body.dataset.tab !== "relay" || !lastSystemSnapshot || !hasVoice()) return;
+      autoStartPending = false;
+      // Training keeps the GPU. Start still loads the voice on purpose, for example to test a checkpoint.
+      if (lastSystemSnapshot.status === "stopped" && !state.gpu_busy) startSystem();
+    }
+
+    async function startSystem() {
+      systemStartBusy = true;
+      renderStartButton();
+      renderRelayCenter();
+      $("globalError").classList.remove("visible");
+      saveRelaySettings();
+      armRelayWhenReady = true;
+      recentActivity("Requesting microphone access...");
+      try {
+        await refreshRelayDevices();
+        await post("/api/start-system", {
+          gpt: $("relayGptModel").value,
+          sovits: $("relaySovitsModel").value,
+          binding: $("relayPttKey").value
+        });
+        recentActivity("System startup requested.");
+        await refreshSystem();
+      } catch (error) {
+        armRelayWhenReady = false;
+        showError(error.message);
+      } finally {
+        systemStartBusy = false;
+        renderStartButton();
+        renderRelayCenter();
       }
     }
 
@@ -4225,6 +4529,7 @@ HTML = r"""<!doctype html>
       }
       fillTrainingDatasets(state.datasets || []);
       fillDatasetSelects(state.datasets || [], state.reference_dataset || "");
+      document.body.dataset.voice = hasVoice() ? "yes" : "no";
       const gptOld = $("gptModel").value;
       const sovitsOld = $("sovitsModel").value;
       const relayGptOld = $("relayGptModel").value || relaySavedSettings.relayGptModel || "";
@@ -4276,6 +4581,9 @@ HTML = r"""<!doctype html>
       const savedModels = [...state.models.gpt, ...state.models.sovits];
       $("modelCount").textContent = savedModels.length ? `${savedModels.length} files` : (state.models_listed ? "none yet" : "listed once WSL is running");
       savedModels.forEach(row => $("modelList").appendChild(modelLine(row.path, row.size_mb)));
+      showWelcome();
+      // Loaded data can move the highlighted element.
+      placeTour();
       } finally {
         refreshBusy = false;
       }
@@ -4290,6 +4598,150 @@ HTML = r"""<!doctype html>
       size.textContent = `${sizeMb} MB`;
       div.append(name, size);
       return div;
+    }
+
+    // Guided tour. The page darkens except for one highlighted element, and a pop-up beside it
+    // explains it. The tour moves through the tabs; opening Mic to Voice starts nothing meanwhile.
+    // Steps marked "voice" show controls that exist only once a voice does.
+    const TOUR_STEPS = [
+      {title: "Welcome", text: "This tour shows what each part of the dashboard does and how to use it. Use Next and Back, or the arrow keys. Esc ends the tour."},
+      {targets: [".tablist"], title: "Tabs", text: "Mic to Voice and Text to Voice speak in a voice. Voice Training creates voices. Logs and System Check help when something does not work."},
+      {tab: "training", targets: ["#newDatasetButton"], title: "Create a voice", text: "Every voice starts as a dataset. Press + New dataset, then give it a name and a language."},
+      {tab: "training", targets: ["#clipsStep", "#noDatasets"], title: "Add clips", text: "Choose one or more clean 3 to 10 second clips. Each clip needs the exact words spoken in it, which you can edit before the clips are added."},
+      {tab: "training", targets: ["#prepareStep", "#noDatasets"], title: "Sync the clips", text: "Sync Only copies the clips to WSL, which is all Text to Voice and Mic to Voice need. Sync again after adding clips."},
+      {tab: "training", targets: ["#trainPanel", "#noDatasets"], title: "Train the voice", text: "Training makes the voice closer to its clips, after Sync & Prepare. It takes a while, and it stops the voice first to free the GPU."},
+      {tab: "generate", targets: ["#targetText", "#tab-generate .no-voice-note"], title: "Text to Voice", text: "Type what the voice should say.", noVoiceText: "Here you type what a voice should say. It needs a voice first, made on Voice Training."},
+      {tab: "generate", voice: true, targets: [".voice-line"], title: "Choose the voice", text: "Pick the voice and a reference clip. The clip's tone shapes how the line sounds, and you can play it here."},
+      {tab: "generate", voice: true, targets: [".compose-actions"], title: "Generate", text: "Generate makes the line. The voice engine starts by itself the first time, which takes a moment. The gear opens the models, the text language and finer controls."},
+      {tab: "generate", targets: ["#tab-generate .history"], title: "Your lines", text: "Every line you generate is listed here. Click one to play it again."},
+      {tab: "relay", targets: ["#relayPttButton", "#relayCapture .no-voice-note"], title: "Mic to Voice", text: "Hold this button or your push-to-talk key, speak English, and release. Your words are spoken in the voice.", noVoiceText: "Here you speak, and your words are spoken in a voice. It needs a voice first, made on Voice Training."},
+      {tab: "relay", voice: true, targets: ["#relaySetPttKey"], title: "Push-to-talk key", text: "Click to choose another key. It also works while another app, such as a game, is in front."},
+      {tab: "relay", voice: true, targets: [".relay-options"], title: "Options", text: "With Hold to talk off, the microphone listens all the time instead. With Speak automatically off, your words are only written down. The gear sets the output device, the volume and the voice."},
+      {tab: "relay", targets: ["#relayHistory"], title: "Recordings", text: "Everything you said in this session is listed here, to read or play again."},
+      {targets: ["#systemIsland"], title: "Status bar", text: "Shows whether speech recognition, the voice engine and the global key are running. Mic to Voice starts them when you open it, and Stop Everything stops them and frees the GPU."},
+      {targets: ["#openGuide"], title: "Take the tour again", text: "Press Guide to see this tour again at any time."},
+    ];
+    let tour = null;
+
+    function startTour() {
+      document.querySelectorAll("dialog[open]").forEach(dialog => dialog.close());
+      tour = {
+        steps: TOUR_STEPS.filter(step => !step.voice || hasVoice()),
+        index: 0,
+        returnTab: document.body.dataset.tab,
+        resumeAutoStart: autoStartPending,
+        returnFocus: document.activeElement,
+      };
+      autoStartPending = false;
+      $("tour").hidden = false;
+      showTourStep();
+    }
+
+    function endTour() {
+      if (!tour) return;
+      const {returnTab, resumeAutoStart, returnFocus} = tour;
+      tour = null;
+      $("tour").hidden = true;
+      activateTab(returnTab, resumeAutoStart);
+      refresh();
+      if (returnFocus && returnFocus.focus) returnFocus.focus();
+    }
+
+    function moveTour(change) {
+      if (!tour) return;
+      const index = tour.index + change;
+      if (index < 0) return;
+      if (index >= tour.steps.length) return endTour();
+      tour.index = index;
+      showTourStep();
+    }
+
+    function tourTarget(step) {
+      for (const selector of step.targets || []) {
+        const element = document.querySelector(selector);
+        if (element && element.getClientRects().length) return element;
+      }
+      return null;
+    }
+
+    function showTourStep() {
+      const step = tour.steps[tour.index];
+      if (step.tab && document.body.dataset.tab !== step.tab) activateTab(step.tab, false);
+      const target = tourTarget(step);
+      if (target) target.scrollIntoView({block: "center", inline: "nearest"});
+      $("tourCount").textContent = `${tour.index + 1} of ${tour.steps.length}`;
+      $("tourTitle").textContent = step.title;
+      $("tourText").textContent = !hasVoice() && step.noVoiceText ? step.noVoiceText : step.text;
+      $("tourBack").disabled = tour.index === 0;
+      $("tourNext").textContent = tour.index === tour.steps.length - 1 ? "Finish" : "Next";
+      placeTour();
+      $("tourNext").focus();
+    }
+
+    // The pop-up goes below the element, else above, right or left, else at the bottom of the window.
+    function placeTour() {
+      if (!tour) return;
+      const target = tourTarget(tour.steps[tour.index]);
+      const spot = $("tourSpot");
+      const pop = $("tourPop");
+      const gap = 12;
+      const pad = 6;
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      const popWidth = pop.offsetWidth;
+      const popHeight = pop.offsetHeight;
+      $("tour").classList.toggle("no-spot", !target);
+      spot.hidden = !target;
+      let top = (height - popHeight) / 2;
+      let left = (width - popWidth) / 2;
+      if (target) {
+        const rect = target.getBoundingClientRect();
+        const box = {top: rect.top - pad, left: rect.left - pad, right: rect.right + pad, bottom: rect.bottom + pad};
+        Object.assign(spot.style, {top: `${box.top}px`, left: `${box.left}px`, width: `${box.right - box.left}px`, height: `${box.bottom - box.top}px`});
+        // The highlight follows the element's corners, so a round button gets a round highlight.
+        const radius = getComputedStyle(target).borderTopLeftRadius;
+        spot.style.borderRadius = radius.endsWith("%") ? radius : `${parseFloat(radius) + pad}px`;
+        const middleX = rect.left + rect.width / 2 - popWidth / 2;
+        const middleY = rect.top + rect.height / 2 - popHeight / 2;
+        if (box.bottom + gap + popHeight <= height - gap) [top, left] = [box.bottom + gap, middleX];
+        else if (box.top - gap - popHeight >= gap) [top, left] = [box.top - gap - popHeight, middleX];
+        else if (box.right + gap + popWidth <= width - gap) [top, left] = [middleY, box.right + gap];
+        else if (box.left - gap - popWidth >= gap) [top, left] = [middleY, box.left - gap - popWidth];
+        else [top, left] = [height - popHeight - gap, middleX];
+      }
+      pop.style.top = `${Math.round(Math.max(gap, Math.min(top, height - popHeight - gap)))}px`;
+      pop.style.left = `${Math.round(Math.max(gap, Math.min(left, width - popWidth - gap)))}px`;
+    }
+
+    $("tourNext").onclick = () => moveTour(1);
+    $("tourBack").onclick = () => moveTour(-1);
+    $("tourEnd").onclick = endTour;
+    // While the tour runs, keys belong to it, so the push-to-talk key does not start a recording.
+    document.addEventListener("keydown", event => {
+      if (!tour) return;
+      event.stopPropagation();
+      if (event.key === "Escape") { event.preventDefault(); endTour(); }
+      else if (event.key === "ArrowRight") { event.preventDefault(); moveTour(1); }
+      else if (event.key === "ArrowLeft") { event.preventDefault(); moveTour(-1); }
+      else if (event.key === "Tab") {
+        // Focus stays in the pop-up.
+        event.preventDefault();
+        const buttons = [...$("tourPop").querySelectorAll("button:not(:disabled)")];
+        const index = buttons.indexOf(document.activeElement);
+        buttons[(index + (event.shiftKey ? buttons.length - 1 : 1)) % buttons.length].focus();
+      }
+    }, true);
+    ["mousedown", "pointerdown", "auxclick", "contextmenu"].forEach(name => $("tour").addEventListener(name, event => event.stopPropagation()));
+    window.addEventListener("resize", placeTour);
+    window.addEventListener("scroll", placeTour, true);
+
+    // Offered once, to a dashboard without datasets. Closing it in any way counts as seen.
+    function showWelcome() {
+      if (welcomeChecked || !state) return;
+      welcomeChecked = true;
+      let seen = false;
+      try { seen = localStorage.getItem("voiceDashboardWelcomeSeen") === "1"; } catch (_) {}
+      if (!seen && !(state.datasets || []).length) $("welcomeDialog").showModal();
     }
 
     async function post(path, data = {}) {
@@ -4367,29 +4819,56 @@ HTML = r"""<!doctype html>
     };
 
     function renderGenerateHistory() {
-      const holder = $("generateHistory");
-      holder.innerHTML = "";
-      const earlier = generateOutputs.slice(0, -1).reverse();
-      holder.hidden = !earlier.length;
-      earlier.forEach(item => {
-        const row = document.createElement("div");
-        row.className = "history-line";
+      const list = $("generateHistory");
+      list.innerHTML = "";
+      const items = generateOutputs.slice().reverse();
+      if (!items.length) {
+        const empty = document.createElement("div");
+        empty.className = "history-empty";
+        empty.textContent = "Lines you generate appear here.";
+        list.appendChild(empty);
+      }
+      items.forEach(item => {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "history-item";
+        row.setAttribute("role", "option");
+        row.setAttribute("aria-selected", item === generateShown ? "true" : "false");
+        row.title = item.name;
         const text = document.createElement("span");
+        text.className = "history-text";
         text.textContent = item.text;
-        text.title = `${item.name}: ${item.text}`;
-        const play = document.createElement("button");
-        play.type = "button";
-        play.className = "secondary mini-button";
-        play.textContent = "Play";
-        play.onclick = () => {
-          $("outputAudio").src = item.url + "?t=" + Date.now();
-          $("outputName").textContent = item.name;
-          $("outputAudio").play().catch(() => {});
-        };
-        row.append(text, play);
-        holder.appendChild(row);
+        const meta = document.createElement("span");
+        meta.className = "history-meta";
+        const time = document.createElement("span");
+        time.textContent = formatClock(item.createdAt);
+        meta.append(time);
+        row.append(text, meta);
+        row.onclick = () => showGeneratedLine(item, true);
+        list.appendChild(row);
       });
+      $("generateHistoryCount").textContent = items.length ? `${items.length} this session` : "Nothing generated yet";
     }
+
+    function showGeneratedLine(item, play) {
+      generateShown = item;
+      $("outputAudio").src = item.url + "?t=" + Date.now();
+      $("outputName").textContent = item.name;
+      $("generateResult").hidden = false;
+      if (play) $("outputAudio").play().catch(() => {});
+      renderGenerateHistory();
+    }
+
+    $("generateNewLine").onclick = () => {
+      generateShown = null;
+      $("targetText").value = "";
+      $("generateResult").hidden = true;
+      $("generateStatus").textContent = "";
+      renderGenerateHistory();
+      $("targetText").focus();
+    };
+    $("openGenerateSettings").onclick = () => $("generateSettingsDialog").showModal();
+    renderGenerateHistory();
     $("relayReference").addEventListener("change", () => {
       const ref = relayRef();
       if (ref) setRelayReference(ref);
@@ -4448,6 +4927,15 @@ HTML = r"""<!doctype html>
       $("historyToggle").setAttribute("aria-expanded", open ? "true" : "false");
     };
     $("openRelaySettings").onclick = () => $("relaySettingsDialog").showModal();
+    $("openGuide").onclick = startTour;
+    $("welcomeDialog").addEventListener("close", () => {
+      try { localStorage.setItem("voiceDashboardWelcomeSeen", "1"); } catch (_) {}
+    });
+    $("welcomeNo").onclick = () => $("welcomeDialog").close();
+    $("welcomeYes").onclick = () => {
+      $("welcomeDialog").close();
+      startTour();
+    };
     $("relayPlayThis").onclick = () => {
       const item = viewedRelayItem();
       if (item && item.url) playRelayUrl(item.url, item.name);
@@ -4478,31 +4966,12 @@ HTML = r"""<!doctype html>
       }
     });
 
-    $("startSystem").onclick = async () => {
-      $("startSystem").disabled = true;
-      $("globalError").classList.remove("visible");
-      saveRelaySettings();
-      armRelayWhenReady = true;
-      recentActivity("Requesting microphone access...");
-      try {
-        await refreshRelayDevices();
-        await post("/api/start-system", {
-          gpt: $("relayGptModel").value,
-          sovits: $("relaySovitsModel").value,
-          binding: $("relayPttKey").value
-        });
-        recentActivity("System startup requested.");
-        await refreshSystem();
-      } catch (error) {
-        armRelayWhenReady = false;
-        showError(error.message);
-        $("startSystem").disabled = false;
-      }
-    };
+    $("startSystem").onclick = startSystem;
 
     $("stopSystem").onclick = async () => {
       $("stopSystem").disabled = true;
       armRelayWhenReady = false;
+      autoStartPending = false;
       stopRelayListening();
       try {
         await post("/api/stop-system");
@@ -4640,7 +5109,10 @@ HTML = r"""<!doctype html>
           language: $("newDatasetLanguage").value
         });
         localStorage.setItem("voiceDashboardTrainingDataset", result.dataset.id);
+        // Emptied, so the next refresh selects the new dataset from the saved choice.
+        $("trainingDataset").innerHTML = "";
         $("newDatasetName").value = "";
+        $("createDatasetDialog").close();
         recentActivity(`Dataset ${result.dataset.name} created.`);
         await refresh();
       } catch (error) {
@@ -4728,7 +5200,9 @@ HTML = r"""<!doctype html>
       $("generate").disabled = true;
       $("generateStatus").className = "status-line";
       if (!(state && state.api_ready)) {
-        $("generateStatus").textContent = "Starting the voice engine first...";
+        $("generateStatus").textContent = state && state.gpu_busy
+          ? "Starting the voice engine first. Training is using the same GPU, so both can run slower or run out of memory."
+          : "Starting the voice engine first...";
         try {
           if (!await ensureGenerateEngine()) throw new Error("The voice engine did not become ready.");
         } catch (e) {
@@ -4765,11 +5239,9 @@ HTML = r"""<!doctype html>
           repetition_penalty: $("repPenalty").value,
           voice: voiceDataset
         });
-        $("outputAudio").src = result.url + "?t=" + Date.now();
-        $("outputName").textContent = result.name;
-        $("generateResult").hidden = false;
-        generateOutputs.push({text: $("targetText").value.trim(), url: result.url, name: result.name});
-        renderGenerateHistory();
+        const line = {text: $("targetText").value.trim(), url: result.url, name: result.name, createdAt: Date.now()};
+        generateOutputs.push(line);
+        showGeneratedLine(line, false);
         $("generateStatus").className = "status-line good";
         $("generateStatus").textContent = "Done.";
       } catch (e) {
