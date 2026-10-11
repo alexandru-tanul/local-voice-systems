@@ -2115,6 +2115,13 @@ HTML = r"""<!doctype html>
     .player .player-toggle:hover:not(:disabled) { background: var(--panel-3); border-color: var(--line); }
     .player .player-seek { flex: 1 1 auto; min-width: 40px; height: auto; min-height: 0; }
     .player-time { flex: 0 0 auto; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .player .player-volume { flex: 0 0 auto; display: grid; place-items: center; width: calc(var(--control-height) - 2px); height: 100%; min-height: 0; padding: 0; border: 0; border-left: 1px solid var(--line); border-radius: 0 var(--radius) var(--radius) 0; background: transparent; color: var(--text); }
+    .player .player-volume:hover:not(:disabled) { background: var(--panel-3); border-color: var(--line); }
+    .player.has-volume { position: relative; padding-right: 0; }
+    /* The volume slider opens above its player, so the position bar keeps its room. */
+    .player-volume-panel { position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 30; display: flex; align-items: center; gap: var(--space-2); width: 200px; height: var(--control-height); padding: 0 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); box-shadow: 0 8px 24px rgba(0, 0, 0, .4); }
+    .player-volume-panel input[type="range"] { flex: 1 1 auto; height: auto; min-height: 0; }
+    .player-volume-value { flex: 0 0 auto; min-width: 36px; text-align: right; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
     .relay-block-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); min-height: 32px; }
     .relay-block-head label { margin: 0; }
     .relay-volume-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--space-3); }
@@ -2638,7 +2645,8 @@ HTML = r"""<!doctype html>
     }
     .compose { display: grid; gap: var(--space-4); width: 100%; max-width: 760px; }
     .compose textarea { padding: 14px 16px; font-size: 16px; line-height: 1.5; }
-    .voice-line { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--space-3); align-items: end; }
+    /* The preview player gets a wider column, so its position bar stays usable beside the volume button. */
+    .voice-line { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.3fr); gap: var(--space-3); align-items: end; }
     .voice-line > * { min-width: 0; }
     .compose-actions { display: flex; align-items: center; justify-content: center; gap: var(--space-3); flex-wrap: wrap; }
     .compose-status { text-align: center; min-height: 20px; }
@@ -2696,6 +2704,7 @@ HTML = r"""<!doctype html>
       header { padding: 8px var(--space-3); gap: var(--space-2); }
       .tab-button { padding: 4px 8px; font-size: 11px; letter-spacing: .04em; }
       .tab-button.tab-tool { margin-left: 0; }
+      .voice-line { grid-template-columns: 1fr; }
       .tab-button.tab-tool::before { display: none; }
       header .guide-button { top: 8px; right: var(--space-3); }
       .workspace[data-view="result"] .capture { align-items: flex-start; }
@@ -2822,7 +2831,7 @@ HTML = r"""<!doctype html>
             <div id="relayPlayerBlock" hidden>
               <div class="result-label">Generated voice</div>
               <div class="result-player" id="relayPlayer">
-                <audio id="relayAudio" data-label="generated line"></audio>
+                <audio id="relayAudio" data-label="generated line" data-settings-volume></audio>
                 <button class="secondary mini-button" id="relayPlayThis" hidden>Play</button>
                 <button class="secondary mini-button" id="relayReplayLast">Replay</button>
               </div>
@@ -3189,6 +3198,72 @@ HTML = r"""<!doctype html>
       seek.addEventListener("change", () => { seeking = false; });
       ["play", "pause", "ended", "timeupdate", "loadedmetadata", "durationchange", "emptied", "loadstart"].forEach(name => audio.addEventListener(name, update));
       update();
+      // Mic to Voice's output sets its volume in Settings, so its player has no volume button.
+      if (!audio.hasAttribute("data-settings-volume")) addVolume(audio, bar, label);
+    }
+
+    // One volume for every player with a volume button, remembered between visits.
+    const VOLUME_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H2v6h4l5 4z" fill="currentColor" stroke="none"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg>';
+    const MUTED_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H2v6h4l5 4z" fill="currentColor" stroke="none"/><path d="m22 9-6 6M16 9l6 6"/></svg>';
+    const volumeControls = [];
+    let playerVolume = 1;
+    try {
+      const saved = Number(localStorage.getItem("voiceDashboardPlayerVolume") ?? 1);
+      if (Number.isFinite(saved)) playerVolume = Math.max(0, Math.min(1, saved));
+    } catch (_) {}
+
+    function setPlayerVolume(volume) {
+      playerVolume = volume;
+      volumeControls.forEach(control => {
+        control.audio.volume = volume;
+        control.range.value = String(Math.round(volume * 100));
+        control.value.textContent = `${Math.round(volume * 100)}%`;
+        control.button.innerHTML = volume ? VOLUME_ICON : MUTED_ICON;
+      });
+      try { localStorage.setItem("voiceDashboardPlayerVolume", String(volume)); } catch (_) {}
+    }
+
+    function addVolume(audio, bar, label) {
+      bar.classList.add("has-volume");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "player-volume";
+      button.setAttribute("aria-label", `Volume of the ${label}`);
+      button.setAttribute("aria-expanded", "false");
+      const panel = document.createElement("div");
+      panel.className = "player-volume-panel";
+      panel.hidden = true;
+      const range = document.createElement("input");
+      range.type = "range";
+      range.min = "0";
+      range.max = "100";
+      range.setAttribute("aria-label", `Volume of the ${label}`);
+      const value = document.createElement("span");
+      value.className = "player-volume-value";
+      panel.append(range, value);
+      bar.append(button, panel);
+      volumeControls.push({audio, range, value, button});
+      const open = show => {
+        panel.hidden = !show;
+        button.setAttribute("aria-expanded", show ? "true" : "false");
+      };
+      button.onclick = () => {
+        open(panel.hidden);
+        if (!panel.hidden) range.focus();
+      };
+      range.addEventListener("input", () => setPlayerVolume(Number(range.value) / 100));
+      // Esc closes the slider, not the window it is in.
+      panel.addEventListener("keydown", event => {
+        if (event.key !== "Escape") return;
+        event.preventDefault();
+        event.stopPropagation();
+        open(false);
+        button.focus();
+      });
+      document.addEventListener("pointerdown", event => {
+        if (!panel.hidden && !bar.contains(event.target)) open(false);
+      });
+      setPlayerVolume(playerVolume);
     }
     document.querySelectorAll("audio").forEach(attachPlayer);
     let relayListening = false;
