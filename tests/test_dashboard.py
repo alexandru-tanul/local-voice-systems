@@ -181,6 +181,20 @@ class DashboardTests(unittest.TestCase):
             with self.subTest(process=name):
                 self.assertIsNone(processes[name].poll())
 
+    def test_saved_models_are_used_when_they_exist(self):
+        models = {
+            "gpt": [{"path": "GPT_weights_v2Pro/joe.ckpt"}, {"path": "GPT_weights_v2Pro/other.ckpt"}],
+            "sovits": [{"path": "SoVITS_weights_v2Pro/joe.pth"}],
+        }
+        with patch.object(dashboard, "model_files", return_value=models):
+            self.assertEqual(dashboard.model_pair("GPT_weights_v2Pro/other.ckpt", "SoVITS_weights_v2Pro/joe.pth"),
+                             ("GPT_weights_v2Pro/other.ckpt", "SoVITS_weights_v2Pro/joe.pth"))
+            # No choice, or a model that was deleted, falls back to the first listed one.
+            self.assertEqual(dashboard.model_pair("", "SoVITS_weights_v2Pro/gone.pth"),
+                             ("GPT_weights_v2Pro/joe.ckpt", "SoVITS_weights_v2Pro/joe.pth"))
+        with patch.object(dashboard, "model_files", return_value={"gpt": [], "sovits": []}):
+            self.assertEqual(dashboard.model_pair("GPT_weights_v2Pro/joe.ckpt", ""), ("", ""))
+
     def test_gpu_jobs_stop_the_voice_first(self):
         running = MagicMock(**{"running.return_value": True})
         with (
@@ -205,6 +219,34 @@ class DashboardTests(unittest.TestCase):
             dashboard.SYSTEM_STATE["status"] = "stopped"
             dashboard.free_gpu_for("training")
             stop_api.assert_called_once()
+
+    def test_a_starting_gpu_job_keeps_the_voice_from_starting_itself(self):
+        dashboard.APP_CONFIG["tts_device"] = "cuda"
+        port = self.start_server()
+        start = lambda auto: json.loads(self.request(port, "POST", "/api/start-system", body=json.dumps({"auto": auto}), Host=f"127.0.0.1:{port}")[2])
+        with patch.object(dashboard, "start_system") as start_system:
+            with dashboard.gpu_reserved():
+                self.assertTrue(dashboard.gpu_busy())
+                self.assertEqual(start(True), {"ok": True, "started": False})
+                start_system.assert_not_called()
+                # Start pressed on purpose still loads the voice.
+                self.assertEqual(start(False), {"ok": True, "started": True})
+                start_system.assert_called_once()
+        self.assertFalse(dashboard.gpu_busy())
+
+    def test_a_running_job_fails_before_it_stops_the_voice(self):
+        running = MagicMock(**{"running.return_value": True})
+        dashboard.JOBS.update({"train-gpt": running, "dataset-prepare": running})
+        with (
+            patch.object(dashboard, "dataset_descriptor", return_value={"name": "Test"}),
+            patch.object(dashboard, "dataset_summary", return_value={"ready": True}),
+            patch.object(dashboard, "free_gpu_for") as free_gpu_for,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "GPT training is already running"):
+                dashboard.start_train("gpt", 1, 1, 1, "test")
+            with self.assertRaisesRegex(RuntimeError, "Dataset preparation is already running"):
+                dashboard.prepare_tts_dataset_job("test", "voice")
+        free_gpu_for.assert_not_called()
 
     def test_training_frees_the_gpu_only_when_it_can_start(self):
         missing = subprocess.CompletedProcess([], 1, "", "")

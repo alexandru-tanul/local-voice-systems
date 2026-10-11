@@ -784,15 +784,24 @@ def startup_step(run_id, phase, message):
     set_system_state("starting", phase, message)
 
 
+def model_pair(gpt_path, sovits_path):
+    """The requested models, or the first listed ones for a request that names none or a model
+    that no longer exists. The page can only send the choice it saved while its list is empty."""
+    models = model_files()
+    gpt_paths = [row["path"] for row in models["gpt"]]
+    sovits_paths = [row["path"] for row in models["sovits"]]
+    gpt = gpt_path if gpt_path in gpt_paths else (gpt_paths[0] if gpt_paths else "")
+    sovits = sovits_path if sovits_path in sovits_paths else (sovits_paths[0] if sovits_paths else "")
+    return gpt, sovits
+
+
 def _start_system_worker(gpt_path, sovits_path, run_id):
     try:
         result = run_wsl("true", timeout=30)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "WSL failed to start.").replace("\x00", "").strip()
             raise RuntimeError(detail)
-        models = model_files()
-        gpt_path = gpt_path or (models["gpt"][0]["path"] if models["gpt"] else "")
-        sovits_path = sovits_path or (models["sovits"][0]["path"] if models["sovits"] else "")
+        gpt_path, sovits_path = model_pair(gpt_path, sovits_path)
         if not gpt_path or not sovits_path:
             raise RuntimeError("No compatible GPT and SoVITS model pair was found.")
 
@@ -1293,15 +1302,37 @@ def sync_dataset_job(dataset_id):
     log(f"Syncing dataset {descriptor['name']} to WSL.")
 
 
+GPU_RESERVATIONS = 0
+
+
+@contextlib.contextmanager
+def gpu_reserved():
+    """Count a GPU job as running while its request is handled, before its process exists."""
+    global GPU_RESERVATIONS
+    with STATE_LOCK:
+        GPU_RESERVATIONS += 1
+    try:
+        yield
+    finally:
+        with STATE_LOCK:
+            GPU_RESERVATIONS -= 1
+
+
 def gpu_busy():
-    """True while a job uses the GPU that the voice engine runs on."""
+    """True while a job uses, or is about to use, the GPU that the voice engine runs on."""
     try:
         if voice_runtime()["device"] != "cuda":
             return False
     except ValueError:
         return False
     with STATE_LOCK:
-        return any(JOBS.get(key) and JOBS[key].running() for key in GPU_JOBS)
+        return GPU_RESERVATIONS > 0 or any(JOBS.get(key) and JOBS[key].running() for key in GPU_JOBS)
+
+
+def job_running(key):
+    with STATE_LOCK:
+        job = JOBS.get(key)
+        return bool(job and job.running())
 
 
 def free_gpu_for(job_name):
@@ -1324,6 +1355,8 @@ def prepare_tts_dataset_job(dataset_id, model_name):
     summary = dataset_summary(descriptor)
     if not summary["ready"]:
         raise RuntimeError("The selected dataset is incomplete. Add matching audio and transcripts first.")
+    if job_running("dataset-prepare"):
+        raise RuntimeError("Dataset preparation is already running.")
     free_gpu_for("dataset preparation")
     model_name = slugify(model_name, "voice-model")
     s2_config = write_s2_config(1, 1, 1, model_name, include_model_version=False)
@@ -1374,6 +1407,8 @@ def prepare_tts_dataset_job(dataset_id, model_name):
 
 def start_train(kind, epochs, batch_size, save_every, dataset_id="", model_name="voice-model"):
     descriptor = dataset_descriptor(dataset_id)
+    if job_running(f"train-{kind}"):
+        raise RuntimeError(f"{'GPT' if kind == 'gpt' else 'SoVITS'} training is already running.")
     model_name = slugify(model_name, "voice-model")
     feature_root = f"{WSL_GSV_ROOT}/logs/{model_name}"
     check = run_wsl(
@@ -1660,9 +1695,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = read_json(self)
             if path == "/api/start-system":
-                # The startup worker picks the newest models when none are given, after WSL is running.
+                if body.get("auto") and gpu_busy():
+                    self.send_json({"ok": True, "started": False})
+                    return
+                # The startup worker checks the models once WSL is running; see model_pair.
                 start_system(body.get("gpt") or "", body.get("sovits") or "", body.get("binding") or "ShiftLeft")
-                self.send_json({"ok": True})
+                self.send_json({"ok": True, "started": True})
                 return
             if path == "/api/stop-system":
                 stop_system()
@@ -1709,16 +1747,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
                 return
             if path == "/api/prepare-dataset":
-                prepare_tts_dataset_job(
-                    body.get("dataset_id") or "",
-                    body.get("model_name") or "voice-model",
-                )
+                with gpu_reserved():
+                    prepare_tts_dataset_job(
+                        body.get("dataset_id") or "",
+                        body.get("model_name") or "voice-model",
+                    )
                 self.send_json({"ok": True})
                 return
             if path == "/api/start-api":
-                models = model_files()
-                gpt = body.get("gpt") or (models["gpt"][0]["path"] if models["gpt"] else "")
-                sovits = body.get("sovits") or (models["sovits"][0]["path"] if models["sovits"] else "")
+                gpt, sovits = model_pair(body.get("gpt"), body.get("sovits"))
                 if not gpt or not sovits:
                     self.send_json({"ok": False, "error": "No GPT/SoVITS model pair found."}, 400)
                     return
@@ -1752,14 +1789,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(result, 200 if result.get("ok") else 500)
                 return
             if path == "/api/start-train":
-                start_train(
-                    body.get("kind"),
-                    int(body.get("epochs", 15)),
-                    int(body.get("batch_size", 1)),
-                    int(body.get("save_every", 5)),
-                    body.get("dataset_id") or "",
-                    body.get("model_name") or "voice-model",
-                )
+                with gpu_reserved():
+                    start_train(
+                        body.get("kind"),
+                        int(body.get("epochs", 15)),
+                        int(body.get("batch_size", 1)),
+                        int(body.get("save_every", 5)),
+                        body.get("dataset_id") or "",
+                        body.get("model_name") or "voice-model",
+                    )
                 self.send_json({"ok": True})
                 return
             if path == "/api/stop-job":
@@ -2128,8 +2166,8 @@ HTML = r"""<!doctype html>
     .relay-volume-row label { margin: 0; }
     #tab-generate textarea { margin: 0; }
     #targetText { min-height: 160px; }
-    #tab-generate .check-list { height: 190px; margin-top: 0; }
-    #tab-generate .selected-list { margin-top: 0; min-height: var(--control-height); }
+    #generateSettingsDialog .check-list { height: 190px; margin-top: 0; }
+    #generateSettingsDialog .selected-list { margin-top: 0; min-height: var(--control-height); }
     .cancel-generation { display: none; }
     .cancel-generation.visible { display: inline-block; }
     .global-error { display: none; max-width: 1680px; margin: 12px auto 0; border: 1px solid #7e4944; background: #2c1d1b; color: #e5b8b3; padding: 12px 16px; }
@@ -2589,7 +2627,7 @@ HTML = r"""<!doctype html>
     .panel { border: 1px solid var(--line-subtle); background: var(--panel); border-radius: 8px; padding: var(--space-4) var(--space-5); }
     .panel-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; margin-bottom: var(--space-3); }
     .panel-head h3 { margin: 0; font-size: 14px; display: flex; align-items: center; }
-    .panel h4 { margin: 0 0 var(--space-3); font-size: 13px; }
+    .panel h4, .training-project h4 { margin: 0 0 var(--space-3); font-size: 13px; }
     .step-number {
       display: inline-grid;
       place-items: center;
@@ -3290,6 +3328,13 @@ HTML = r"""<!doctype html>
     // stay off until the tab is opened again or Start is pressed.
     let autoStartPending = false;
     let systemStartBusy = false;
+    // Stop Everything raises it, so a start that is still waiting, for example for the microphone
+    // prompt, does not go on.
+    let startToken = 0;
+    let lastGpuBusy = false;
+    // A dataset created on this page, kept selected until a dataset list includes it: a list that
+    // was requested before the dataset existed can arrive after it.
+    let newTrainingDataset = null;
     let welcomeChecked = false;
     let lastSystemMessage = "";
     let datasetUploadFiles = [];
@@ -3406,10 +3451,12 @@ HTML = r"""<!doctype html>
 
     function fillTrainingDatasets(datasets) {
       const select = $("trainingDataset");
-      const old = select.value || localStorage.getItem("voiceDashboardTrainingDataset") || "";
+      const old = (newTrainingDataset && newTrainingDataset.id) || select.value || localStorage.getItem("voiceDashboardTrainingDataset") || "";
       select.innerHTML = "";
       (datasets || []).forEach(dataset => option(select, dataset.id, datasetLabel(dataset)));
-      if ((datasets || []).some(dataset => dataset.id === old)) select.value = old;
+      if (newTrainingDataset && (datasets || []).some(dataset => dataset.id === newTrainingDataset.id)) newTrainingDataset = null;
+      else if (newTrainingDataset) option(select, newTrainingDataset.id, newTrainingDataset.name);
+      if (Array.from(select.options).some(item => item.value === old)) select.value = old;
       const selected = (datasets || []).find(dataset => dataset.id === select.value);
       if (selected) {
         $("trainingDatasetStatus").textContent = `${selected.name}: ${selected.wav_count} WAV files / ${selected.list_rows} transcripts · ${selected.ready ? "ready" : "needs audio or transcripts"}`;
@@ -3513,6 +3560,8 @@ HTML = r"""<!doctype html>
       autoStartPending = name === "relay" && autoStart;
       autoStartSystem();
       renderStartButton();
+      // Before the first status arrives, the page is still loading and has nothing to show.
+      if (name === "relay" && lastSystemSnapshot) renderRelayCenter();
     }
     document.querySelectorAll(".tab-button, [data-go]").forEach(button => {
       button.onclick = () => {
@@ -3701,6 +3750,15 @@ HTML = r"""<!doctype html>
         setRelayReference(selected);
       }
       updateRelayPresetStatus();
+    }
+
+    // The Mic to Voice models. Their lists fill only once WSL runs, which can be after Mic to Voice
+    // starts, so the saved choice stands in until then.
+    function relayModels() {
+      return {
+        gpt: $("relayGptModel").value || relaySavedSettings.relayGptModel || "",
+        sovits: $("relaySovitsModel").value || relaySavedSettings.relaySovitsModel || "",
+      };
     }
 
     function relayRef() {
@@ -3990,6 +4048,10 @@ HTML = r"""<!doctype html>
         return {key: "ready", icon: "", label: "Press to start listening", hint: "Voice activation is on. Turn Hold to talk on to record by holding instead."};
       }
       let hint = statusHint();
+      // Only while the voice is starting or running; when it is off, why it is off matters more.
+      if (!hint && needsPageClick() && (systemStartBusy || ["starting", "ready", "degraded"].includes(system.status))) {
+        hint = "Click anywhere on this page once. Browsers play the voice only after that.";
+      }
       if (!hint && relayCurrentItem && item && item !== relayCurrentItem) hint = "Another line is still being generated or played.";
       if (!hint) {
         if (relayListening && !relayAudioCtx) hint = "Speech recognition is starting.";
@@ -4001,6 +4063,13 @@ HTML = r"""<!doctype html>
       }
       return {key: "ready", icon: "", label: "Hold to talk", hint};
     }
+
+    // Mic to Voice can start without a click now, but browsers refuse to play sound on a page that
+    // was never clicked.
+    function needsPageClick() {
+      return Boolean(navigator.userActivation) && !navigator.userActivation.hasBeenActive;
+    }
+    ["pointerdown", "keydown"].forEach(name => document.addEventListener(name, () => setTimeout(renderRelayCenter), {capture: true, once: true}));
 
     function renderRelayCenter() {
       const item = viewedRelayItem();
@@ -4067,7 +4136,7 @@ HTML = r"""<!doctype html>
     async function ensureRelayApiReady() {
       if (state && state.api_ready) return;
       relayStatus("starting TTS engine");
-      await post("/api/start-api", {gpt: $("relayGptModel").value, sovits: $("relaySovitsModel").value});
+      await post("/api/start-api", relayModels());
       for (let i = 0; i < 80; i++) {
         await new Promise(resolve => setTimeout(resolve, 1500));
         await refresh();
@@ -4081,8 +4150,7 @@ HTML = r"""<!doctype html>
       if (!ref) throw new Error("Pick a reference clip in Settings.");
       const aux = relayAuxRefs().map(item => item.wsl_path);
       return await post("/api/generate", {
-        gpt: $("relayGptModel").value,
-        sovits: $("relaySovitsModel").value,
+        ...relayModels(),
         ref_audio_path: ref.wsl_path,
         aux_ref_audio_paths: aux,
         prompt_text: ref.text,
@@ -4489,27 +4557,33 @@ HTML = r"""<!doctype html>
     }
 
     function autoStartSystem() {
-      if (!autoStartPending || document.body.dataset.tab !== "relay" || !lastSystemSnapshot || !hasVoice()) return;
+      if (!autoStartPending || systemStartBusy || document.body.dataset.tab !== "relay" || !lastSystemSnapshot || !hasVoice()) return;
       autoStartPending = false;
       // Training keeps the GPU. Start still loads the voice on purpose, for example to test a checkpoint.
-      if (lastSystemSnapshot.status === "stopped" && !state.gpu_busy) startSystem();
+      if (lastSystemSnapshot.status === "stopped" && !state.gpu_busy) startSystem(true);
+      // The hint said it was starting while this was undecided.
+      else renderRelayCenter();
     }
 
-    async function startSystem() {
+    async function startSystem(auto = false) {
+      const token = ++startToken;
       systemStartBusy = true;
       renderStartButton();
       renderRelayCenter();
       $("globalError").classList.remove("visible");
-      saveRelaySettings();
       armRelayWhenReady = true;
       recentActivity("Requesting microphone access...");
       try {
+        saveRelaySettings();
         await refreshRelayDevices();
-        await post("/api/start-system", {
-          gpt: $("relayGptModel").value,
-          sovits: $("relaySovitsModel").value,
-          binding: $("relayPttKey").value
-        });
+        if (token !== startToken) return;
+        const result = await post("/api/start-system", {...relayModels(), binding: $("relayPttKey").value, auto});
+        if (result.started === false) {
+          // A GPU job started meanwhile; the page learns it from the next state.
+          armRelayWhenReady = false;
+          await refresh();
+          return;
+        }
         recentActivity("System startup requested.");
         await refreshSystem();
       } catch (error) {
@@ -4605,6 +4679,10 @@ HTML = r"""<!doctype html>
       fillTrainingDatasets(state.datasets || []);
       fillDatasetSelects(state.datasets || [], state.reference_dataset || "");
       document.body.dataset.voice = hasVoice() ? "yes" : "no";
+      if (Boolean(state.gpu_busy) !== lastGpuBusy) {
+        lastGpuBusy = Boolean(state.gpu_busy);
+        renderRelayCenter();
+      }
       const gptOld = $("gptModel").value;
       const sovitsOld = $("sovitsModel").value;
       const relayGptOld = $("relayGptModel").value || relaySavedSettings.relayGptModel || "";
@@ -4700,6 +4778,7 @@ HTML = r"""<!doctype html>
 
     function startTour() {
       document.querySelectorAll("dialog[open]").forEach(dialog => dialog.close());
+      endRelayPush();
       tour = {
         steps: TOUR_STEPS.filter(step => !step.voice || hasVoice()),
         index: 0,
@@ -5041,12 +5120,13 @@ HTML = r"""<!doctype html>
       }
     });
 
-    $("startSystem").onclick = startSystem;
+    $("startSystem").onclick = () => startSystem(false);
 
     $("stopSystem").onclick = async () => {
       $("stopSystem").disabled = true;
       armRelayWhenReady = false;
       autoStartPending = false;
+      startToken += 1;
       stopRelayListening();
       try {
         await post("/api/stop-system");
@@ -5083,8 +5163,8 @@ HTML = r"""<!doctype html>
     pttEvents.addEventListener("ptt", event => {
       try {
         const ptt = JSON.parse(event.data);
-        if (ptt.held) beginRelayPush();
-        else endRelayPush();
+        if (!ptt.held) endRelayPush();
+        else if (!tour) beginRelayPush();
       } catch (error) {
         console.error(error);
       }
@@ -5184,8 +5264,10 @@ HTML = r"""<!doctype html>
           language: $("newDatasetLanguage").value
         });
         localStorage.setItem("voiceDashboardTrainingDataset", result.dataset.id);
-        // Emptied, so the next refresh selects the new dataset from the saved choice.
-        $("trainingDataset").innerHTML = "";
+        newTrainingDataset = {id: result.dataset.id, name: result.dataset.name};
+        fillTrainingDatasets(state ? state.datasets : []);
+        datasetUploadFiles = [];
+        renderDatasetUploads();
         $("newDatasetName").value = "";
         $("createDatasetDialog").close();
         recentActivity(`Dataset ${result.dataset.name} created.`);
