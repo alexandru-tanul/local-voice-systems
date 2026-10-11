@@ -28,17 +28,28 @@ CONFIG_PATH = ROOT / "config.json"
 def load_config(path):
     """Read config.json. Returns the settings and an error message for the page, or "" when there is none."""
     if not path.exists():
-        return {}, ""
+        return {}, "config.json is missing. Copy config.example.json to config.json and set the paths in it."
     try:
         config = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
-        return {}, (
-            f"config.json could not be read ({exc}), so the dashboard is using default paths. "
-            "In Windows paths, write \\\\ or / instead of \\."
-        )
+        return {}, f"config.json could not be read ({exc}). In Windows paths, write \\\\ or / instead of \\."
     if not isinstance(config, dict):
-        return {}, "config.json must contain one JSON object, so the dashboard is using default paths."
+        return {}, "config.json must contain one JSON object."
     return config, ""
+
+
+WSL_PATH_KEYS = ("wsl_gpt_sovits_root", "wsl_python", "wsl_datasets_root")
+
+
+def wsl_paths_error(config):
+    """Why the WSL paths in config.json cannot be used, or "". They have no defaults, because each
+    install has its own Linux user name in them."""
+    if any("YOUR_WSL_USER" in str(config.get(key)) for key in WSL_PATH_KEYS):
+        return "In config.json, replace YOUR_WSL_USER with your Linux user name."
+    unset = [key for key in WSL_PATH_KEYS if not str(config.get(key) or "").startswith("/")]
+    if unset:
+        return f"config.json must set {', '.join(unset)} to Linux paths that start with /, as in config.example.json."
+    return ""
 
 
 def config_port(config, key, default):
@@ -54,10 +65,13 @@ def config_port(config, key, default):
 
 
 APP_CONFIG, CONFIG_ERROR = load_config(CONFIG_PATH)
+# Every action that needs the WSL paths stops with this message while they are unusable.
+# A missing or unreadable config.json is itself the reason they are unset.
+WSL_PATHS_ERROR = CONFIG_ERROR or wsl_paths_error(APP_CONFIG)
 DASHBOARD_PORT, _port_error = config_port(APP_CONFIG, "dashboard_port", 8790)
 RELAY_ASR_PORT, _asr_port_error = config_port(APP_CONFIG, "asr_port", 8792)
 TTS_PORT, _tts_port_error = config_port(APP_CONFIG, "tts_port", 9880)
-CONFIG_ERROR = " ".join(filter(None, [CONFIG_ERROR, _port_error, _asr_port_error, _tts_port_error]))
+CONFIG_ERROR = " ".join(filter(None, [WSL_PATHS_ERROR, _port_error, _asr_port_error, _tts_port_error]))
 # For running a second copy beside the installed one, for example while testing.
 if os.environ.get("VOICE_DASHBOARD_PORT"):
     DASHBOARD_PORT = int(os.environ["VOICE_DASHBOARD_PORT"])
@@ -69,9 +83,9 @@ CACHE_DIR = Path(APP_CONFIG.get("cache_dir") or ROOT / ".cache")
 TMP_DIR = Path(APP_CONFIG.get("tmp_dir") or CACHE_DIR / "tmp")
 
 WSL_DISTRO = APP_CONFIG.get("wsl_distro") or "Ubuntu-24.04"
-WSL_GSV_ROOT = APP_CONFIG.get("wsl_gpt_sovits_root") or "/root/GPT-SoVITS"
-WSL_PYTHON = APP_CONFIG.get("wsl_python") or "/root/gsv-venv/bin/python"
-WSL_DATASETS_ROOT = APP_CONFIG.get("wsl_datasets_root") or "/root/datasets"
+WSL_GSV_ROOT = str(APP_CONFIG.get("wsl_gpt_sovits_root") or "")
+WSL_PYTHON = str(APP_CONFIG.get("wsl_python") or "")
+WSL_DATASETS_ROOT = str(APP_CONFIG.get("wsl_datasets_root") or "")
 WSL_GSV_WIN = Path(f"\\\\wsl.localhost\\{WSL_DISTRO}{WSL_GSV_ROOT.replace('/', os.sep)}")
 # 127.0.0.1, not localhost: Windows tries localhost as ::1 first, where the forwarded WSL port is
 # not listening, and each request then waited about 2 seconds before it fell back to IPv4.
@@ -153,7 +167,16 @@ def shquote(value):
     return "'" + str(value).replace("'", "'\"'\"'") + "'"
 
 
+def wsl_bash(script):
+    # --exec hands the script to bash unchanged. With "--", wsl.exe first runs the command line
+    # through the default shell, which expands the script's own variables before bash sets them.
+    return ["wsl", "-d", WSL_DISTRO, "--exec", "bash", "-lc", script]
+
+
 def wsl_command(script):
+    """Run script in WSL with the voice engine's Python first on PATH."""
+    if WSL_PATHS_ERROR:
+        raise ValueError(WSL_PATHS_ERROR)
     python_dir = WSL_PYTHON.rsplit("/", 1)[0]
     lib_dir = python_dir.rsplit("/", 1)[0] + "/lib"
     script = (
@@ -161,9 +184,7 @@ def wsl_command(script):
         f'export LD_LIBRARY_PATH={shquote(lib_dir)}"${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"; '
         + script
     )
-    # --exec hands the script to bash unchanged. With "--", wsl.exe first runs the command line
-    # through the default shell, which expands the script's own variables before bash sets them.
-    return ["wsl", "-d", WSL_DISTRO, "--exec", "bash", "-lc", script]
+    return wsl_bash(script)
 
 
 def run_wsl(script, **kwargs):
@@ -177,16 +198,20 @@ def run_wsl(script, **kwargs):
 
 def stop_in_wsl(script):
     """Run a pkill stop script in WSL. A stopped distro runs nothing to stop, and starting it
-    only for this took longer than the timeout, so it is skipped."""
+    only for this took longer than the timeout, so it is skipped. pkill needs none of the paths
+    from config.json, so this also works while they are unset."""
     if not wsl_distro_running():
         return
     try:
-        run_wsl(script, timeout=15)
+        subprocess.run(wsl_bash(script), text=True, capture_output=True, timeout=15)
     except (OSError, subprocess.SubprocessError) as exc:
         log(f"Could not run the stop command in WSL: {exc}")
 
 
 def voice_runtime():
+    # The engine's config files are written into its folder in WSL, so its paths come first.
+    if WSL_PATHS_ERROR:
+        raise ValueError(WSL_PATHS_ERROR)
     device = APP_CONFIG.get("tts_device", "cuda")
     precision = APP_CONFIG.get("tts_precision", "fp32")
     if device not in {"cuda", "cpu"} or precision not in {"fp16", "fp32"}:
@@ -954,7 +979,7 @@ def setup_status():
 
     return {
         "config": {
-            "status": "needs_configuration" if CONFIG_ERROR else ("ready" if CONFIG_PATH.exists() else "missing"),
+            "status": "missing" if not CONFIG_PATH.exists() else ("needs_configuration" if CONFIG_ERROR else "ready"),
             "detail": CONFIG_ERROR or str(CONFIG_PATH),
         },
         "dashboard_python": {
@@ -962,8 +987,8 @@ def setup_status():
             "detail": sys.executable,
         },
         "wsl_files": {
-            "status": "ready" if safe_exists(WSL_GSV_WIN) else "missing",
-            "detail": str(WSL_GSV_WIN),
+            "status": "needs_configuration" if WSL_PATHS_ERROR else ("ready" if safe_exists(WSL_GSV_WIN) else "missing"),
+            "detail": WSL_PATHS_ERROR or str(WSL_GSV_WIN),
         },
         "gpt_models": {
             "status": "ready" if models["gpt"] else "missing",

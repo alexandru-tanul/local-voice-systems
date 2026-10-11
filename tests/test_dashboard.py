@@ -26,7 +26,7 @@ class DashboardTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="voice test ")))
         for name, value in {
             "WSL_GSV_WIN": self.root, "TMP_DIR": self.root / "tmp",
-            "APP_CONFIG": {"tts_device": "cpu"}, "JOBS": {},
+            "APP_CONFIG": {"tts_device": "cpu"}, "JOBS": {}, "WSL_PATHS_ERROR": "",
         }.items():
             self.enterContext(patch.object(dashboard, name, value))
         self.enterContext(patch.dict(dashboard.SYSTEM_STATE))
@@ -120,7 +120,7 @@ class DashboardTests(unittest.TestCase):
                 job = dashboard.JOBS[key]
                 pattern = re.search(r"pkill -f '([^']+)'", job.stop_script).group(1)
                 self.assertRegex(job.command[-1], pattern)
-                self.assertNotRegex(dashboard.wsl_command(job.stop_script)[-1], pattern)
+                self.assertNotRegex(dashboard.wsl_bash(job.stop_script)[-1], pattern)
 
     def test_ports_come_from_config(self):
         self.assertEqual(dashboard.config_port({"asr_port": 9001}, "asr_port", 8792), (9001, ""))
@@ -151,7 +151,7 @@ class DashboardTests(unittest.TestCase):
         for key, script in dashboard.WSL_STOP_SCRIPTS.items():
             with self.subTest(job=key):
                 pattern = re.search(r"pkill -f '([^']+)'", script).group(1)
-                self.assertNotRegex(dashboard.wsl_command(script)[-1], pattern)
+                self.assertNotRegex(dashboard.wsl_bash(script)[-1], pattern)
 
     def test_stop_buttons_work_after_a_restart(self):
         port = self.start_server()
@@ -163,14 +163,14 @@ class DashboardTests(unittest.TestCase):
     def test_stop_skips_wsl_when_the_distro_is_stopped(self):
         with (
             patch.object(dashboard, "wsl_distro_running", return_value=False),
-            patch.object(dashboard, "run_wsl") as run_wsl,
+            patch.object(dashboard, "wsl_bash") as wsl_bash,
             patch.object(dashboard, "relay_asr_ready", return_value=False),
             patch.object(dashboard, "kill_orphan_ptt_helpers"),
             patch.object(dashboard, "API_PROCESS", None),
             patch.object(dashboard, "API_URL", "http://127.0.0.1:9"),
         ):
             dashboard.stop_system()
-        run_wsl.assert_not_called()
+        wsl_bash.assert_not_called()
         self.assertEqual(dashboard.SYSTEM_STATE["status"], "stopped")
 
     def test_stop_during_startup_cancels_it(self):
@@ -308,9 +308,32 @@ class DashboardTests(unittest.TestCase):
         path.write_text('{"asr_model_dir": "C:\\models"}', encoding="utf-8")
         config, error = dashboard.load_config(path)
         self.assertEqual(config, {})
-        self.assertIn("default paths", error)
+        self.assertIn("could not be read", error)
         path.write_text('\ufeff{"asr_model_dir": "C:/models"}', encoding="utf-8")
         self.assertEqual(dashboard.load_config(path), ({"asr_model_dir": "C:/models"}, ""))
+        self.assertIn("Copy config.example.json", dashboard.load_config(self.root / "none.json")[1])
+
+    def test_wsl_paths_have_no_defaults(self):
+        paths = {
+            "wsl_gpt_sovits_root": "/home/me/GPT-SoVITS",
+            "wsl_python": "/home/me/miniforge3/envs/gsv/bin/python",
+            "wsl_datasets_root": "/home/me/voice-datasets",
+        }
+        self.assertEqual(dashboard.wsl_paths_error(paths), "")
+        self.assertIn("wsl_python, wsl_datasets_root", dashboard.wsl_paths_error({"wsl_gpt_sovits_root": "/x"}))
+        self.assertIn("wsl_python", dashboard.wsl_paths_error({**paths, "wsl_python": "gsv/bin/python"}))
+        self.assertIn("replace YOUR_WSL_USER", dashboard.wsl_paths_error({**paths, "wsl_python": "/home/YOUR_WSL_USER/py"}))
+        # Nothing runs in WSL or writes to it without the paths, but jobs can still be stopped.
+        with (
+            patch.object(dashboard, "WSL_PATHS_ERROR", "Set the paths."),
+            patch.object(dashboard, "wsl_distro_running", return_value=True),
+            patch.object(dashboard.subprocess, "run") as run,
+        ):
+            for action in (lambda: dashboard.wsl_command("true"), dashboard.voice_runtime):
+                with self.assertRaisesRegex(ValueError, "Set the paths."):
+                    action()
+            dashboard.stop_in_wsl(dashboard.WSL_STOP_SCRIPTS["api"])
+        self.assertEqual(run.call_args[0][0][-1], dashboard.WSL_STOP_SCRIPTS["api"])
 
     def test_server_rejects_requests_from_other_sites(self):
         port = self.start_server()
