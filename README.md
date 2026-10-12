@@ -78,9 +78,11 @@ Optional keys, for when a port is taken or you want a different setting:
 | `asr_model_dir` | `cache_dir/faster-whisper` | Download folder of the speech model |
 | `cache_dir`, `tmp_dir` | `.cache`, `cache_dir/tmp` | Download caches and temporary files |
 | `dashboard_python` | `relay_env` | Python that runs the dashboard |
+| `restore_python` | `restore_env` | Python that runs Restore audio |
 
 Run `Setup-Relay-Env.bat`, then `Launch-Voice-Dashboard.bat`. Open **System Check** to check the selected device.
 Use `Stop-Voice-Dashboard.bat` to stop it. Speech recognition uses CPU and downloads its model on first use.
+For **Restore audio**, also run `Setup-Restore-Env.bat` once. It downloads about 1 GB, and a model of about 55 MB on first use.
 
 ## Use
 
@@ -105,6 +107,11 @@ python import_dataset.py --name "My Voice" --audio-dir C:\clips --transcripts C:
 
 Without `--transcripts`, each transcript comes from the file name. Add `--language` for a dataset that is not English.
 
+### Restore audio
+
+**Restore audio**, a tab on **Voice Training**, cleans up noisy or low-quality recordings before training, with [LavaSR](https://github.com/ysharma3501/LavaSR). It can remove background noise, restore missing high frequencies, or both.
+Each result is added to the list, so steps can be combined, compared, and added to a dataset. It runs on the CPU.
+
 Generated audio is saved in `outputs`. Mic to Voice keeps only its newest 200 lines, in `outputs\relay`.
 Use [VB-CABLE](https://vb-audio.com/Cable/) to send the generated voice to another app.
 
@@ -113,6 +120,7 @@ Use [VB-CABLE](https://vb-audio.com/Cable/) to send the generated voice to anoth
 - GPU error: check the Windows driver and build. To use CPU, set `tts_device` to `cpu`.
 - Noise or NaNs: use `tts_precision: "fp32"`. Out of memory: stop other GPU jobs, reduce batch size, or use CPU.
 - Upload fails: run `ffmpeg -version` in Windows. Missing WSL files: check the paths in `config.json`.
+- Restore audio says it is not installed: run `Setup-Restore-Env.bat`.
 
 ## Check
 
@@ -122,4 +130,4 @@ python -m unittest discover -s tests
 
 CI checks Windows and Linux. Training and generation were tested on Windows 10 with an AMD Radeon RX 7900 XTX, through ROCm in WSL2, and CPU synthesis in Ubuntu. NVIDIA GPUs remain untested.
 
-[GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) · [faster-whisper](https://github.com/SYSTRAN/faster-whisper) · [MIT](LICENSE)
+[GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) · [faster-whisper](https://github.com/SYSTRAN/faster-whisper) · [LavaSR](https://github.com/ysharma3501/LavaSR) (Apache-2.0) with the [UL-UNAS](https://github.com/Xiaobin-Rong/ul-unas) noise remover (MIT), downloaded by `Setup-Restore-Env.bat` · [MIT](LICENSE)

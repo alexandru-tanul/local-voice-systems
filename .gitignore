@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .venv/
 relay_env/
+restore_env/
 .cache/
 
 # Local state: logs, generated audio, personal configuration

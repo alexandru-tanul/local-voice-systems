@@ -24,6 +24,10 @@ try {
 Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | ForEach-Object {
     $owner = Get-CimInstance Win32_Process -Filter "ProcessId=$($_.OwningProcess)"
     if ($owner -and $owner.CommandLine -like '*voice_dashboard.py*') {
+        # A Restore audio run is a process of its own, which would go on without the dashboard.
+        Get-CimInstance Win32_Process -Filter "ParentProcessId=$($owner.ProcessId)" |
+            Where-Object { $_.CommandLine -like '*restore_audio.py*' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
         Stop-Process -Id $owner.ProcessId -Force
     }
 }

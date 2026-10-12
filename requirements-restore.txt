@@ -1,0 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1
+torchaudio==2.11.0
+librosa==1.0.0
+soundfile==0.14.0
+numpy==2.5.4
+scipy==1.18.1
+huggingface_hub==2.2.0
+einops==0.8.2
+encodec==0.1.1
+pyyaml==6.0.3
+vocos @ git+https://github.com/langtech-bsc/vocos.git@451e522f7a11c3652c9522f63ea6780736d93de0

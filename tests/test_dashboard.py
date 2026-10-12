@@ -1,6 +1,7 @@
 import base64
 import contextlib
 import http.client
+import importlib.util
 import io
 import json
 import os
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+import wave
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -180,6 +182,162 @@ class DashboardTests(unittest.TestCase):
         for name in ("names the file", "other dashboard", "not python"):
             with self.subTest(process=name):
                 self.assertIsNone(processes[name].poll())
+
+    @unittest.skipUnless(os.name == "nt", "Stops Windows processes")
+    def test_orphan_cleanup_stops_only_this_dashboards_restore_run(self):
+        sleeper = "import time; time.sleep(60)"
+        quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        job = lambda port: str(self.root / f"restore-{port}-20261012-120000-abcd.json")
+        processes = {
+            "worker": subprocess.Popen([sys.executable, "-c", sleeper, "restore_audio.py", job(18799)], **quiet),
+            "other dashboard": subprocess.Popen([sys.executable, "-c", sleeper, "restore_audio.py", job(18798)], **quiet),
+            "names the file": subprocess.Popen([sys.executable, "-c", sleeper, "restore_audio.py"], **quiet),
+        }
+        for proc in processes.values():
+            self.addCleanup(proc.kill)
+        with patch.object(dashboard, "DASHBOARD_PORT", 18799), patch.object(dashboard, "TMP_DIR", self.root):
+            dashboard.kill_orphan_restore_workers()
+        self.assertIsNotNone(processes["worker"].wait(timeout=10))
+        for name in ("other dashboard", "names the file"):
+            with self.subTest(process=name):
+                self.assertIsNone(processes[name].poll())
+
+    def test_restore_settings_follow_lavasr_and_explain_mistakes(self):
+        self.assertEqual(
+            dashboard.restore_settings({"denoise": True, "enhance": False, "quality": "16000", "keep_below": "6000", "model": "v1", "pieces": True}),
+            {"denoise": True, "enhance": False, "model": "v1", "quality": 16000, "keep_below": 6000.0, "pieces": True},
+        )
+        self.assertEqual(dashboard.restore_settings({"enhance": True})["quality"], "detect")
+        for settings, message in [
+            ({}, "Choose Remove background noise"),
+            ({"enhance": True, "model": "v3"}, "version 1 or 2"),
+            ({"enhance": True, "quality": "12345"}, "from the list"),
+            ({"enhance": True, "keep_below": 500}, "1 to 24 kHz"),
+        ]:
+            with self.subTest(settings=settings), self.assertRaisesRegex(ValueError, message):
+                dashboard.restore_settings(settings)
+
+    def test_restore_uploads_keep_their_rate_and_runs_reach_the_worker(self):
+        def fake_convert(source, target, sample_rate=44100):
+            self.assertIsNone(sample_rate)
+            with wave.open(str(target), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(22050)
+                wav.writeframes(b"\x00\x00" * 22050)
+
+        with (
+            patch.object(dashboard, "RESTORE_DIR", self.root / "restored"),
+            patch.object(dashboard, "OUTPUT_DIR", self.root),
+            patch.object(dashboard, "convert_audio", fake_convert),
+            patch.object(dashboard, "RESTORE_PYTHON", Path(sys.executable)),
+            patch.object(dashboard.ManagedProcess, "start"),
+        ):
+            item = dashboard.add_restore_audio("Old Call.mp3", base64.b64encode(b"audio").decode())
+            self.assertEqual((item["name"], item["sample_rate"], item["duration"]), ("Old Call", 22050, 1.0))
+            self.assertEqual([row["id"] for row in dashboard.restore_items()], [item["id"]])
+            with self.assertRaisesRegex(RuntimeError, "at least one"):
+                dashboard.start_restore(["missing"], {"enhance": True})
+            dashboard.start_restore([item["id"]], {"denoise": True, "enhance": True})
+            job = dashboard.JOBS["restore"]
+            self.assertEqual(job.command[:2], [sys.executable, str(dashboard.ROOT / "restore_audio.py")])
+            spec = json.loads(Path(job.command[2]).read_text(encoding="utf-8"))
+            self.assertEqual(spec["items"][0]["path"], str(self.root / "restored" / item["file"]))
+            self.assertTrue(spec["settings"]["denoise"] and spec["settings"]["enhance"])
+            dashboard.delete_restore_item(item["id"])
+            self.assertEqual(dashboard.restore_items(), [])
+        with patch.object(dashboard, "RESTORE_PYTHON", self.root / "missing.exe"), self.assertRaisesRegex(RuntimeError, "Setup-Restore-Env.bat"):
+            dashboard.start_restore([item["id"]], {"enhance": True})
+
+    def test_restore_results_of_one_run_never_share_a_file(self):
+        def fake_convert(source, target, sample_rate=44100):
+            with wave.open(str(target), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(16000)
+                wav.writeframes(b"\x00\x00" * (16000 if b"sound" in Path(source).read_bytes() else 0))
+
+        with (
+            patch.object(dashboard, "RESTORE_DIR", self.root / "restored"),
+            patch.object(dashboard, "OUTPUT_DIR", self.root),
+            patch.object(dashboard, "convert_audio", fake_convert),
+            patch.object(dashboard, "RESTORE_PYTHON", Path(sys.executable)),
+            patch.object(dashboard.ManagedProcess, "start"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no sound"):
+                dashboard.add_restore_audio("empty.wav", base64.b64encode(b"empty").decode())
+            self.assertEqual(list((self.root / "restored").iterdir()), [])
+            # A result keeps its recording's name, so a recording and its result share one.
+            first = dashboard.add_restore_audio("clip.wav", base64.b64encode(b"sound").decode())
+            second = dashboard.add_restore_audio("clip.wav", base64.b64encode(b"sound").decode())
+            self.assertNotEqual(first["id"], second["id"])
+            # A stopped run leaves its job file and a result it was still writing.
+            leftovers = [self.root / f"restore-{dashboard.DASHBOARD_PORT}-old.json", self.root / "restored" / "clip-old.wav.part"]
+            for path in leftovers:
+                path.write_bytes(b"")
+            with patch.object(dashboard, "TMP_DIR", self.root):
+                results = dashboard.start_restore([first["id"], second["id"]], {"enhance": True})
+            spec = json.loads(Path(dashboard.JOBS["restore"].command[2]).read_text(encoding="utf-8"))
+            self.assertEqual(results, {item["id"]: item["out_id"] for item in spec["items"]})
+            self.assertEqual(len(set(results.values())), 2)
+            self.assertFalse(any(path.exists() for path in leftovers))
+
+    @unittest.skipUnless(os.name == "nt", "Windows refuses to delete an open file")
+    def test_deleting_a_recording_waits_for_a_player_to_let_go(self):
+        restored = self.root / "restored"
+        restored.mkdir()
+        (restored / "clip.wav").write_bytes(b"RIFF")
+        (restored / "clip.json").write_text(json.dumps({"id": "clip", "name": "clip", "file": "clip.wav"}), encoding="utf-8")
+        with patch.object(dashboard, "RESTORE_DIR", restored):
+            # As the server does while it still sends the file to a player.
+            sending = (restored / "clip.wav").open("rb")
+            threading.Timer(0.5, sending.close).start()
+            dashboard.delete_restore_item("clip")
+            self.assertEqual(list(restored.iterdir()), [])
+
+    def test_a_stopped_job_reports_stopped_and_one_that_cannot_start_reports_failed(self):
+        for attempt in range(5):
+            with self.subTest(attempt=attempt):
+                proc = dashboard.ManagedProcess("Sleeper", [sys.executable, "-c", "import time; time.sleep(30)"])
+                proc.start()
+                proc.stop()
+                proc.process.wait(timeout=10)
+                for _ in range(50):
+                    if proc.status != "stopping":
+                        break
+                    time.sleep(0.05)
+                time.sleep(0.2)
+                self.assertEqual(proc.snapshot()["status"], "stopped")
+        missing = dashboard.ManagedProcess("Missing", [str(self.root / "missing.exe")])
+        with self.assertRaises(OSError):
+            missing.start()
+        self.assertEqual(missing.snapshot()["status"], "failed")
+
+    @unittest.skipUnless(all(importlib.util.find_spec(name) for name in ("librosa", "torch")), "Needs restore_env's audio libraries")
+    def test_detect_finds_where_a_recording_stops(self):
+        import librosa
+        import numpy as np
+
+        import restore_audio
+
+        rng = np.random.default_rng(0)
+        sr = 44100
+        # Noise shaped like speech: strongest at low frequencies, fading towards the top.
+        spectrum = np.fft.rfft(rng.standard_normal(sr * 3))
+        freqs = np.fft.rfftfreq(sr * 3, 1 / sr)
+        speech = np.fft.irfft(spectrum / (1 + freqs / 1000), n=sr * 3)
+        fade = np.ones_like(speech)
+        fade[:441] = fade[-441:][::-1] = np.linspace(0, 1, 441)
+        resample = lambda audio, src, dst: librosa.resample(audio, orig_sr=src, target_sr=dst, res_type="soxr_hq")
+        for rate, expected in [(8000, 4000), (16000, 8000), (32000, 16000), (None, sr / 2)]:
+            # Made at a lower rate and saved at 44.1 kHz, as an old recording; faded in and out, or
+            # cut out of a longer recording mid-sound.
+            audio = resample(resample(speech, sr, rate), rate, sr)[: len(speech)] if rate else speech
+            audio = (audio / np.abs(audio).max() * 0.5).astype(np.float32)
+            for ends, clip in [("faded", audio * fade), ("cut", audio[sr // 3 :])]:
+                with self.subTest(rate=rate, ends=ends):
+                    self.assertEqual(restore_audio.detect_band(clip, sr), expected)
+        self.assertEqual(restore_audio.detect_band(np.zeros(100, dtype=np.float32), sr), sr / 2)
 
     def test_saved_models_are_used_when_they_exist(self):
         models = {

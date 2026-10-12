@@ -253,18 +253,23 @@ class ManagedProcess:
         self.returncode = None
         self.status = "running"
         self.lines = []
-        self.process = subprocess.Popen(
-            self.command,
-            cwd=str(self.cwd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            env=self.env,
-        )
+        try:
+            self.process = subprocess.Popen(
+                self.command,
+                cwd=str(self.cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                env=self.env,
+            )
+        except OSError as exc:
+            self.status = "failed"
+            self.lines.append(f"Could not start {self.name}: {exc}")
+            raise
         self.reader = threading.Thread(target=self._read_output, daemon=True)
         self.reader.start()
         threading.Thread(target=self._wait, daemon=True).start()
@@ -289,7 +294,7 @@ class ManagedProcess:
         if not self.process:
             return
         self.returncode = self.process.wait()
-        if self.status == "stopping":
+        if self.status in ("stopping", "stopped"):
             self.status = "stopped"
             return
         self.status = "done" if self.returncode == 0 else "failed"
@@ -577,9 +582,11 @@ def write_dataset_manifest(root, manifest):
     write_text_atomic(root / "dataset.json", json.dumps(manifest, indent=2))
 
 
-def convert_audio(source, target):
+def convert_audio(source, target, sample_rate=44100):
+    """Convert to a mono 16-bit WAV, at sample_rate, or at the source's own rate when it is None."""
+    rate = ["-ar", str(sample_rate)] if sample_rate else []
     result = subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-ar", "44100", "-ac", "1", "-sample_fmt", "s16", str(target)],
+        ["ffmpeg", "-y", "-v", "error", "-i", str(source), *rate, "-ac", "1", "-sample_fmt", "s16", str(target)],
         text=True,
         capture_output=True,
         timeout=180,
@@ -594,12 +601,7 @@ def add_dataset_audio(dataset_id, filename, audio_base64, text, speaker="", lang
     transcript = clean_transcript(text)
     if not transcript:
         raise RuntimeError("Every audio file needs a transcript.")
-    try:
-        audio = base64.b64decode(audio_base64, validate=True)
-    except Exception as exc:
-        raise RuntimeError("The uploaded audio data is invalid.") from exc
-    if not audio or len(audio) > 100 * 1024 * 1024:
-        raise RuntimeError("Audio files must be between 1 byte and 100 MB.")
+    audio = decode_audio_upload(audio_base64)
     root = descriptor["root"]
     filename = str(filename or "clip.audio")
     stem = slugify(Path(filename).stem, "clip")
@@ -639,6 +641,190 @@ def add_dataset_audio(dataset_id, filename, audio_base64, text, speaker="", lang
                 pass
     log(f"Added {wav_name} to dataset {descriptor['name']}.")
     return dataset_summary(dataset_descriptor(dataset_id))
+
+
+# Restore audio. The LavaSR worker runs in restore_env, which Setup-Restore-Env.bat creates, so the
+# dashboard itself needs no audio libraries. Each recording and each result is a WAV in RESTORE_DIR
+# with a JSON file beside it, so results written by the worker appear without shared state.
+RESTORE_DIR = OUTPUT_DIR / "restored"
+RESTORE_PYTHON = Path(APP_CONFIG.get("restore_python") or ROOT / "restore_env" / "Scripts" / "python.exe")
+RESTORE_QUALITIES = {"detect", "file", 8000, 16000, 22050, 24000, 32000, 44100, 48000}
+
+
+def decode_audio_upload(audio_base64):
+    try:
+        audio = base64.b64decode(audio_base64, validate=True)
+    except Exception as exc:
+        raise RuntimeError("The uploaded audio data is invalid.") from exc
+    if not audio or len(audio) > 100 * 1024 * 1024:
+        raise RuntimeError("Audio files must be between 1 byte and 100 MB.")
+    return audio
+
+
+def restore_item_id(name):
+    # A result keeps its recording's name, and the clock can read the same twice in one run, so
+    # random digits keep the ids of one run apart.
+    return f"{slugify(name, 'audio')[:40]}-{datetime.now():%Y%m%d-%H%M%S}-{os.urandom(4).hex()}"
+
+
+def restore_items():
+    items = []
+    for sidecar in RESTORE_DIR.glob("*.json"):
+        try:
+            item = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(item, dict) or not (RESTORE_DIR / str(item.get("file", ""))).is_file():
+            continue
+        item["url"] = f"/outputs/restored/{item['file']}"
+        items.append(item)
+    return sorted(items, key=lambda item: item.get("created", 0), reverse=True)
+
+
+def add_restore_audio(filename, audio_base64):
+    """Keep an uploaded recording as a WAV at its own sample rate, which Detect needs."""
+    audio = decode_audio_upload(audio_base64)
+    filename = str(filename or "audio")
+    name = Path(filename).stem or "audio"
+    item_id = restore_item_id(name)
+    RESTORE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, source_name = tempfile.mkstemp(prefix="restore-", suffix=Path(filename).suffix.lower() or ".audio", dir=str(OUTPUT_DIR))
+    os.close(fd)
+    source = Path(source_name)
+    target = RESTORE_DIR / f"{item_id}.wav"
+    try:
+        source.write_bytes(audio)
+        convert_audio(source, target, sample_rate=None)
+        with wave.open(str(target), "rb") as wav:
+            sample_rate = wav.getframerate()
+            frames = wav.getnframes()
+        if not frames:
+            raise RuntimeError("This file has no sound in it.")
+    except BaseException:
+        # A failed conversion leaves no WAV without its JSON file behind.
+        target.unlink(missing_ok=True)
+        raise
+    finally:
+        try:
+            source.unlink()
+        except OSError:
+            pass
+    duration = round(frames / sample_rate, 2)
+    item = {
+        "id": item_id,
+        "name": name,
+        "file": target.name,
+        "sample_rate": sample_rate,
+        "duration": duration,
+        "made_from": None,
+        "steps": [],
+        "created": time.time(),
+    }
+    write_text_atomic(RESTORE_DIR / f"{item_id}.json", json.dumps(item, indent=2))
+    log(f"Added {Path(filename).name} to Restore audio.")
+    item["url"] = f"/outputs/restored/{target.name}"
+    return item
+
+
+def delete_restore_item(item_id):
+    item = next((row for row in restore_items() if row["id"] == item_id), None)
+    if not item:
+        raise RuntimeError("That recording no longer exists.")
+    for path in (RESTORE_DIR / item["file"], RESTORE_DIR / f"{item['id']}.json"):
+        for attempt in range(30):
+            try:
+                path.unlink(missing_ok=True)
+                break
+            except PermissionError:
+                # Still being sent to a player, which lets go a moment after the page clears it.
+                if attempt == 29:
+                    raise RuntimeError("The recording is still in use. Stop playing it, then delete it again.")
+                time.sleep(0.1)
+
+
+def restore_settings(settings):
+    """Checked settings for restore_audio.py; LavaSR's own options, named as on the page."""
+    settings = settings if isinstance(settings, dict) else {}
+    denoise = bool(settings.get("denoise"))
+    enhance = bool(settings.get("enhance"))
+    if not denoise and not enhance:
+        raise ValueError("Choose Remove background noise, Restore high frequencies, or both.")
+    model = settings.get("model") or "v2"
+    if model not in {"v1", "v2"}:
+        raise ValueError("The LavaSR model must be version 1 or 2.")
+    quality = settings.get("quality") or "detect"
+    if quality not in {"detect", "file"}:
+        try:
+            quality = int(quality)
+        except (TypeError, ValueError):
+            quality = None
+    if quality not in RESTORE_QUALITIES:
+        raise ValueError("Choose the original recording quality from the list.")
+    keep_below = settings.get("keep_below")
+    if keep_below in (None, ""):
+        keep_below = None
+    else:
+        try:
+            keep_below = float(keep_below)
+        except (TypeError, ValueError):
+            keep_below = 0
+        if not 1000 <= keep_below <= 24000:
+            raise ValueError("Keep the original sound up to a value from 1 to 24 kHz, or leave it empty.")
+    return {"denoise": denoise, "enhance": enhance, "model": model, "quality": quality,
+            "keep_below": keep_below, "pieces": bool(settings.get("pieces"))}
+
+
+def start_restore(item_ids, settings):
+    if not RESTORE_PYTHON.exists():
+        raise RuntimeError("Restore audio is not installed. Run Setup-Restore-Env.bat.")
+    settings = restore_settings(settings)
+    known = {row["id"]: row for row in restore_items()}
+    chosen = [known[item_id] for item_id in (item_ids or []) if item_id in known]
+    if not chosen:
+        raise RuntimeError("Choose at least one recording to restore.")
+    job = {
+        "out_dir": str(RESTORE_DIR),
+        "settings": settings,
+        "items": [
+            {"id": row["id"], "name": row["name"], "path": str(RESTORE_DIR / row["file"]),
+             "steps": row.get("steps", []), "out_id": restore_item_id(row["name"])}
+            for row in chosen
+        ],
+    }
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    # The port in the name tells this dashboard's runs from those of another one with the same TMP_DIR.
+    job_path = TMP_DIR / f"restore-{DASHBOARD_PORT}-{datetime.now():%Y%m%d-%H%M%S}-{os.urandom(4).hex()}.json"
+    env = os.environ.copy()
+    env.update({"HF_HOME": str(CACHE_DIR / "huggingface"), "PYTHONUNBUFFERED": "1", "PYTHONNOUSERSITE": "1",
+                "PYTHONIOENCODING": "utf-8", "TEMP": str(TMP_DIR), "TMP": str(TMP_DIR)})
+    proc = ManagedProcess("Restore audio", [str(RESTORE_PYTHON), str(ROOT / "restore_audio.py"), str(job_path)], cwd=ROOT, env=env)
+    with STATE_LOCK:
+        current = JOBS.get("restore")
+        if current and current.running():
+            raise RuntimeError("Restore audio is already running.")
+        # A stopped run leaves its job file, and a result it was still writing.
+        for leftover in [*TMP_DIR.glob(f"restore-{DASHBOARD_PORT}-*.json"), *RESTORE_DIR.glob("*.part")]:
+            leftover.unlink(missing_ok=True)
+        write_text_atomic(job_path, json.dumps(job, indent=2))
+        proc.start()
+        JOBS["restore"] = proc
+    log(f"Restoring {len(chosen)} recording(s) with LavaSR {settings['model']}.")
+    return {item["id"]: item["out_id"] for item in job["items"]}
+
+
+def kill_orphan_restore_workers():
+    """Stop Restore audio runs that an earlier run of this dashboard left, when it was closed or
+    crashed. Only restore_audio.py with a job file of this dashboard, by TMP_DIR and port, matches."""
+    marker = str(TMP_DIR / f"restore-{DASHBOARD_PORT}-").replace("'", "''")
+    script = (
+        "Get-CimInstance Win32_Process -Filter \"Name LIKE 'python%'\" | "
+        f"Where-Object {{ $_.CommandLine -like '*restore_audio.py*' -and $_.CommandLine.Contains('{marker}') }} | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+    )
+    try:
+        run_powershell(script, timeout=8)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"Could not stop an earlier Restore audio run: {exc}")
 
 
 class TcpInitialRtoParameters(ctypes.Structure):
@@ -691,6 +877,7 @@ def start_relay_asr():
         {
             "PYTHONNOUSERSITE": "1",
             "PYTHONUNBUFFERED": "1",
+            "PYTHONIOENCODING": "utf-8",
             "HF_HOME": str(CACHE_DIR / "huggingface"),
             "HF_HUB_CACHE": str(CACHE_DIR / "huggingface" / "hub"),
             "PIP_CACHE_DIR": str(CACHE_DIR / "pip"),
@@ -1604,6 +1791,7 @@ class Handler(BaseHTTPRequestHandler):
                 "all_references": all_references,
                 "api_ready": api_ready(),
                 "gpu_busy": gpu_busy(),
+                "restore": {"installed": RESTORE_PYTHON.exists(), "items": restore_items()},
                 "relay_asr_ready": relay_asr_ready(),
                 "jobs": {key: proc.snapshot() for key, proc in JOBS.items()},
                 "system": system_snapshot(),
@@ -1741,6 +1929,16 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("language"),
                 )
                 self.send_json({"ok": True, "dataset": result})
+                return
+            if path == "/api/restore-upload":
+                self.send_json({"ok": True, "item": add_restore_audio(body.get("filename"), body.get("audio_base64"))})
+                return
+            if path == "/api/restore-run":
+                self.send_json({"ok": True, "results": start_restore(body.get("item_ids"), body.get("settings"))})
+                return
+            if path == "/api/restore-delete":
+                delete_restore_item(str(body.get("item_id") or ""))
+                self.send_json({"ok": True})
                 return
             if path == "/api/sync-dataset":
                 sync_dataset_job(body.get("dataset_id") or "")
@@ -2208,7 +2406,7 @@ HTML = r"""<!doctype html>
     #datasetAudioFiles::file-selector-button { height: var(--control-height); margin-right: 12px; padding: 0 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-3); color: var(--text); font: inherit; font-weight: 700; cursor: pointer; }
     #datasetAudioFiles::file-selector-button:hover { background: #2a2f34; border-color: #444a51; }
     .upload-list { display: grid; gap: var(--space-2); max-height: 310px; overflow: auto; margin-top: var(--space-3); }
-    .upload-row { display: grid; grid-template-columns: minmax(150px,.7fr) minmax(260px,1.5fr); gap: var(--space-2); align-items: center; border: 1px solid var(--line-subtle); padding: var(--space-2); background: #101214; }
+    .upload-row { display: grid; grid-template-columns: minmax(150px,.7fr) minmax(260px,1.5fr) auto; gap: var(--space-2); align-items: center; border: 1px solid var(--line-subtle); padding: var(--space-2); background: #101214; }
     .upload-row .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
     .models {
       display: grid;
@@ -2681,6 +2879,14 @@ HTML = r"""<!doctype html>
     @media (min-width: 1280px) {
       section.relay-page, section.side-page { grid-template-columns: 272px minmax(0, 1fr) 272px; }
     }
+    /* Voice Training has two modes: training a dataset, and restoring recordings for one. */
+    #tab-training:not([data-mode="restore"]) .restore-only,
+    #tab-training[data-mode="restore"] .train-only { display: none !important; }
+    .mode-tabs { display: flex; gap: var(--space-2); width: 100%; max-width: 920px; margin: 0 auto var(--space-5); }
+    .mode-tabs button[aria-selected="true"] { border-color: var(--accent); box-shadow: inset 0 -2px 0 var(--accent); }
+    .restore-row { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: var(--space-2); }
+    .restore-row input[type="checkbox"] { margin-left: var(--space-2); }
+    .restore-options { display: grid; gap: var(--space-2); }
     .compose { display: grid; gap: var(--space-4); width: 100%; max-width: 760px; }
     .compose textarea { padding: 14px 16px; font-size: 16px; line-height: 1.5; }
     /* The preview player gets a wider column, so its position bar stays usable beside the volume button. */
@@ -2757,6 +2963,8 @@ HTML = r"""<!doctype html>
       section.relay-page { padding: 0; }
       .relay-volume-row { grid-template-columns: 1fr; gap: 8px; }
       .result-player { grid-template-columns: 1fr; }
+      .upload-row { grid-template-columns: minmax(0, 1fr) auto; }
+      .upload-row input { grid-column: 1 / -1; grid-row: 2; }
     }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { animation: none !important; transition: none !important; }
@@ -2881,19 +3089,29 @@ HTML = r"""<!doctype html>
       </section>
 
       <section id="tab-training" class="tab-panel side-page" role="tabpanel">
-        <aside class="history" aria-label="Datasets">
+        <aside class="history train-only" aria-label="Datasets">
           <button class="secondary history-new" id="newDatasetButton" aria-haspopup="dialog">+ New dataset</button>
           <div class="history-list" id="datasetList" role="listbox" aria-label="Datasets"></div>
           <div class="history-foot"><span class="small" id="datasetListCount">No datasets yet</span></div>
         </aside>
+        <aside class="history restore-only" aria-label="Recordings to restore">
+          <button class="secondary history-new" id="restoreAddButton">+ Add audio files</button>
+          <input id="restoreFiles" type="file" accept="audio/*,.wav,.ogg,.mp3,.flac,.m4a" multiple hidden />
+          <div class="history-list" id="restoreList" aria-label="Recordings to restore"></div>
+          <div class="history-foot"><span class="small" id="restoreCount">No audio yet</span></div>
+        </aside>
         <div class="workspace training-workspace">
           <!-- The selected dataset. The list on the left sets it. -->
           <select id="trainingDataset" hidden></select>
-          <div class="empty-note" id="noDatasets" hidden>
+          <div class="mode-tabs" role="tablist" aria-label="Voice Training">
+            <button class="secondary" role="tab" id="trainingModeTrain" data-mode="train" aria-selected="true">Train</button>
+            <button class="secondary" role="tab" id="trainingModeRestore" data-mode="restore" aria-selected="false">Restore audio</button>
+          </div>
+          <div class="empty-note train-only" id="noDatasets" hidden>
             <p>No voice yet. A voice starts as a dataset: one clean 3 to 10 second clip and its exact words.</p>
             <button id="newDatasetEmpty" aria-haspopup="dialog">Create a dataset</button>
           </div>
-          <div class="steps" id="trainingSteps">
+          <div class="steps train-only" id="trainingSteps">
             <div class="step" id="clipsStep">
               <div class="step-head"><h3><span class="step-number">1</span>Clips</h3><span class="status-line" id="trainingDatasetStatus"></span></div>
               <input id="datasetAudioFiles" type="file" accept="audio/*,.wav,.ogg,.mp3,.flac,.m4a" multiple aria-label="Audio files to add" />
@@ -2951,6 +3169,53 @@ HTML = r"""<!doctype html>
               <summary>Saved models <span class="small" id="modelCount"></span></summary>
               <div class="sub-body"><div class="models" id="modelList" style="border-top: 0; padding-top: 0; margin-top: 0;"></div></div>
             </details>
+          </div>
+          <div class="restore-only restore-panel">
+            <div class="empty-note" id="restoreMissing" hidden>
+              <p>Not installed. Run <strong>Setup-Restore-Env.bat</strong>.</p>
+            </div>
+            <div class="empty-note" id="restoreEmpty" hidden>
+              <p>Clean up noisy or low-quality recordings before training.</p>
+              <button id="restoreAddEmpty">Add audio files</button>
+            </div>
+            <div class="steps" id="restoreSteps" hidden>
+              <div class="step">
+                <div class="step-head"><h3 id="restoreTitle"></h3><span class="status-line" id="restoreInfo"></span></div>
+                <div id="restoreParentBlock" hidden><label>Before</label><audio id="restoreParent" data-label="recording before restoring"></audio></div>
+                <div><label id="restoreItemLabel">Recording</label><audio id="restoreItem" data-label="recording"></audio></div>
+                <div class="small" id="restoreHistory"></div>
+                <div class="row">
+                  <button class="secondary" id="restoreToDataset">Add to dataset</button>
+                  <button class="secondary" id="restoreDownload">Download</button>
+                  <button class="danger" id="restoreDelete">Delete</button>
+                </div>
+              </div>
+              <div class="step">
+                <div class="step-head"><h3>Restore</h3><span class="status-line" id="restoreStatus"></span></div>
+                <div class="restore-options">
+                  <label><input type="checkbox" id="restoreDenoise" /> Remove background noise</label>
+                  <div class="small">Best with Restore high frequencies on.</div>
+                  <label><input type="checkbox" id="restoreEnhance" checked /> Restore high frequencies</label>
+                </div>
+                <div class="field-row">
+                  <div><label for="restoreQuality">Original recording quality</label><select id="restoreQuality">
+                    <option value="detect">Detect from the audio</option>
+                    <option value="file">The file's own quality</option>
+                    <option value="8000">8 kHz</option>
+                    <option value="16000">16 kHz</option>
+                    <option value="22050">22.05 kHz</option>
+                    <option value="24000">24 kHz</option>
+                    <option value="32000">32 kHz</option>
+                    <option value="44100">44.1 kHz</option>
+                    <option value="48000">48 kHz</option>
+                  </select></div>
+                  <div><label for="restoreKeep">Keep the original sound up to (kHz)</label><input id="restoreKeep" type="number" min="1" max="24" step="0.5" placeholder="Automatic" /></div>
+                  <div><label for="restoreModel">LavaSR model</label><select id="restoreModel"><option value="v2">Version 2 (newer)</option><option value="v1">Version 1</option></select></div>
+                </div>
+                <label><input type="checkbox" id="restorePieces" /> Work in short pieces (for long recordings)</label>
+                <div class="row"><button id="restoreRun">Restore</button><button class="danger" data-stop="restore">Stop</button></div>
+              </div>
+            </div>
           </div>
         </div>
       </section>
@@ -3338,6 +3603,8 @@ HTML = r"""<!doctype html>
     let welcomeChecked = false;
     let lastSystemMessage = "";
     let datasetUploadFiles = [];
+    // Transcripts typed for files waiting to be added, so a redraw of the list keeps them.
+    const datasetUploadTexts = new WeakMap();
     // Relay workspace view: "capture" shows the recording control alone; "result" shows one queue item.
     let relayView = {mode: "capture", itemId: null};
     let relayTranscribing = false;
@@ -3520,10 +3787,21 @@ HTML = r"""<!doctype html>
         name.title = file.name;
         name.textContent = file.name;
         const transcript = document.createElement("input");
-        transcript.value = suggestedTranscript(file.name);
+        transcript.value = datasetUploadTexts.has(file) ? datasetUploadTexts.get(file) : suggestedTranscript(file.name);
         transcript.placeholder = "Exact spoken transcript";
         transcript.dataset.uploadTranscript = String(index);
-        row.append(name, transcript);
+        transcript.oninput = () => datasetUploadTexts.set(file, transcript.value);
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "secondary icon-button";
+        remove.title = "Remove from the list";
+        remove.setAttribute("aria-label", `Remove ${file.name}`);
+        remove.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+        remove.onclick = () => {
+          datasetUploadFiles.splice(index, 1);
+          renderDatasetUploads();
+        };
+        row.append(name, transcript, remove);
         list.appendChild(row);
       });
       const selected = state && (state.datasets || []).find(dataset => dataset.id === $("trainingDataset").value);
@@ -4734,6 +5012,7 @@ HTML = r"""<!doctype html>
       const savedModels = [...state.models.gpt, ...state.models.sovits];
       $("modelCount").textContent = savedModels.length ? `${savedModels.length} files` : (state.models_listed ? "none yet" : "listed once WSL is running");
       savedModels.forEach(row => $("modelList").appendChild(modelLine(row.path, row.size_mb)));
+      renderRestore();
       showWelcome();
       // Loaded data can move the highlighted element.
       placeTour();
@@ -4763,6 +5042,7 @@ HTML = r"""<!doctype html>
       {tab: "training", targets: ["#clipsStep", "#noDatasets"], title: "Add clips", text: "Choose one or more clean 3 to 10 second clips. Each clip needs the exact words spoken in it, which you can edit before the clips are added."},
       {tab: "training", targets: ["#prepareStep", "#noDatasets"], title: "Sync the clips", text: "Sync Only copies the clips to WSL, which is all Text to Voice and Mic to Voice need. Sync again after adding clips."},
       {tab: "training", targets: ["#trainPanel", "#noDatasets"], title: "Train the voice", text: "Training makes the voice closer to its clips, after Sync & Prepare. It takes a while, and it stops the voice first to free the GPU."},
+      {tab: "training", targets: ["#trainingModeRestore"], title: "Restore audio", text: "Clean up noisy or low-quality recordings before training. Each result is added to the list, to restore again or add to a dataset."},
       {tab: "generate", targets: ["#targetText", "#tab-generate .no-voice-note"], title: "Text to Voice", text: "Type what the voice should say.", noVoiceText: "Here you type what a voice should say. It needs a voice first, made on Voice Training."},
       {tab: "generate", voice: true, targets: [".voice-line"], title: "Choose the voice", text: "Pick the voice and a reference clip. The clip's tone shapes how the line sounds, and you can play it here."},
       {tab: "generate", voice: true, targets: [".compose-actions"], title: "Generate", text: "Generate makes the line. The voice engine starts by itself the first time, which takes a moment. The gear opens the models, the text language and finer controls."},
@@ -4821,6 +5101,7 @@ HTML = r"""<!doctype html>
     function showTourStep() {
       const step = tour.steps[tour.index];
       if (step.tab && document.body.dataset.tab !== step.tab) activateTab(step.tab, false);
+      if (step.tab === "training") setTrainingMode("train");
       const target = tourTarget(step);
       if (target) target.scrollIntoView({block: "center", inline: "nearest"});
       $("tourCount").textContent = `${tour.index + 1} of ${tour.steps.length}`;
@@ -5280,7 +5561,9 @@ HTML = r"""<!doctype html>
     };
 
     $("datasetAudioFiles").onchange = () => {
-      datasetUploadFiles = Array.from($("datasetAudioFiles").files || []);
+      // Added to the list, which can also hold recordings from Restore audio.
+      datasetUploadFiles.push(...Array.from($("datasetAudioFiles").files || []));
+      $("datasetAudioFiles").value = "";
       renderDatasetUploads();
     };
 
@@ -5411,6 +5694,253 @@ HTML = r"""<!doctype html>
       }
     };
 
+    // Restore audio: LavaSR's noise remover and high-frequency restoration, for recordings that
+    // can then be added to a dataset. Every result is a new recording in the list, so the steps can
+    // be combined: for example noise removal first, then high frequencies.
+    let restoreFocus = "";
+    const restoreChecked = new Set();
+    let restoreListSignature = "";
+    // The result to show when it appears, if the view is still on the recording it is made from.
+    let restoreAwait = null;
+    const RESTORE_SETTING_IDS = ["restoreDenoise", "restoreEnhance", "restoreQuality", "restoreKeep", "restoreModel", "restorePieces"];
+
+    function setTrainingMode(mode) {
+      $("tab-training").dataset.mode = mode;
+      document.querySelectorAll(".mode-tabs [data-mode]").forEach(button => {
+        button.setAttribute("aria-selected", button.dataset.mode === mode ? "true" : "false");
+      });
+      try { localStorage.setItem("voiceDashboardTrainingMode", mode); } catch (_) {}
+    }
+
+    function restoreItems() {
+      return (state && state.restore && state.restore.items) || [];
+    }
+
+    function restoreItem(id) {
+      return restoreItems().find(item => item.id === id) || null;
+    }
+
+    function restoreTargets() {
+      return restoreChecked.size ? [...restoreChecked] : (restoreFocus ? [restoreFocus] : []);
+    }
+
+    function describeRestore(item) {
+      return item.steps && item.steps.length ? item.steps[item.steps.length - 1] : `original, ${Number(item.sample_rate) / 1000} kHz`;
+    }
+
+    function renderRestore() {
+      const restore = (state && state.restore) || {installed: false, items: []};
+      const items = restore.items || [];
+      const job = state && state.jobs && state.jobs.restore;
+      const status = job ? job.status : "";
+      if (restoreAwait && restoreFocus !== restoreAwait.from) restoreAwait = null;
+      if (restoreAwait && items.some(item => item.id === restoreAwait.to)) {
+        restoreFocus = restoreAwait.to;
+        restoreAwait = null;
+      }
+      if (!items.some(item => item.id === restoreFocus)) restoreFocus = items.length ? items[0].id : "";
+      [...restoreChecked].forEach(id => { if (!items.some(item => item.id === id)) restoreChecked.delete(id); });
+      $("restoreMissing").hidden = Boolean(restore.installed);
+      $("restoreEmpty").hidden = !restore.installed || items.length > 0;
+      $("restoreSteps").hidden = !restore.installed || !items.length;
+      $("restoreAddButton").disabled = !restore.installed;
+      // Redrawn only when the list or the recording in view changes, so focus stays put.
+      const signature = restoreFocus + "|" + items.map(item => item.id).join(",");
+      if (signature !== restoreListSignature) {
+        restoreListSignature = signature;
+        renderRestoreList(items);
+      }
+      renderRestoreFocus();
+      const running = status === "running";
+      $("restoreRun").disabled = running || !restoreFocus;
+      if (job) {
+        const progress = (job.lines || []).filter(line => /^(Loading|Restored|Failed|Done|\d+ of \d+ file)/.test(line)).slice(-1)[0] || "Starting...";
+        const failed = `${/ failed\.$/.test(progress) ? progress : "Failed."} See Logs for details.`;
+        $("restoreStatus").textContent = running ? progress : (status === "done" ? "Done." : (status === "failed" ? failed : "Stopped."));
+        $("restoreStatus").className = status === "failed" ? "status-line bad" : (status === "done" ? "status-line good" : "status-line");
+      }
+    }
+
+    function renderRestoreList(items) {
+      const list = $("restoreList");
+      list.innerHTML = "";
+      items.forEach(item => {
+        const row = document.createElement("div");
+        row.className = "restore-row";
+        const check = document.createElement("input");
+        check.type = "checkbox";
+        check.checked = restoreChecked.has(item.id);
+        check.setAttribute("aria-label", `Select ${item.name}`);
+        check.onchange = () => {
+          if (check.checked) restoreChecked.add(item.id);
+          else restoreChecked.delete(item.id);
+          renderRestoreFocus();
+        };
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "history-item";
+        button.setAttribute("aria-current", item.id === restoreFocus ? "true" : "false");
+        button.setAttribute("aria-selected", item.id === restoreFocus ? "true" : "false");
+        const name = document.createElement("span");
+        name.className = "history-text";
+        name.textContent = item.name;
+        const meta = document.createElement("span");
+        meta.className = "history-meta";
+        const what = document.createElement("span");
+        what.textContent = describeRestore(item);
+        const time = document.createElement("span");
+        time.textContent = formatClock((item.created || 0) * 1000);
+        meta.append(what, time);
+        button.append(name, meta);
+        button.onclick = () => {
+          restoreFocus = item.id;
+          renderRestore();
+        };
+        row.append(check, button);
+        list.appendChild(row);
+      });
+    }
+
+    function renderRestoreFocus() {
+      const items = restoreItems();
+      const selected = restoreChecked.size;
+      $("restoreCount").textContent = items.length
+        ? `${items.length} recording${items.length === 1 ? "" : "s"}${selected ? `, ${selected} selected` : ""}`
+        : "No audio yet";
+      const item = restoreItem(restoreFocus);
+      if (!item) return;
+      const parent = item.made_from ? restoreItem(item.made_from) : null;
+      $("restoreTitle").textContent = item.name;
+      $("restoreInfo").textContent = `${Number(item.sample_rate) / 1000} kHz · ${item.duration} s`;
+      $("restoreParentBlock").hidden = !parent;
+      if (!parent) $("restoreParent").pause();
+      $("restoreItemLabel").textContent = item.made_from ? "After" : "Recording";
+      // Only a different recording is loaded, so a refresh does not stop playback.
+      if (parent && $("restoreParent").dataset.item !== parent.id) {
+        $("restoreParent").src = parent.url;
+        $("restoreParent").dataset.item = parent.id;
+      }
+      if ($("restoreItem").dataset.item !== item.id) {
+        $("restoreItem").src = item.url;
+        $("restoreItem").dataset.item = item.id;
+      }
+      let history = item.steps && item.steps.length ? `Made by: ${item.steps.join(", then ")}.` : "Not restored yet.";
+      if (item.made_from && !parent) history += " The recording it was made from was deleted.";
+      $("restoreHistory").textContent = history;
+      $("restoreRun").textContent = selected ? `Restore ${selected} selected` : "Restore";
+      $("restoreToDataset").textContent = selected ? `Add ${selected} to dataset` : "Add to dataset";
+      $("restoreDelete").textContent = selected ? `Delete ${selected}` : "Delete";
+    }
+
+    function restoreSettings() {
+      return {
+        denoise: $("restoreDenoise").checked,
+        enhance: $("restoreEnhance").checked,
+        quality: $("restoreQuality").value,
+        keep_below: $("restoreKeep").value ? Number($("restoreKeep").value) * 1000 : null,
+        model: $("restoreModel").value,
+        pieces: $("restorePieces").checked,
+      };
+    }
+
+    document.querySelectorAll(".mode-tabs [data-mode]").forEach(button => {
+      button.addEventListener("click", () => setTrainingMode(button.dataset.mode));
+    });
+    let savedTrainingMode = "train";
+    try { savedTrainingMode = localStorage.getItem("voiceDashboardTrainingMode") || "train"; } catch (_) {}
+    setTrainingMode(savedTrainingMode === "restore" ? "restore" : "train");
+
+    try {
+      const saved = JSON.parse(localStorage.getItem("voiceDashboardRestoreSettings") || "{}") || {};
+      RESTORE_SETTING_IDS.forEach(id => {
+        if (saved[id] === undefined) return;
+        if ($(id).type === "checkbox") $(id).checked = Boolean(saved[id]);
+        else $(id).value = saved[id];
+      });
+    } catch (_) {}
+    RESTORE_SETTING_IDS.forEach(id => $(id).addEventListener("change", () => {
+      const saved = {};
+      RESTORE_SETTING_IDS.forEach(key => { saved[key] = $(key).type === "checkbox" ? $(key).checked : $(key).value; });
+      try { localStorage.setItem("voiceDashboardRestoreSettings", JSON.stringify(saved)); } catch (_) {}
+    }));
+
+    $("restoreAddButton").onclick = () => $("restoreFiles").click();
+    $("restoreAddEmpty").onclick = () => $("restoreFiles").click();
+    $("restoreFiles").onchange = async () => {
+      const files = Array.from($("restoreFiles").files || []);
+      $("restoreFiles").value = "";
+      for (let index = 0; index < files.length; index++) {
+        $("restoreCount").textContent = `Adding ${index + 1} of ${files.length}...`;
+        try {
+          const result = await post("/api/restore-upload", {filename: files[index].name, audio_base64: await fileToBase64(files[index])});
+          restoreFocus = result.item.id;
+        } catch (error) {
+          showError(`${files[index].name}: ${error.message}`);
+        }
+      }
+      await refresh();
+    };
+    $("restoreRun").onclick = async () => {
+      $("restoreRun").disabled = true;
+      try {
+        const result = await post("/api/restore-run", {item_ids: restoreTargets(), settings: restoreSettings()});
+        const made = (result.results || {})[restoreFocus];
+        restoreAwait = made ? {from: restoreFocus, to: made} : null;
+        $("restoreStatus").className = "status-line";
+        $("restoreStatus").textContent = "Starting...";
+        refresh();
+      } catch (error) {
+        $("restoreRun").disabled = false;
+        showError(error.message);
+      }
+    };
+    $("restoreToDataset").onclick = async () => {
+      if (!state || !(state.datasets || []).length) return showError("Create a dataset first, on the Train tab.");
+      const items = restoreTargets().map(restoreItem).filter(Boolean);
+      const files = [];
+      try {
+        for (const item of items) {
+          const response = await fetch(item.url);
+          if (!response.ok) throw new Error(`${item.name} could not be loaded. It may have been deleted.`);
+          files.push(new File([await response.blob()], `${item.name}.wav`, {type: "audio/wav"}));
+        }
+      } catch (error) {
+        return showError(error.message);
+      }
+      datasetUploadFiles.push(...files);
+      renderDatasetUploads();
+      setTrainingMode("train");
+      $("clipsStep").scrollIntoView({block: "start"});
+      $("datasetUploadProgress").textContent = `${items.length} restored recording${items.length === 1 ? "" : "s"} ready. Check each transcript, then press Add Files to Dataset.`;
+    };
+    $("restoreDownload").onclick = () => {
+      const item = restoreItem(restoreFocus);
+      if (!item) return;
+      const link = document.createElement("a");
+      link.href = item.url;
+      link.download = `${item.name}${item.made_from ? "-restored" : ""}.wav`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+    };
+    $("restoreDelete").onclick = async () => {
+      const ids = restoreTargets();
+      if (!ids.length || !confirm(`Delete ${ids.length === 1 ? "this recording" : `${ids.length} recordings`}? This cannot be undone.`)) return;
+      ["restoreItem", "restoreParent"].forEach(id => {
+        $(id).pause();
+        $(id).removeAttribute("src");
+        $(id).load();
+        delete $(id).dataset.item;
+      });
+      for (const id of ids) {
+        try { await post("/api/restore-delete", {item_id: id}); }
+        catch (error) { showError(error.message); }
+      }
+      restoreChecked.clear();
+      restoreFocus = "";
+      refresh();
+    };
+
     refresh();
     refreshSystem();
     setInterval(refresh, 5000);
@@ -5423,7 +5953,13 @@ HTML = r"""<!doctype html>
 
 def main():
     port = DASHBOARD_PORT
+    # Launch-Voice-Dashboard.ps1 writes the output to a file, which Python would otherwise write
+    # in the Windows code page, failing on names in other alphabets.
+    for stream in (sys.stdout, sys.stderr):
+        if stream and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     log(f"Local Voice UI starting on http://localhost:{port}")
+    threading.Thread(target=kill_orphan_restore_workers, daemon=True).start()
     if CONFIG_ERROR:
         log(CONFIG_ERROR)
     server = DashboardServer(("127.0.0.1", port), Handler)
@@ -5432,7 +5968,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        for key in ("ptt-helper", "relay-asr"):
+        for key in ("ptt-helper", "relay-asr", "restore"):
             proc = JOBS.get(key)
             if proc and proc.process and proc.process.poll() is None:
                 proc.stop()
