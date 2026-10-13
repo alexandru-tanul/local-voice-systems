@@ -19,6 +19,16 @@ if ($env:VOICE_DASHBOARD_PORT) { $port = [int]$env:VOICE_DASHBOARD_PORT }
 try {
     Invoke-RestMethod -Method Post -ContentType 'application/json' -Body '{}' -Uri "http://127.0.0.1:$port/api/stop-system" -TimeoutSec 30 | Out-Null
 } catch { }
+# And its own jobs, among them music removal in WSL, which would go on without it. Training is left
+# running on purpose; the page can stop it after the next start.
+try {
+    $state = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/state" -TimeoutSec 30
+    foreach ($job in 'restore', 'dataset-cut', 'compare') {
+        if ($state.jobs.$job -and $state.jobs.$job.status -eq 'running') {
+            Invoke-RestMethod -Method Post -ContentType 'application/json' -Body (@{ key = $job } | ConvertTo-Json) -Uri "http://127.0.0.1:$port/api/stop-job" -TimeoutSec 30 | Out-Null
+        }
+    }
+} catch { }
 
 # Only a process that runs voice_dashboard.py is stopped, so another program on the port is left alone.
 Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | ForEach-Object {

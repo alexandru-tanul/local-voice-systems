@@ -6,6 +6,7 @@ import hashlib
 import io
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import wave
+import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -106,6 +108,7 @@ WSL_STOP_SCRIPTS = {
     "train-gpt": "pkill -f '[G]PT_SoVITS/s1_train.py' || true",
     "train-sovits": "pkill -f '[G]PT_SoVITS/s2_train.py' || true",
     "api": f"pkill -f '[a]pi_v2.py.*-p {TTS_PORT} ' || true",
+    "separate": "pkill -f '[s]eparate_audio.py' || true",
 }
 # Jobs that use the GPU, and with it the memory the voice engine also needs.
 GPU_JOBS = ("dataset-prepare", "train-sovits", "train-gpt")
@@ -246,6 +249,8 @@ class ManagedProcess:
         self.lines = []
         self.status = "idle"
         self.reader = None
+        # Called with each line of output, as TrainingProgress is.
+        self.watch = None
 
     def start(self):
         if self.process and self.process.poll() is None:
@@ -284,11 +289,14 @@ class ManagedProcess:
     def _read_output(self):
         if not self.process or not self.process.stdout:
             return
-        for line in self.process.stdout:
-            line = line.rstrip()
-            with STATE_LOCK:
-                self.lines.append(line)
-                del self.lines[:-1200]
+        with self.process.stdout:
+            for line in self.process.stdout:
+                line = line.rstrip()
+                with STATE_LOCK:
+                    self.lines.append(line)
+                    del self.lines[:-1200]
+                if self.watch:
+                    self.watch(line)
 
     def _wait(self):
         if not self.process:
@@ -328,6 +336,180 @@ class ManagedProcess:
             "status": "running" if running else self.status,
             "returncode": self.returncode,
             "lines": self.lines[-250:],
+            "progress": self.watch.state() if self.watch else None,
+        }
+
+
+class TrainingProgress:
+    """Follows a training job's output: the last epoch it finished, and the time an epoch takes.
+
+    SoVITS training logs "====> Epoch: N" after epoch N. GPT training shows Lightning's progress
+    bar, "Epoch N: 100%", counting from 0. Both continue from an earlier run's checkpoint, so the
+    first epoch seen need not be 1."""
+
+    PATTERNS = {"sovits": re.compile(r"====> Epoch: (\d+)"), "gpt": re.compile(r"\bEpoch (\d+):\s*100%")}
+
+    def __init__(self, kind, epochs):
+        self.kind = kind
+        self.epochs = int(epochs)
+        self.epoch = 0
+        self.finished = []
+
+    def __call__(self, line):
+        match = self.PATTERNS[self.kind].search(line)
+        if not match:
+            return
+        epoch = int(match.group(1)) + (1 if self.kind == "gpt" else 0)
+        # The bar shows 100% more than once while it updates its numbers.
+        if epoch != self.epoch:
+            self.epoch = epoch
+            self.finished.append(time.time())
+
+    def state(self):
+        left = None
+        if len(self.finished) >= 2:
+            per_epoch = (self.finished[-1] - self.finished[0]) / (len(self.finished) - 1)
+            left = round(per_epoch * max(0, self.epochs - self.epoch))
+        return {"epoch": self.epoch, "epochs": self.epochs, "seconds_left": left}
+
+
+class JobStopped(Exception):
+    pass
+
+
+class ThreadJob:
+    """A job that runs a function in a thread of the dashboard, shown and stopped like a
+    ManagedProcess. The function reports progress with say(), runs programs with run(), and
+    calls check_stop() between steps."""
+
+    def __init__(self, name, target):
+        self.name = name
+        self.target = target
+        self.lines = []
+        self.status = "idle"
+        self.returncode = None
+        self.stopping = False
+        self.thread = None
+        self.child = None
+        self.child_stop_script = None
+        self.uses_gpu = False
+
+    def start(self):
+        self.lines = []
+        self.returncode = None
+        self.stopping = False
+        self.status = "running"
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        return True
+
+    def _run(self):
+        try:
+            self.target(self)
+            self.returncode = 0
+            self.status = "stopped" if self.stopping else "done"
+        except JobStopped:
+            self.returncode = 1
+            self.status = "stopped"
+        except Exception as exc:
+            self.returncode = 1
+            self.status = "stopped" if self.stopping else "failed"
+            if not self.stopping:
+                self.say(f"Failed: {exc}")
+        log(f"{self.name} {self.status}.")
+
+    def say(self, line):
+        with STATE_LOCK:
+            self.lines.append(line)
+            del self.lines[:-1200]
+
+    def check_stop(self):
+        if self.stopping:
+            raise JobStopped()
+
+    def run(self, command, timeout=None):
+        """Run a program and return its finished process, with its output as text."""
+        self.check_stop()
+        with subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ) as child:
+            self.child = child
+            if self.stopping:
+                child.kill()
+            try:
+                stdout, stderr = child.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.communicate()
+                raise RuntimeError(f"{Path(command[0]).name} did not finish within {timeout} seconds.")
+            finally:
+                self.child = None
+        self.check_stop()
+        return subprocess.CompletedProcess(command, child.returncode, stdout, stderr)
+
+    def stream(self, command, env=None, stop_script=None):
+        """Run a program and show its output as it comes. A stop ends it, and a program in WSL
+        also by stop_script, as ending wsl.exe leaves the Linux process running."""
+        self.check_stop()
+        with subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ) as child:
+            self.child, self.child_stop_script = child, stop_script
+            if self.stopping:
+                child.kill()
+                if stop_script:
+                    stop_in_wsl(stop_script)
+            try:
+                for line in child.stdout:
+                    line = line.rstrip()
+                    # Progress bars redraw many times a second; their last state says nothing new.
+                    if line and not re.search(r"\d+%\||it/s\]|s/it\]|GetSegmentId", line):
+                        self.say(line)
+                child.wait()
+            finally:
+                self.child = self.child_stop_script = None
+        self.check_stop()
+        return child.returncode
+
+    def running(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    def last_lines(self, count):
+        return self.lines[-count:]
+
+    def stop(self):
+        if not self.running():
+            return
+        self.stopping = True
+        child, stop_script = self.child, getattr(self, "child_stop_script", None)
+        if child and child.poll() is None:
+            child.kill()
+        if stop_script:
+            stop_in_wsl(stop_script)
+        self.thread.join(timeout=15)
+        log(f"{self.name} stopped.")
+
+    def snapshot(self):
+        return {
+            "name": self.name,
+            "status": "running" if self.running() else self.status,
+            "returncode": self.returncode,
+            "lines": self.lines[-250:],
+            "dataset": getattr(self, "dataset_id", ""),
+            "results": getattr(self, "results", None),
         }
 
 
@@ -463,6 +645,7 @@ def dataset_descriptor(dataset_id):
         "root": root,
         "list_path": root / f"{dataset_id}.list",
         "wsl_root": f"{WSL_DATASETS_ROOT}/{dataset_id}",
+        "language": language_code(manifest.get("default_language")),
         "entries": manifest.get("entries") or [],
     }
 
@@ -596,6 +779,34 @@ def convert_audio(source, target, sample_rate=44100):
         raise RuntimeError(result.stderr.strip() or "ffmpeg could not convert this audio file.")
 
 
+def add_dataset_clip(root, converted, stem, source_name, transcript, speaker="", language=""):
+    """Move a converted WAV into a dataset under a free name, list it, and return the name."""
+    with dataset_lock(root):
+        manifest = json.loads((root / "dataset.json").read_text(encoding="utf-8"))
+        taken = {entry.get("wav") for entry in manifest.get("entries", [])}
+        wav_name = f"{stem}.wav"
+        counter = 2
+        while wav_name in taken or (root / "wavs" / wav_name).exists():
+            wav_name = f"{stem}-{counter}.wav"
+            counter += 1
+        # The clip can come from another drive, such as TMP_DIR's, which os.replace cannot cross.
+        # It is moved under another name and renamed, so wavs/ never holds half a clip.
+        part = root / "wavs" / (wav_name + ".part")
+        shutil.move(str(converted), str(part))
+        os.replace(part, root / "wavs" / wav_name)
+        manifest.setdefault("entries", []).append(
+            {
+                "wav": wav_name,
+                "source_name": source_name,
+                "text": transcript,
+                "speaker": speaker or manifest.get("default_speaker") or "speaker",
+                "language": language or manifest.get("default_language") or "en",
+            }
+        )
+        write_dataset_manifest(root, manifest)
+    return wav_name
+
+
 def add_dataset_audio(dataset_id, filename, audio_base64, text, speaker="", language="en"):
     descriptor = dataset_descriptor(dataset_id)
     transcript = clean_transcript(text)
@@ -614,25 +825,7 @@ def add_dataset_audio(dataset_id, filename, audio_base64, text, speaker="", lang
         # The slow conversion runs before the lock, and a failed one leaves nothing in wavs/.
         source.write_bytes(audio)
         convert_audio(source, converted)
-        with dataset_lock(root):
-            manifest = json.loads((root / "dataset.json").read_text(encoding="utf-8"))
-            taken = {entry.get("wav") for entry in manifest.get("entries", [])}
-            wav_name = f"{stem}.wav"
-            counter = 2
-            while wav_name in taken or (root / "wavs" / wav_name).exists():
-                wav_name = f"{stem}-{counter}.wav"
-                counter += 1
-            os.replace(converted, root / "wavs" / wav_name)
-            manifest.setdefault("entries", []).append(
-                {
-                    "wav": wav_name,
-                    "source_name": Path(filename).name,
-                    "text": transcript,
-                    "speaker": speaker or manifest.get("default_speaker") or "speaker",
-                    "language": language or manifest.get("default_language") or "en",
-                }
-            )
-            write_dataset_manifest(root, manifest)
+        wav_name = add_dataset_clip(root, converted, stem, Path(filename).name, transcript, speaker, language)
     finally:
         for path in (source, converted):
             try:
@@ -641,6 +834,422 @@ def add_dataset_audio(dataset_id, filename, audio_base64, text, speaker="", lang
                 pass
     log(f"Added {wav_name} to dataset {descriptor['name']}.")
     return dataset_summary(dataset_descriptor(dataset_id))
+
+
+# SoVITS training skips clips this short or this long (GPT_SoVITS/module/data_utils.py).
+TRAINING_MIN_SECONDS = 0.6
+TRAINING_MAX_SECONDS = 54.0
+
+
+def wav_seconds(path):
+    try:
+        with wave.open(str(path), "rb") as audio:
+            return round(audio.getnframes() / audio.getframerate(), 2)
+    except (OSError, EOFError, ZeroDivisionError, wave.Error):
+        return None
+
+
+def dataset_clips(dataset_id):
+    """The clips of a dataset, in the order they were added, with their transcripts and lengths."""
+    descriptor = dataset_descriptor(dataset_id)
+    clips = []
+    for entry in descriptor["entries"]:
+        wav = str(entry.get("wav", ""))
+        path = descriptor["root"] / "wavs" / wav
+        try:
+            # The time in the address makes a browser load a clip again after it was replaced.
+            version = int(path.stat().st_mtime)
+        except OSError:
+            version = 0
+        clips.append(
+            {
+                "wav": wav,
+                "text": entry.get("text", ""),
+                "duration": wav_seconds(path),
+                "url": f"/datasets/{descriptor['id']}/wavs/{urllib.parse.quote(wav)}?v={version}",
+            }
+        )
+    return {"clips": clips, "seconds": round(sum(clip["duration"] or 0 for clip in clips), 1)}
+
+
+def update_dataset_clip(dataset_id, wav, text):
+    descriptor = dataset_descriptor(dataset_id)
+    transcript = clean_transcript(text)
+    if not transcript:
+        raise RuntimeError("A clip needs its transcript. Delete the clip instead.")
+    root = descriptor["root"]
+    with dataset_lock(root):
+        manifest = json.loads((root / "dataset.json").read_text(encoding="utf-8"))
+        entry = next((row for row in manifest.get("entries", []) if row.get("wav") == wav), None)
+        if not entry:
+            raise RuntimeError("That clip is no longer in the dataset.")
+        entry["text"] = transcript
+        write_dataset_manifest(root, manifest)
+    return transcript
+
+
+def delete_dataset_clip(dataset_id, wav):
+    descriptor = dataset_descriptor(dataset_id)
+    root = descriptor["root"]
+    with dataset_lock(root):
+        manifest = json.loads((root / "dataset.json").read_text(encoding="utf-8"))
+        entries = manifest.get("entries", [])
+        kept = [row for row in entries if row.get("wav") != wav]
+        if len(kept) == len(entries):
+            raise RuntimeError("That clip is no longer in the dataset.")
+        manifest["entries"] = kept
+        write_dataset_manifest(root, manifest)
+    path = root / "wavs" / Path(str(wav)).name
+    for attempt in range(30):
+        try:
+            path.unlink(missing_ok=True)
+            break
+        except PermissionError:
+            # Still being sent to the page's player, which lets go a moment after it stops.
+            if attempt == 29:
+                log(f"{path.name} is out of the dataset, but its file is still in use, so it stays in wavs/.")
+            time.sleep(0.1)
+    log(f"Deleted {wav} from dataset {descriptor['name']}.")
+
+
+# Dataset transcripts come from faster-whisper in the speech recognition server, with a larger
+# model than Mic to Voice uses, since a transcript is written once and should be exact.
+DATASET_ASR_MODEL = str(APP_CONFIG.get("dataset_asr_model") or "")
+
+
+def dataset_asr_model(language):
+    return DATASET_ASR_MODEL or ("small.en" if language == "en" else "small")
+
+
+def ensure_relay_asr():
+    """Start speech recognition when it is not running, and wait until it listens."""
+    if relay_asr_ready():
+        return
+    start_relay_asr()
+    for _ in range(80):
+        if relay_asr_ready():
+            return
+        time.sleep(0.25)
+    raise RuntimeError("Speech recognition did not start. See Logs for details.")
+
+
+def transcribe_dataset_wav(wav_path, language):
+    """The words spoken in a WAV file, for a dataset in this language."""
+    model = dataset_asr_model(language)
+    # Whisper models before large-v3 have no Cantonese; they write it as Chinese.
+    whisper_language = "zh" if language == "yue" and "large-v3" not in model else language
+    payload = {
+        "audio_base64": base64.b64encode(Path(wav_path).read_bytes()).decode("ascii"),
+        "model": model,
+        "language": whisper_language,
+        "beam_size": 5,
+        "vad": False,
+    }
+    # Stop Everything, or freeing the GPU for training, stops speech recognition, perhaps in the
+    # middle of a recording being cut; it is started again, once.
+    for attempt in (1, 2):
+        ensure_relay_asr()
+        request = urllib.request.Request(
+            RELAY_ASR_URL + "/transcribe",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        # The first use downloads the model, which can take minutes.
+        try:
+            with urllib.request.urlopen(request, timeout=900) as response:
+                body = response.read()
+            break
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            break
+        except (urllib.error.URLError, ConnectionError):
+            if attempt == 2:
+                raise RuntimeError("Speech recognition stopped while it was writing a transcript.")
+            time.sleep(1)
+    try:
+        result = json.loads(body.decode("utf-8", errors="replace"))
+    except ValueError:
+        result = {}
+    if not result.get("ok"):
+        raise RuntimeError(f"Speech recognition failed: {result.get('error') or 'no answer'}")
+    if result.get("model") != model:
+        # A speech recognition server from before an update knows only the Mic to Voice model.
+        raise RuntimeError("Speech recognition is running from an older version. Press Stop Everything, then try again.")
+    return clean_transcript(result.get("text"))
+
+
+def transcribe_dataset_upload(dataset_id, filename, audio_base64):
+    descriptor = dataset_descriptor(dataset_id)
+    audio = decode_audio_upload(audio_base64)
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    fd, source_name = tempfile.mkstemp(prefix="transcribe-", suffix=Path(str(filename or "")).suffix.lower() or ".audio", dir=str(TMP_DIR))
+    os.close(fd)
+    source = Path(source_name)
+    converted = source.with_name(source.stem + "-16k.wav")
+    try:
+        source.write_bytes(audio)
+        convert_audio(source, converted, sample_rate=16000)
+        return transcribe_dataset_wav(converted, descriptor["language"])
+    finally:
+        for path in (source, converted):
+            path.unlink(missing_ok=True)
+
+
+# Long recordings are cut into clips at pauses. ffmpeg measures the loudness of every 20 ms, so
+# the dashboard needs no audio libraries; each clip is transcribed and added to the dataset. The
+# page sends recordings longer than 20 seconds here.
+CUT_STEP = 0.02
+CUT_DIR = OUTPUT_DIR / "cut"
+
+
+def frame_levels(job, wav_path):
+    """The loudness of each 20 ms of a recording, in dB; silence is -inf."""
+    result = job.run(
+        [
+            "ffmpeg", "-v", "error", "-i", str(wav_path), "-af",
+            "aresample=16000,asetnsamples=n=320:p=0,"
+            "astats=metadata=1:reset=1:measure_overall=RMS_level:measure_perchannel=none,"
+            "ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file=-",
+            "-f", "null", "-",
+        ]
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "ffmpeg could not measure the recording.")
+    levels = []
+    for line in result.stdout.splitlines():
+        if line.startswith("lavfi.astats.Overall.RMS_level="):
+            try:
+                levels.append(float(line.split("=", 1)[1]))
+            except ValueError:
+                levels.append(float("-inf"))
+    return levels
+
+
+def plan_clips(levels, step=CUT_STEP, min_seconds=3.0, max_seconds=10.0):
+    """Where to cut a recording, as (start, end) seconds, from the loudness of each step.
+
+    Speech is what is louder than the quiet parts by a third of the way to the loud parts, so the
+    level of the recording and of its background does not matter. The loud parts are measured
+    among what stands out from the quiet ones, so a recording that is mostly silence still has its
+    speech as its loud part; one where nothing stands out has no speech to cut. A clip ends at the
+    first pause of 0.3 s once it is min_seconds long, always at a pause of a second, and before it
+    would grow past max_seconds; speech that goes on longer is cut at its quietest moment. Each
+    clip keeps up to 0.2 s of the pause on both sides."""
+    # Digital silence measures -inf; it counts as -120 dB, so it is the quiet part of a recording.
+    heard = sorted(max(level, -120.0) for level in levels)
+    if not heard or heard[-1] <= -120:
+        return []
+    quiet = heard[len(heard) // 20]
+    standing_out = [level for level in heard if level > quiet + 6]
+    if not standing_out:
+        return []
+    loud = standing_out[len(standing_out) * 9 // 10]
+    threshold = quiet + (loud - quiet) / 3
+    # Runs of speech, joined across dips shorter than 0.1 s, such as the stop in "kept".
+    runs = []
+    for index, level in enumerate(levels):
+        if level <= threshold:
+            continue
+        if runs and (index - runs[-1][1]) * step < 0.1:
+            runs[-1][1] = index + 1
+        else:
+            runs.append([index, index + 1])
+    if not runs:
+        return []
+    clips = []
+    start, end = runs[0]
+    for run_start, run_end in runs[1:]:
+        pause = (run_start - end) * step
+        if pause >= 1.0 or (run_end - start) * step > max_seconds or ((end - start) * step >= min_seconds and pause >= 0.3):
+            clips.append((start, end))
+            start = run_start
+        end = run_end
+    clips.append((start, end))
+
+    def split(start, end):
+        if (end - start) * step <= max_seconds:
+            return [(start, end)]
+        margin = int(min_seconds / step)
+        middle = range(start + margin, end - margin)
+        cut = min(middle, key=lambda index: levels[index]) if len(middle) else (start + end) // 2
+        return split(start, cut) + split(cut, end)
+
+    clips = [piece for start, end in clips for piece in split(start, end)]
+    total = len(levels) * step
+    padded = []
+    for index, (start, end) in enumerate(clips):
+        before = (start - clips[index - 1][1]) * step / 2 if index else 0.2
+        after = (clips[index + 1][0] - end) * step / 2 if index + 1 < len(clips) else 0.2
+        begin = max(0.0, start * step - min(0.2, before))
+        finish = min(total, end * step + min(0.2, after))
+        # Training skips clips of 0.6 s or less; shorter sounds are clicks and breaths.
+        if finish - begin > 0.7:
+            padded.append((round(begin, 3), round(finish, 3)))
+    return padded
+
+
+def write_wav_part(source, target, start, end):
+    with wave.open(str(source), "rb") as reader:
+        rate = reader.getframerate()
+        reader.setpos(min(reader.getnframes(), int(start * rate)))
+        frames = reader.readframes(int((end - start) * rate))
+        with wave.open(str(target), "wb") as writer:
+            writer.setparams(reader.getparams())
+            writer.writeframes(frames)
+
+
+def cut_recordings(job, dataset_id):
+    """The work of the dataset-cut job: each recording in job.sources, in turn."""
+    try:
+        cut_each_recording(job, dataset_descriptor(dataset_id))
+    finally:
+        # Recordings it did not reach, because it failed or was stopped.
+        with STATE_LOCK:
+            job.accepting = False
+            left, job.sources = job.sources, []
+        for source, _ in left:
+            source.unlink(missing_ok=True)
+
+
+def cut_each_recording(job, descriptor):
+    added = skipped = 0
+    failed = []
+    while True:
+        with STATE_LOCK:
+            if not job.sources:
+                # From here on start_dataset_cut starts a new job instead of adding to this one.
+                job.accepting = False
+                break
+            source, name = job.sources.pop(0)
+        # One recording that cannot be read does not stop the ones after it.
+        try:
+            made, left_out = cut_recording(job, descriptor, source, name)
+            added += made
+            skipped += left_out
+        except JobStopped:
+            raise
+        except Exception as exc:
+            failed.append(name)
+            job.say(f"Could not cut {name}: {exc}")
+        finally:
+            source.unlink(missing_ok=True)
+            source.with_name(source.stem + "-44k.wav").unlink(missing_ok=True)
+    job.say(f"Done. {added} clip{'' if added == 1 else 's'} to check in the list below."
+            + (f" {skipped} had no words and were left out." if skipped else ""))
+    if failed:
+        raise RuntimeError(f"{len(failed)} recording{'' if len(failed) == 1 else 's'} could not be cut: {', '.join(failed)}.")
+
+
+def cut_recording(job, descriptor, source, name):
+    """Cut one recording into clips and transcribe them. The clips with words go to job.results,
+    from where the page puts them in the list of files to check before they are added.
+    Returns the clips made and those left out."""
+    job.check_stop()
+    stem = slugify(Path(name).stem, "clip")[:48]
+    converted = source.with_name(source.stem + "-44k.wav")
+    job.say(f"Converting {name}...")
+    result = job.run(["ffmpeg", "-y", "-v", "error", "-i", str(source), "-ar", "44100", "-ac", "1", "-sample_fmt", "s16", str(converted)])
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg could not read it: {result.stderr.strip()}")
+    job.say(f"Finding the pauses in {name}...")
+    clips = plan_clips(frame_levels(job, converted))
+    if not clips:
+        job.say(f"Found no speech in {name}.")
+        return 0, 0
+    job.say(f"Cut {name} into {len(clips)} clips. Writing their transcripts...")
+    added = skipped = 0
+    CUT_DIR.mkdir(parents=True, exist_ok=True)
+    for index, (start, end) in enumerate(clips, 1):
+        job.check_stop()
+        clip = f"{stem}-{index:03d}.wav"
+        part = CUT_DIR / f"{os.urandom(4).hex()}-{clip}"
+        write_wav_part(converted, part, start, end)
+        text = transcribe_dataset_wav(part, descriptor["language"])
+        if not text:
+            part.unlink(missing_ok=True)
+            skipped += 1
+            continue
+        with STATE_LOCK:
+            job.results.append({"name": clip, "url": f"/outputs/cut/{part.name}", "text": text})
+        added += 1
+        job.say(f"Transcribed {index} of {len(clips)} from {name}: {text}")
+    return added, skipped
+
+
+def start_dataset_cut(dataset_id, sources):
+    """Cut recordings, given as (temporary file, name) pairs, into clips of a dataset. A run for the
+    same dataset takes them on; the files are deleted when they are done."""
+    try:
+        descriptor = dataset_descriptor(dataset_id)
+    except Exception:
+        for source, _ in sources:
+            source.unlink(missing_ok=True)
+        raise
+    with STATE_LOCK:
+        current = JOBS.get("dataset-cut")
+        busy = bool(current and current.running() and current.accepting and not current.stopping)
+        if busy and current.dataset_id == descriptor["id"]:
+            current.sources.extend(sources)
+        elif not busy:
+            # The clips of an earlier run were taken by the page then, or are no longer wanted.
+            for old in CUT_DIR.glob("*.wav"):
+                old.unlink(missing_ok=True)
+            job = ThreadJob(f"Cut recordings for {descriptor['name']}", lambda job: cut_recordings(job, descriptor["id"]))
+            job.dataset_id = descriptor["id"]
+            job.sources = list(sources)
+            job.results = []
+            job.accepting = True
+            JOBS["dataset-cut"] = job
+            job.start()
+    if busy and current.dataset_id != descriptor["id"]:
+        for source, _ in sources:
+            source.unlink(missing_ok=True)
+        raise RuntimeError("Another dataset's recordings are being cut. Wait until that ends.")
+    if busy:
+        current.say(f"{len(sources)} more recording{'' if len(sources) == 1 else 's'} to cut.")
+    else:
+        log(f"Cutting {len(sources)} recording(s) into clips for {descriptor['name']}.")
+
+
+def read_upload(handler, limit=4 * 1024 ** 3):
+    """Save the request body, a file the page sends as it is, to a temporary file."""
+    length = int(handler.headers.get("Content-Length", "0") or "0")
+    if length <= 0 or length > limit:
+        raise RuntimeError("Files must be between 1 byte and 4 GB.")
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix="upload-", suffix=".audio", dir=str(TMP_DIR))
+    path = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            left = length
+            while left:
+                chunk = handler.rfile.read(min(left, 1024 * 1024))
+                if not chunk:
+                    raise RuntimeError("The upload stopped before the whole file arrived.")
+                handle.write(chunk)
+                left -= len(chunk)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def cut_restored(dataset_id, item_ids):
+    """Cut recordings from Restore audio into clips of a dataset."""
+    known = {row["id"]: row for row in restore_items()}
+    sources = []
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    for item_id in item_ids or []:
+        row = known.get(item_id)
+        if not row:
+            continue
+        copy = TMP_DIR / f"upload-{os.urandom(4).hex()}.wav"
+        shutil.copyfile(RESTORE_DIR / row["file"], copy)
+        sources.append((copy, f"{row['name']}.wav"))
+    if not sources:
+        raise RuntimeError("Those recordings no longer exist.")
+    start_dataset_cut(dataset_id, sources)
 
 
 # Restore audio. The LavaSR worker runs in restore_env, which Setup-Restore-Env.bat creates, so the
@@ -742,13 +1351,27 @@ def delete_restore_item(item_id):
                 time.sleep(0.1)
 
 
+# Separation models of GPT-SoVITS's tools/uvr5, run in WSL by separate_audio.py, and the words
+# a result's history uses for them.
+SEPARATION_NOTES = {
+    "best": "music removed (BS-Roformer)",
+    "main": "music and backing voices removed (HP5)",
+    "all": "music removed (HP2)",
+    "echo": "echo and reverb removed",
+}
+
+
 def restore_settings(settings):
-    """Checked settings for restore_audio.py; LavaSR's own options, named as on the page."""
+    """Checked settings for the steps; LavaSR's own options, named as on the page."""
     settings = settings if isinstance(settings, dict) else {}
+    music = settings.get("music") or ""
+    if music not in {"", "best", "main", "all"}:
+        raise ValueError("Choose a separation model from the list.")
+    echo = bool(settings.get("echo"))
     denoise = bool(settings.get("denoise"))
     enhance = bool(settings.get("enhance"))
-    if not denoise and not enhance:
-        raise ValueError("Choose Remove background noise, Restore high frequencies, or both.")
+    if not (music or echo or denoise or enhance):
+        raise ValueError("Choose at least one thing to remove or restore.")
     model = settings.get("model") or "v2"
     if model not in {"v1", "v2"}:
         raise ValueError("The LavaSR model must be version 1 or 2.")
@@ -770,46 +1393,131 @@ def restore_settings(settings):
             keep_below = 0
         if not 1000 <= keep_below <= 24000:
             raise ValueError("Keep the original sound up to a value from 1 to 24 kHz, or leave it empty.")
-    return {"denoise": denoise, "enhance": enhance, "model": model, "quality": quality,
-            "keep_below": keep_below, "pieces": bool(settings.get("pieces"))}
+    return {"music": music, "echo": echo, "denoise": denoise, "enhance": enhance, "model": model,
+            "quality": quality, "keep_below": keep_below, "pieces": bool(settings.get("pieces"))}
 
 
 def start_restore(item_ids, settings):
-    if not RESTORE_PYTHON.exists():
-        raise RuntimeError("Restore audio is not installed. Run Setup-Restore-Env.bat.")
     settings = restore_settings(settings)
+    separation = [step for step in (settings["music"], "echo" if settings["echo"] else "") if step]
+    lavasr = settings["denoise"] or settings["enhance"]
+    if lavasr and not RESTORE_PYTHON.exists():
+        raise RuntimeError("Remove background noise and Restore high frequencies need Setup-Restore-Env.bat. Run it first.")
+    if separation:
+        if WSL_PATHS_ERROR:
+            raise RuntimeError(WSL_PATHS_ERROR)
+        with STATE_LOCK:
+            starting = GPU_RESERVATIONS > 0
+        if starting or any(job_running(key) for key in GPU_JOBS):
+            raise RuntimeError("Removing music or echo needs the GPU, which training is using. Wait until it ends.")
+        if job_running("compare"):
+            raise RuntimeError("Compare epochs is using the voice engine. Remove music or echo when it ends, or stop it.")
     known = {row["id"]: row for row in restore_items()}
     chosen = [known[item_id] for item_id in (item_ids or []) if item_id in known]
     if not chosen:
         raise RuntimeError("Choose at least one recording to restore.")
-    job = {
-        "out_dir": str(RESTORE_DIR),
-        "settings": settings,
-        "items": [
-            {"id": row["id"], "name": row["name"], "path": str(RESTORE_DIR / row["file"]),
-             "steps": row.get("steps", []), "out_id": restore_item_id(row["name"])}
-            for row in chosen
-        ],
-    }
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-    # The port in the name tells this dashboard's runs from those of another one with the same TMP_DIR.
-    job_path = TMP_DIR / f"restore-{DASHBOARD_PORT}-{datetime.now():%Y%m%d-%H%M%S}-{os.urandom(4).hex()}.json"
-    env = os.environ.copy()
-    env.update({"HF_HOME": str(CACHE_DIR / "huggingface"), "PYTHONUNBUFFERED": "1", "PYTHONNOUSERSITE": "1",
-                "PYTHONIOENCODING": "utf-8", "TEMP": str(TMP_DIR), "TMP": str(TMP_DIR)})
-    proc = ManagedProcess("Restore audio", [str(RESTORE_PYTHON), str(ROOT / "restore_audio.py"), str(job_path)], cwd=ROOT, env=env)
+    items = [
+        {"id": row["id"], "name": row["name"], "path": str(RESTORE_DIR / row["file"]),
+         "steps": row.get("steps", []), "out_id": restore_item_id(row["name"])}
+        for row in chosen
+    ]
     with STATE_LOCK:
         current = JOBS.get("restore")
         if current and current.running():
             raise RuntimeError("Restore audio is already running.")
-        # A stopped run leaves its job file, and a result it was still writing.
-        for leftover in [*TMP_DIR.glob(f"restore-{DASHBOARD_PORT}-*.json"), *RESTORE_DIR.glob("*.part")]:
-            leftover.unlink(missing_ok=True)
-        write_text_atomic(job_path, json.dumps(job, indent=2))
-        proc.start()
-        JOBS["restore"] = proc
-    log(f"Restoring {len(chosen)} recording(s) with LavaSR {settings['model']}.")
-    return {item["id"]: item["out_id"] for item in job["items"]}
+        # A stopped run leaves its work folder, and a result it was still writing.
+        for leftover in [*TMP_DIR.glob(f"restore-{DASHBOARD_PORT}-*"), *RESTORE_DIR.glob("*.part")]:
+            if leftover.is_dir():
+                shutil.rmtree(leftover, ignore_errors=True)
+            else:
+                leftover.unlink(missing_ok=True)
+        job = ThreadJob("Restore audio", lambda job: run_restore(job, items, settings, separation, lavasr))
+        # Counted as a GPU job from the start, so nothing else starts on the GPU meanwhile.
+        job.uses_gpu = bool(separation)
+        JOBS["restore"] = job
+        job.start()
+    log(f"Restoring {len(chosen)} recording(s).")
+    return {item["id"]: item["out_id"] for item in items}
+
+
+def run_restore(job, items, settings, separation, lavasr):
+    """The steps of a Restore audio run, in order: music and echo in WSL, then LavaSR."""
+    # The port in the name tells this dashboard's runs from those of another one with the same TMP_DIR.
+    work = TMP_DIR / f"restore-{DASHBOARD_PORT}-{datetime.now():%Y%m%d-%H%M%S}-{os.urandom(4).hex()}"
+    work.mkdir(parents=True)
+    count = len(items)
+    try:
+        if separation:
+            items = separate_for_restore(job, items, separation, work)
+        if items and lavasr:
+            job_path = work / "lavasr.json"
+            write_text_atomic(job_path, json.dumps({"out_dir": str(RESTORE_DIR), "settings": settings, "items": items}, indent=2))
+            env = os.environ.copy()
+            env.update({"HF_HOME": str(CACHE_DIR / "huggingface"), "PYTHONUNBUFFERED": "1", "PYTHONNOUSERSITE": "1",
+                        "PYTHONIOENCODING": "utf-8", "TEMP": str(TMP_DIR), "TMP": str(TMP_DIR)})
+            job.stream([str(RESTORE_PYTHON), str(ROOT / "restore_audio.py"), str(job_path)], env=env)
+            made = sum((RESTORE_DIR / f"{item['out_id']}.json").is_file() for item in items)
+        else:
+            for item in items:
+                save_restore_result(item, Path(item["path"]))
+            made = len(items)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    job.check_stop()
+    if made < count:
+        raise RuntimeError(f"{made} of {count} file(s) restored; {count - made} failed.")
+    job.say(f"Done. {count} file(s) restored.")
+
+
+def separate_for_restore(job, items, steps, work):
+    """Remove music or echo from each recording with separate_audio.py in WSL. Returns the items
+    that worked, now pointing at their voice alone, with the step in their history."""
+    for item in items:
+        # The models need 44.1 kHz stereo.
+        item["work"] = str(work / f"{item['out_id']}-in.wav")
+        item["output"] = str(work / f"{item['out_id']}-voice.wav")
+        result = job.run(["ffmpeg", "-y", "-v", "error", "-i", item["path"], "-ar", "44100", "-ac", "2", "-sample_fmt", "s16", item["work"]])
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg could not read {item['name']}: {result.stderr.strip()}")
+    job_path = work / "separate.json"
+    runtime = voice_runtime()
+    write_text_atomic(job_path, json.dumps({"steps": steps, "device": runtime["device"], "is_half": runtime["is_half"], "items": items}, indent=2))
+    free_gpu_for("music and echo removal")
+    try:
+        script = (
+            f"cd {shquote(WSL_GSV_ROOT)} && "
+            f"{shquote(WSL_PYTHON)} -s \"$(wslpath -u {shquote(str(ROOT / 'separate_audio.py'))})\" {shquote(str(job_path))}"
+        )
+        job.stream(wsl_command(voice_environment() + script), stop_script=WSL_STOP_SCRIPTS["separate"])
+    finally:
+        job.uses_gpu = False
+    note = ", ".join(SEPARATION_NOTES[step] for step in steps)
+    done = []
+    for item in items:
+        voice = Path(item.pop("output"))
+        item.pop("work")
+        if voice.is_file():
+            done.append({**item, "path": str(voice), "steps": item["steps"] + [note]})
+    return done
+
+
+def save_restore_result(item, wav):
+    """Keep a recording made by the steps in WSL as a result in the list."""
+    target = RESTORE_DIR / f"{item['out_id']}.wav"
+    part = RESTORE_DIR / f"{item['out_id']}.wav.part"
+    shutil.copyfile(wav, part)
+    os.replace(part, target)
+    sidecar = {
+        "id": item["out_id"],
+        "name": item["name"],
+        "file": target.name,
+        "sample_rate": 44100,
+        "duration": wav_seconds(target),
+        "made_from": item["id"],
+        "steps": item["steps"],
+        "created": time.time(),
+    }
+    write_text_atomic(RESTORE_DIR / f"{item['out_id']}.json", json.dumps(sidecar, indent=2))
 
 
 def kill_orphan_restore_workers():
@@ -1513,7 +2221,25 @@ def gpu_busy():
     except ValueError:
         return False
     with STATE_LOCK:
-        return GPU_RESERVATIONS > 0 or any(JOBS.get(key) and JOBS[key].running() for key in GPU_JOBS)
+        return GPU_RESERVATIONS > 0 or any(
+            job.running() and (key in GPU_JOBS or getattr(job, "uses_gpu", False)) for key, job in JOBS.items()
+        )
+
+
+def separation_running():
+    """True while Restore audio removes music or echo, on the GPU in WSL."""
+    with STATE_LOCK:
+        job = JOBS.get("restore")
+    return bool(job and job.running() and getattr(job, "uses_gpu", False))
+
+
+def refuse_gpu_conflicts(starting):
+    """Training, preparation, music removal and Compare epochs each need the GPU or the voice
+    engine for a long time, and together they can run out of memory or stop each other."""
+    if separation_running():
+        raise RuntimeError(f"Removing music or echo is using the GPU. Start {starting} when it ends.")
+    if job_running("compare"):
+        raise RuntimeError(f"Compare epochs is using the voice engine. Start {starting} when it ends, or stop it.")
 
 
 def job_running(key):
@@ -1544,6 +2270,7 @@ def prepare_tts_dataset_job(dataset_id, model_name):
         raise RuntimeError("The selected dataset is incomplete. Add matching audio and transcripts first.")
     if job_running("dataset-prepare"):
         raise RuntimeError("Dataset preparation is already running.")
+    refuse_gpu_conflicts("preparation")
     free_gpu_for("dataset preparation")
     model_name = slugify(model_name, "voice-model")
     s2_config = write_s2_config(1, 1, 1, model_name, include_model_version=False)
@@ -1596,6 +2323,7 @@ def start_train(kind, epochs, batch_size, save_every, dataset_id="", model_name=
     descriptor = dataset_descriptor(dataset_id)
     if job_running(f"train-{kind}"):
         raise RuntimeError(f"{'GPT' if kind == 'gpt' else 'SoVITS'} training is already running.")
+    refuse_gpu_conflicts("training")
     model_name = slugify(model_name, "voice-model")
     feature_root = f"{WSL_GSV_ROOT}/logs/{model_name}"
     check = run_wsl(
@@ -1625,6 +2353,7 @@ def start_train(kind, epochs, batch_size, save_every, dataset_id="", model_name=
         raise ValueError("Unknown training kind.")
     key = f"train-{kind}"
     proc = ManagedProcess(name, wsl_command(script), stop_script=WSL_STOP_SCRIPTS[key])
+    proc.watch = TrainingProgress(kind, epochs)
     with STATE_LOCK:
         current = JOBS.get(key)
         if current and current.process and current.process.poll() is None:
@@ -1632,6 +2361,265 @@ def start_train(kind, epochs, batch_size, save_every, dataset_id="", model_name=
         JOBS[key] = proc
     proc.start()
     log(f"{name} started from {descriptor['name']}: epochs={epochs}, batch={batch_size}, save_every={save_every}.")
+
+
+# A voice file holds voice.json, both models in models/, and the reference clips. Its clips become a
+# small dataset on import, as the references of every voice are dataset clips.
+VOICE_FILE_FORMAT = 1
+VOICE_EXPORT = re.compile(r"^voice-export-[0-9a-f]{8}\.zip$")
+
+
+def wake_wsl():
+    """Start the distro before its files are read through \\wsl.localhost."""
+    if run_wsl(":", timeout=90).returncode != 0:
+        raise RuntimeError("WSL did not start. Run System Check.")
+
+
+def export_voice(gpt, sovits, dataset_id, reference_id, prompt_text, extra_ids):
+    """Pack a voice into a zip file in TMP_DIR. Returns the file and a name to save it as."""
+    wake_wsl()
+    models = model_files()
+    if gpt not in {row["path"] for row in models["gpt"]} or sovits not in {row["path"] for row in models["sovits"]}:
+        raise RuntimeError("Choose a GPT and a SoVITS model first.")
+    descriptor = dataset_descriptor(dataset_id)
+    references = {ref["id"]: ref for ref in parse_references(descriptor["id"], valid_only=False)}
+    reference = references.get(reference_id)
+    if not reference or not reference["valid_reference"]:
+        raise RuntimeError("Choose a reference clip of 3 to 10 seconds first.")
+    extras = [references[ref_id] for ref_id in extra_ids or [] if ref_id in references and ref_id != reference_id
+              and references[ref_id]["valid_aux_reference"]]
+    manifest = {
+        "format": VOICE_FILE_FORMAT,
+        "name": descriptor["name"],
+        "language": descriptor["language"],
+        "version": "v2Pro",
+        "gpt": Path(gpt).name,
+        "sovits": Path(sovits).name,
+        "reference": {"file": "reference.wav", "text": clean_transcript(prompt_text) or reference["text"], "language": reference["lang"]},
+        "extra_references": [{"file": f"extra-{index}.wav", "text": ref["text"], "language": ref["lang"]} for index, ref in enumerate(extras, 1)],
+    }
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    path = TMP_DIR / f"voice-export-{os.urandom(4).hex()}.zip"
+    try:
+        # The models are already compressed, so the zip only stores them.
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as bundle:
+            bundle.writestr("voice.json", json.dumps(manifest, indent=2))
+            bundle.write(WSL_GSV_WIN / gpt, f"models/{Path(gpt).name}")
+            bundle.write(WSL_GSV_WIN / sovits, f"models/{Path(sovits).name}")
+            for ref, entry in [(reference, manifest["reference"]), *zip(extras, manifest["extra_references"])]:
+                bundle.write(descriptor["root"] / "wavs" / f"{ref['id']}.wav", entry["file"])
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    log(f"Exported the voice {descriptor['name']}.")
+    return path, f"{slugify(descriptor['name'], 'voice')}.voice.zip"
+
+
+def install_weight(bundle, member, folder):
+    """Copy a model from a voice file into GPT-SoVITS, under a name no other model has."""
+    name = Path(member).name
+    target_dir = WSL_GSV_WIN / folder
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stem, suffix = Path(name).stem, Path(name).suffix
+    candidate, counter = name, 2
+    while (target_dir / candidate).exists():
+        # The same model imported again is used as it is. Models of one kind all have the same
+        # size, so only equal contents count.
+        existing = target_dir / candidate
+        if existing.stat().st_size == bundle.getinfo(member).file_size:
+            with bundle.open(member) as packed, existing.open("rb") as installed:
+                if hashlib.file_digest(packed, "sha256").digest() == hashlib.file_digest(installed, "sha256").digest():
+                    return f"{folder}/{candidate}"
+        candidate = f"{stem}-{counter}{suffix}"
+        counter += 1
+    part = target_dir / (candidate + ".part")
+    with bundle.open(member) as source, open(part, "wb") as copy:
+        shutil.copyfileobj(source, copy, 1024 * 1024)
+    os.replace(part, target_dir / candidate)
+    return f"{folder}/{candidate}"
+
+
+def import_voice(path):
+    try:
+        bundle = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError("This is not a voice file.") from exc
+    with bundle:
+        try:
+            manifest = json.loads(bundle.read("voice.json").decode("utf-8"))
+        except (KeyError, ValueError) as exc:
+            raise RuntimeError("This is not a voice file from Local Voice Systems.") from exc
+        if manifest.get("format") != VOICE_FILE_FORMAT:
+            raise RuntimeError("This voice file is from a newer version of Local Voice Systems. Update the dashboard.")
+        if manifest.get("version") != "v2Pro":
+            raise RuntimeError(f"This voice is for GPT-SoVITS {manifest.get('version')}, and the dashboard uses v2Pro.")
+        gpt = f"models/{Path(str(manifest.get('gpt'))).name}"
+        sovits = f"models/{Path(str(manifest.get('sovits'))).name}"
+        references = [manifest.get("reference") or {}, *(manifest.get("extra_references") or [])][:10]
+        names = set(bundle.namelist())
+        if not gpt.endswith(".ckpt") or not sovits.endswith(".pth") or gpt not in names or sovits not in names:
+            raise RuntimeError("The voice file is missing its models.")
+        wake_wsl()
+        if any(Path(str(ref.get("file"))).name not in names or not clean_transcript(ref.get("text")) for ref in references):
+            raise RuntimeError("The voice file is missing a reference clip or its text.")
+        if (any(bundle.getinfo(Path(str(ref["file"])).name).file_size > 100 * 1024 ** 2 for ref in references)
+                or max(bundle.getinfo(gpt).file_size, bundle.getinfo(sovits).file_size) > 4 * 1024 ** 3):
+            raise RuntimeError("The voice file holds files far larger than a voice needs.")
+        gpt_path = install_weight(bundle, gpt, "GPT_weights_v2Pro")
+        sovits_path = install_weight(bundle, sovits, "SoVITS_weights_v2Pro")
+        name = str(manifest.get("name") or "Imported voice").strip()[:60] or "Imported voice"
+        base, counter = name, 2
+        while (DATASETS_DIR / dataset_id_for_name(name)).exists():
+            name = f"{base} {counter}"
+            counter += 1
+        dataset_id = create_dataset(name, language=language_code(manifest.get("language")))["id"]
+        root = DATASETS_DIR / dataset_id
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            for index, ref in enumerate(references):
+                member = Path(str(ref["file"])).name
+                source = TMP_DIR / f"import-{os.urandom(4).hex()}.wav"
+                converted = source.with_name(source.stem + "-44k.wav")
+                try:
+                    source.write_bytes(bundle.read(member))
+                    convert_audio(source, converted)
+                    add_dataset_clip(root, converted, "reference" if index == 0 else f"extra-{index}", member,
+                                     clean_transcript(ref["text"]), language=language_code(ref.get("language")))
+                finally:
+                    source.unlink(missing_ok=True)
+                    converted.unlink(missing_ok=True)
+        except BaseException:
+            # No half-made voice stays behind, and a second try gets the same name.
+            shutil.rmtree(root, ignore_errors=True)
+            raise
+    # The voice engine reads the clips in WSL.
+    result = run_wsl(dataset_sync_script(dataset_descriptor(dataset_id)), timeout=180)
+    if result.returncode != 0:
+        log(f"The imported voice's clips could not be synced: {result.stdout} {result.stderr}")
+        raise RuntimeError("The voice was imported, but its clips could not be copied to WSL. Press Sync Only on Voice Training.")
+    model_files()
+    log(f"Imported the voice {name}.")
+    return {"dataset": dataset_id, "name": name, "gpt": gpt_path, "sovits": sovits_path, "reference": "reference"}
+
+
+COMPARE_DIR = OUTPUT_DIR / "compare"
+
+
+def model_epochs(model_name, kind):
+    """The saved checkpoints of a trained model, as (epoch, path) pairs. GPT training saves
+    name-eN.ckpt and SoVITS training name_eN_sSTEPS.pth."""
+    name = re.escape(slugify(model_name, "voice-model"))
+    pattern = re.compile(rf"^{name}-e(\d+)\.ckpt$" if kind == "gpt" else rf"^{name}_e(\d+)_s\d+\.pth$")
+    rows = [(int(match.group(1)), row["path"]) for row in model_files()[kind] if (match := pattern.match(row["name"]))]
+    return sorted(rows)
+
+
+def start_compare(model_name, kind, dataset_id, reference_wav, text):
+    """Generate one line with each saved epoch of a model, the other model at its last epoch."""
+    if kind not in {"gpt", "sovits"}:
+        raise RuntimeError("Choose GPT or SoVITS epochs to compare.")
+    text = " ".join(str(text or "").split())
+    if not text:
+        raise RuntimeError("Type a test line first.")
+    if any(job_running(key) for key in GPU_JOBS):
+        raise RuntimeError("Training is using the GPU. Compare epochs when it ends.")
+    if separation_running():
+        raise RuntimeError("Removing music or echo is using the GPU. Compare epochs when it ends.")
+    descriptor = dataset_descriptor(dataset_id)
+    wake_wsl()
+    reference = next((ref for ref in parse_references(descriptor["id"]) if f"{ref['id']}.wav" == reference_wav), None)
+    if not reference:
+        raise RuntimeError("Choose a reference clip of 3 to 10 seconds.")
+    epochs = model_epochs(model_name, kind)
+    if not epochs:
+        raise RuntimeError(f"{slugify(model_name, 'voice-model')} has no saved {'GPT' if kind == 'gpt' else 'SoVITS'} epochs yet.")
+    other_kind = "sovits" if kind == "gpt" else "gpt"
+    others = model_epochs(model_name, other_kind)
+    # Without saved epochs of the other model, the pretrained one GPT-SoVITS starts from.
+    other = others[-1][1] if others else next((row["path"] for row in model_files()[other_kind] if "pretrained" in row["path"]), "")
+    if not other:
+        raise RuntimeError("The pretrained models of GPT-SoVITS are missing. Run System Check.")
+    settings = {"name": slugify(model_name, "voice-model"), "kind": kind, "epochs": epochs, "other": other,
+                "reference": reference, "text": text, "language": descriptor["language"], "dataset": descriptor}
+    with STATE_LOCK:
+        current = JOBS.get("compare")
+        if current and current.running():
+            raise RuntimeError("A comparison is already running.")
+        job = ThreadJob(f"Compare {settings['name']} epochs", lambda job: compare_epochs(job, settings))
+        job.results = []
+        JOBS["compare"] = job
+        job.start()
+    log(f"Comparing {len(epochs)} {kind} epochs of {settings['name']}.")
+
+
+def compare_epochs(job, settings):
+    # The voice engine reads the reference clip in WSL, where a clip added since the last sync is not yet.
+    job.say("Syncing the dataset to WSL...")
+    result = job.run(wsl_command(dataset_sync_script(settings["dataset"])), timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"The dataset could not be synced: {(result.stderr or result.stdout).strip()[-300:]}")
+    if not api_ready():
+        job.say("Starting the voice engine...")
+        first = settings["epochs"][0][1]
+        start_api(first if settings["kind"] == "gpt" else settings["other"], first if settings["kind"] == "sovits" else settings["other"])
+        for _ in range(720):
+            job.check_stop()
+            if api_ready():
+                break
+            if API_PROCESS and not API_PROCESS.running():
+                raise RuntimeError("The voice engine stopped while starting. See Logs for details.")
+            time.sleep(0.25)
+        else:
+            raise RuntimeError("The voice engine did not start within 3 minutes.")
+    COMPARE_DIR.mkdir(parents=True, exist_ok=True)
+    reference = settings["reference"]
+    for index, (epoch, path) in enumerate(settings["epochs"], 1):
+        job.check_stop()
+        gpt, sovits = (path, settings["other"]) if settings["kind"] == "gpt" else (settings["other"], path)
+        payload = {
+            "text": settings["text"], "text_lang": settings["language"],
+            "ref_audio_path": reference["wsl_path"], "prompt_text": reference["text"], "prompt_lang": reference["lang"],
+            "top_k": 15, "top_p": 0.6, "temperature": 0.6, "text_split_method": "cut5", "batch_size": 1,
+            "speed_factor": 1.0, "fragment_interval": 0.3, "media_type": "wav", "parallel_infer": True,
+            "repetition_penalty": 1.35, "streaming_mode": 0,
+            # One seed for every epoch, so the epoch is what differs.
+            "seed": 1234,
+        }
+        request = urllib.request.Request(API_URL + "/tts", data=json.dumps(payload).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"}, method="POST")
+        with GENERATION_LOCK:
+            set_api_weights(gpt, sovits)
+            try:
+                with urllib.request.urlopen(request, timeout=240) as response:
+                    data = response.read()
+            except urllib.error.HTTPError as exc:
+                raise RuntimeError(f"Epoch {epoch}: {exc.read().decode('utf-8', errors='replace')[:300]}") from exc
+        if not data.startswith(b"RIFF"):
+            raise RuntimeError(f"Epoch {epoch}: {data.decode('utf-8', errors='replace')[:300]}")
+        output = COMPARE_DIR / f"{settings['name']}-{settings['kind']}-e{epoch}.wav"
+        output.write_bytes(data)
+        job.results.append({"epoch": epoch, "kind": settings["kind"], "gpt": gpt, "sovits": sovits,
+                            "url": f"/outputs/compare/{output.name}?v={int(time.time())}"})
+        job.say(f"Generated epoch {epoch}, {index} of {len(settings['epochs'])}.")
+    job.say("Done. Listen to each epoch and use the best.")
+
+
+def jobs_now():
+    with STATE_LOCK:
+        return list(JOBS.items())
+
+
+def clean_old_temp_files(max_age=3600):
+    """Remove the files a crash or a closed dashboard left in TMP_DIR: uploads, cut clips and
+    voice files. Only older ones go, as another dashboard may share TMP_DIR."""
+    patterns = ("upload-*", "cut-*", "transcribe-*", "import-*", "voice-export-*.zip")
+    for pattern in patterns:
+        for path in TMP_DIR.glob(pattern):
+            try:
+                if path.is_file() and time.time() - path.stat().st_mtime > max_age:
+                    path.unlink()
+            except OSError:
+                pass
 
 
 def read_json(handler):
@@ -1793,11 +2781,37 @@ class Handler(BaseHTTPRequestHandler):
                 "gpu_busy": gpu_busy(),
                 "restore": {"installed": RESTORE_PYTHON.exists(), "items": restore_items()},
                 "relay_asr_ready": relay_asr_ready(),
-                "jobs": {key: proc.snapshot() for key, proc in JOBS.items()},
+                "jobs": {key: proc.snapshot() for key, proc in jobs_now()},
                 "system": system_snapshot(),
                 "log": latest_log_text(),
             }
             self.send_json(data)
+            return
+        if path.startswith("/api/voice-download/"):
+            name = path.rsplit("/", 1)[1]
+            file = TMP_DIR / name
+            if not VOICE_EXPORT.match(name) or not file.is_file():
+                self.send_error(404)
+                return
+            download = urllib.parse.parse_qs(parsed_url.query).get("name", ["voice.zip"])[0]
+            download = re.sub(r"[^A-Za-z0-9._-]+", "-", download) or "voice.zip"
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", f'attachment; filename="{download}"')
+                self.send_header("Content-Length", str(file.stat().st_size))
+                self.end_headers()
+                with file.open("rb") as handle:
+                    shutil.copyfileobj(handle, self.wfile, 1024 * 1024)
+            finally:
+                file.unlink(missing_ok=True)
+            return
+        if path == "/api/dataset-clips":
+            query = urllib.parse.parse_qs(parsed_url.query)
+            try:
+                self.send_json({"ok": True, **dataset_clips(query.get("dataset", [""])[0])})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 404)
             return
         if path.startswith("/datasets/"):
             self.serve_file(DATASETS_DIR / path[len("/datasets/") :])
@@ -1880,6 +2894,29 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(403)
             return
         path = urllib.parse.urlparse(self.path).path
+        if path == "/api/voice-import":
+            source = None
+            try:
+                source = read_upload(self)
+                self.send_json({"ok": True, **import_voice(source)})
+            except Exception as exc:
+                log(f"Error: {exc}")
+                self.send_json({"ok": False, "error": str(exc)}, 500)
+            finally:
+                if source:
+                    source.unlink(missing_ok=True)
+            return
+        if path == "/api/dataset-cut":
+            # The file itself is the body, as a long recording is too large for JSON.
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                source = read_upload(self)
+                start_dataset_cut(query.get("dataset", [""])[0], [(source, query.get("filename", ["recording"])[0])])
+                self.send_json({"ok": True})
+            except Exception as exc:
+                log(f"Error: {exc}")
+                self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
         try:
             body = read_json(self)
             if path == "/api/start-system":
@@ -1930,6 +2967,30 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 self.send_json({"ok": True, "dataset": result})
                 return
+            if path == "/api/voice-export":
+                file, name = export_voice(body.get("gpt"), body.get("sovits"), body.get("dataset_id"), body.get("reference"),
+                                          body.get("prompt_text"), body.get("extra_references"))
+                self.send_json({"ok": True, "url": f"/api/voice-download/{file.name}?name={urllib.parse.quote(name)}", "name": name})
+                return
+            if path == "/api/compare-epochs":
+                start_compare(body.get("model"), body.get("kind"), body.get("dataset_id"), body.get("reference"), body.get("text"))
+                self.send_json({"ok": True})
+                return
+            if path == "/api/dataset-cut-restored":
+                cut_restored(body.get("dataset_id"), body.get("item_ids"))
+                self.send_json({"ok": True})
+                return
+            if path == "/api/dataset-clip-text":
+                self.send_json({"ok": True, "text": update_dataset_clip(body.get("dataset_id"), body.get("wav"), body.get("text"))})
+                return
+            if path == "/api/dataset-clip-delete":
+                delete_dataset_clip(body.get("dataset_id"), body.get("wav"))
+                self.send_json({"ok": True})
+                return
+            if path == "/api/dataset-transcribe":
+                text = transcribe_dataset_upload(body.get("dataset_id"), body.get("filename"), body.get("audio_base64"))
+                self.send_json({"ok": True, "text": text})
+                return
             if path == "/api/restore-upload":
                 self.send_json({"ok": True, "item": add_restore_audio(body.get("filename"), body.get("audio_base64"))})
                 return
@@ -1969,12 +3030,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
                 return
             if path == "/api/transcribe":
-                if not relay_asr_ready():
-                    start_relay_asr()
-                    for _ in range(80):
-                        if relay_asr_ready():
-                            break
-                        time.sleep(0.25)
+                ensure_relay_asr()
                 req = urllib.request.Request(
                     RELAY_ASR_URL + "/transcribe",
                     data=json.dumps({"audio_base64": body.get("audio_base64", "")}).encode("utf-8"),
@@ -2003,9 +3059,9 @@ class Handler(BaseHTTPRequestHandler):
                 proc = JOBS.get(key)
                 if proc:
                     proc.stop()
-                elif key in WSL_STOP_SCRIPTS:
+                elif key in WSL_STOP_SCRIPTS or key == "restore":
                     # Started before the dashboard restarted, so only WSL still knows the job.
-                    stop_in_wsl(WSL_STOP_SCRIPTS[key])
+                    stop_in_wsl(WSL_STOP_SCRIPTS["separate" if key == "restore" else key])
                 self.send_json({"ok": True})
                 return
             if path == "/api/generate":
@@ -2400,13 +3456,24 @@ HTML = r"""<!doctype html>
     .setup-state.missing { color: var(--bad); }
     .setup-state.needs_configuration, .setup-state.needs_browser_check { color: var(--warn); }
     .training-project { display: grid; align-content: start; }
+    .progress-bar { height: 4px; background: var(--line-subtle); border-radius: 2px; overflow: hidden; margin-top: var(--space-2); }
+    .progress-bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s; }
+    .compare-list { display: grid; gap: var(--space-3); }
+    .compare-row { display: grid; grid-template-columns: 9em minmax(0, 1fr) auto; gap: var(--space-2); align-items: center; }
+    @media (max-width: 600px) { .compare-row { grid-template-columns: minmax(0, 1fr) auto; grid-auto-flow: dense; } .compare-row .player { grid-column: 1 / -1; } }
     .training-project input + label { margin-top: var(--space-3); }
     /* The file chooser as a plain button, without the field box around it. */
     #datasetAudioFiles { border: 0; background: transparent; padding: 0; min-height: 0; color: var(--muted); }
     #datasetAudioFiles::file-selector-button { height: var(--control-height); margin-right: 12px; padding: 0 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-3); color: var(--text); font: inherit; font-weight: 700; cursor: pointer; }
     #datasetAudioFiles::file-selector-button:hover { background: #2a2f34; border-color: #444a51; }
     .upload-list { display: grid; gap: var(--space-2); max-height: 310px; overflow: auto; margin-top: var(--space-3); }
-    .upload-row { display: grid; grid-template-columns: minmax(150px,.7fr) minmax(260px,1.5fr) auto; gap: var(--space-2); align-items: center; border: 1px solid var(--line-subtle); padding: var(--space-2); background: #101214; }
+    .upload-row { display: grid; grid-template-columns: auto minmax(150px,.7fr) minmax(260px,1.5fr) auto; gap: var(--space-2); align-items: center; border: 1px solid var(--line-subtle); padding: var(--space-2); background: #101214; }
+    .clip-summary { color: var(--muted); }
+    .clip-summary.warn { color: var(--warn); }
+    .clip-list { display: grid; gap: var(--space-1); max-height: 440px; overflow-y: auto; padding-right: var(--space-1); }
+    .clip-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; gap: var(--space-2); align-items: center; }
+    .clip-row .clip-length { color: var(--muted); font-size: 12px; white-space: nowrap; text-align: right; min-width: 5.5em; }
+    .clip-row.warn .clip-length { color: var(--warn); }
     .upload-row .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
     .models {
       display: grid;
@@ -2887,6 +3954,7 @@ HTML = r"""<!doctype html>
     .restore-row { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: var(--space-2); }
     .restore-row input[type="checkbox"] { margin-left: var(--space-2); }
     .restore-options { display: grid; gap: var(--space-2); }
+    .warn-text { color: var(--warn); }
     .compose { display: grid; gap: var(--space-4); width: 100%; max-width: 760px; }
     .compose textarea { padding: 14px 16px; font-size: 16px; line-height: 1.5; }
     /* The preview player gets a wider column, so its position bar stays usable beside the volume button. */
@@ -2963,7 +4031,7 @@ HTML = r"""<!doctype html>
       section.relay-page { padding: 0; }
       .relay-volume-row { grid-template-columns: 1fr; gap: 8px; }
       .result-player { grid-template-columns: 1fr; }
-      .upload-row { grid-template-columns: minmax(0, 1fr) auto; }
+      .upload-row { grid-template-columns: auto minmax(0, 1fr) auto; }
       .upload-row input { grid-column: 1 / -1; grid-row: 2; }
     }
     @media (prefers-reduced-motion: reduce) {
@@ -2996,7 +4064,7 @@ HTML = r"""<!doctype html>
         <div class="workspace">
           <div class="no-voice-note">
             <p>You have no voice yet. On Voice Training, create a dataset, add one clean 3 to 10 second clip with its exact words, and press Sync Only.</p>
-            <button data-go="training">Go to Voice Training</button>
+            <div class="row" style="justify-content: center;"><button data-go="training">Go to Voice Training</button><button class="secondary" data-import-voice>Import a voice</button></div>
           </div>
           <div class="compose">
             <label class="sr-only" for="targetText">Text to speak</label>
@@ -3034,7 +4102,7 @@ HTML = r"""<!doctype html>
           <div class="capture" id="relayCapture">
             <div class="no-voice-note">
               <p>You have no voice yet. Create one on Voice Training, then come back here to speak through it.</p>
-              <button data-go="training">Go to Voice Training</button>
+              <div class="row" style="justify-content: center;"><button data-go="training">Go to Voice Training</button><button class="secondary" data-import-voice>Import a voice</button></div>
             </div>
             <button class="talk-button" id="relayPttButton" aria-label="Hold to talk" aria-describedby="relayStatusText relayStatusHint">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/><path d="M8 21h8"/></svg>
@@ -3114,10 +4182,18 @@ HTML = r"""<!doctype html>
           <div class="steps train-only" id="trainingSteps">
             <div class="step" id="clipsStep">
               <div class="step-head"><h3><span class="step-number">1</span>Clips</h3><span class="status-line" id="trainingDatasetStatus"></span></div>
-              <input id="datasetAudioFiles" type="file" accept="audio/*,.wav,.ogg,.mp3,.flac,.m4a" multiple aria-label="Audio files to add" />
-              <div class="small">Each file gets a transcript you can edit before it is added. The file name is the first suggestion.</div>
+              <div class="small clip-summary" id="clipSummary"></div>
+              <div class="clip-list" id="clipList" aria-label="Clips in the dataset"></div>
+              <div class="row">
+                <button class="secondary" id="datasetAddFiles">+ Add audio</button>
+                <input id="datasetAudioFiles" type="file" accept="audio/*,.wav,.ogg,.mp3,.flac,.m4a" multiple hidden aria-label="Audio files to add" />
+                <button class="danger" data-stop="dataset-cut" id="datasetCutStop" hidden>Stop cutting</button>
+                <span class="status-line" id="datasetCutStatus"></span>
+              </div>
+              <div class="small">Recordings over 20 seconds are cut into clips at pauses.</div>
+              <div class="small" id="datasetUploadHint" hidden>Transcripts are written automatically. Check each one, then add the files.</div>
               <div class="upload-list" id="datasetUploadRows"></div>
-              <div class="row"><button id="uploadDatasetAudio" disabled>Add Files to Dataset</button><span class="status-line" id="datasetUploadProgress"></span></div>
+              <div class="row"><button id="uploadDatasetAudio" disabled hidden>Add Files to Dataset</button><span class="status-line" id="datasetUploadProgress"></span></div>
             </div>
 
             <div class="step" id="prepareStep">
@@ -3150,6 +4226,7 @@ HTML = r"""<!doctype html>
                     <button class="danger" data-stop="train-sovits">Stop</button>
                   </div>
                   <div class="status-line" id="trainSovitsStatus" style="margin-top: 8px;"></div>
+                  <div class="progress-bar" id="trainSovitsBar" hidden><span></span></div>
                 </div>
                 <div class="training-project">
                   <h4>GPT</h4>
@@ -3161,8 +4238,21 @@ HTML = r"""<!doctype html>
                     <button class="danger" data-stop="train-gpt">Stop</button>
                   </div>
                   <div class="status-line" id="trainGptStatus" style="margin-top: 8px;"></div>
+                  <div class="progress-bar" id="trainGptBar" hidden><span></span></div>
                 </div>
               </div>
+            </div>
+
+            <div class="step" id="compareStep">
+              <div class="step-head"><h3><span class="step-number">4</span>Compare epochs</h3><span class="status-line" id="compareStatus"></span></div>
+              <div class="small" id="compareInfo">Generates one line with each saved epoch, so you can choose the best by ear.</div>
+              <div class="field-row">
+                <div><label for="compareKind">Compare</label><select id="compareKind"><option value="sovits">SoVITS epochs</option><option value="gpt">GPT epochs</option></select></div>
+                <div><label for="compareReference">Reference clip</label><select id="compareReference"></select></div>
+              </div>
+              <div><label for="compareText">Test line</label><input id="compareText" value="This is how my new voice sounds." /></div>
+              <div class="row"><button id="compareRun">Compare</button><button class="danger" data-stop="compare" id="compareStop" hidden>Stop</button></div>
+              <div class="compare-list" id="compareResults"></div>
             </div>
 
             <details class="sub">
@@ -3171,9 +4261,6 @@ HTML = r"""<!doctype html>
             </details>
           </div>
           <div class="restore-only restore-panel">
-            <div class="empty-note" id="restoreMissing" hidden>
-              <p>Not installed. Run <strong>Setup-Restore-Env.bat</strong>.</p>
-            </div>
             <div class="empty-note" id="restoreEmpty" hidden>
               <p>Clean up noisy or low-quality recordings before training.</p>
               <button id="restoreAddEmpty">Add audio files</button>
@@ -3193,6 +4280,15 @@ HTML = r"""<!doctype html>
               <div class="step">
                 <div class="step-head"><h3>Restore</h3><span class="status-line" id="restoreStatus"></span></div>
                 <div class="restore-options">
+                  <label><input type="checkbox" id="restoreMusic" /> Remove music and sound effects</label>
+                  <div><select id="restoreMusicModel" aria-label="Separation model">
+                    <option value="best">BS-Roformer, best quality</option>
+                    <option value="main">HP5, main voice only</option>
+                    <option value="all">HP2, all voices</option>
+                  </select></div>
+                  <label><input type="checkbox" id="restoreEcho" /> Remove echo and reverb</label>
+                  <div class="small">These two run on the GPU in WSL.</div>
+                  <div class="small warn-text" id="restoreMissing" hidden>Noise removal and high frequencies need <strong>Setup-Restore-Env.bat</strong>.</div>
                   <label><input type="checkbox" id="restoreDenoise" /> Remove background noise</label>
                   <div class="small">Best with Restore high frequencies on.</div>
                   <label><input type="checkbox" id="restoreEnhance" checked /> Restore high frequencies</label>
@@ -3372,6 +4468,14 @@ HTML = r"""<!doctype html>
         <div class="row" style="margin-top: 10px;"><button class="secondary" id="startApi">Start Engine</button><button class="secondary" id="stopApi">Stop Engine</button><span class="small">Generate starts the engine on its own when it is off.</span></div>
       </div>
       <div>
+        <h3>Share this voice <span class="status-line" id="shareStatus"></span></h3>
+        <div class="row">
+          <button class="secondary" id="exportVoice">Export voice</button>
+          <button class="secondary" data-import-voice>Import a voice</button>
+        </div>
+        <div class="small">One file with both models and the reference clips, to give to someone or to keep.</div>
+      </div>
+      <div>
         <h3>Generation</h3>
         <div class="grid3">
           <div><label for="textLang" title="Language of the text to speak. It follows the voice dataset's language when you choose a dataset.">Text language</label><select id="textLang"><option value="en">English</option><option value="zh">Chinese</option><option value="ja">Japanese</option><option value="ko">Korean</option><option value="yue">Cantonese</option></select></div>
@@ -3454,7 +4558,6 @@ HTML = r"""<!doctype html>
     catch (_) { relayAuxSelected = new Set(); }
     let refsSignature = "";
     let modelsSignature = "";
-    let refreshBusy = false;
     const $ = id => document.getElementById(id);
 
     // The dashboard's own audio player in place of the browser's: a play button, a position bar
@@ -3603,8 +4706,12 @@ HTML = r"""<!doctype html>
     let welcomeChecked = false;
     let lastSystemMessage = "";
     let datasetUploadFiles = [];
-    // Transcripts typed for files waiting to be added, so a redraw of the list keeps them.
+    // Transcripts of the files waiting to be added, typed or written by speech recognition, so a
+    // redraw of the list keeps them. A file without one is still being transcribed.
     const datasetUploadTexts = new WeakMap();
+    const datasetUploadInputs = new WeakMap();
+    const transcriptQueue = [];
+    let transcriptBusy = false;
     // Relay workspace view: "capture" shows the recording control alone; "result" shows one queue item.
     let relayView = {mode: "capture", itemId: null};
     let relayTranscribing = false;
@@ -3726,11 +4833,254 @@ HTML = r"""<!doctype html>
       if (Array.from(select.options).some(item => item.value === old)) select.value = old;
       const selected = (datasets || []).find(dataset => dataset.id === select.value);
       if (selected) {
-        $("trainingDatasetStatus").textContent = `${selected.name}: ${selected.wav_count} WAV files / ${selected.list_rows} transcripts · ${selected.ready ? "ready" : "needs audio or transcripts"}`;
+        $("trainingDatasetStatus").textContent = selected.ready ? "Ready" : (selected.wav_count || selected.list_rows ? "Clips and transcripts do not match" : "No clips yet");
         $("trainingDatasetStatus").className = selected.ready ? "status-line good" : "status-line warn";
-        $("uploadDatasetAudio").disabled = !datasetUploadFiles.length;
+        updateUploadButton();
       }
       renderDatasetList(datasets || [], select.value);
+      loadClips();
+    }
+
+    // The clips already in the selected dataset: listen, correct a transcript, or delete a clip.
+    // Rows are kept while the list grows, so typing in one is not interrupted.
+    let clipsSignature = "";
+    let clipsDataset = "";
+    let clipsData = {clips: [], seconds: 0};
+    const clipRows = new Map();
+    const clipAudio = new Audio();
+    let clipPlaying = "";
+    const STOP_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12"/></svg>';
+
+    function formatLength(seconds) {
+      if (seconds === null || seconds === undefined) return "unreadable";
+      if (seconds < 60) return `${Number(seconds).toFixed(1)} s`;
+      const whole = Math.round(seconds);
+      return `${Math.floor(whole / 60)} min ${whole % 60} s`;
+    }
+
+    function clipProblem(seconds) {
+      if (seconds === null || seconds === undefined) return "The file cannot be read.";
+      if (seconds <= 0.6) return "Training skips clips of 0.6 s or less.";
+      if (seconds >= 54) return "Training skips clips of 54 s or more.";
+      return "";
+    }
+
+    async function loadClips(force = false) {
+      const dataset = ((state && state.datasets) || []).find(row => row.id === $("trainingDataset").value);
+      const signature = dataset ? `${dataset.id}|${dataset.wav_count}|${dataset.list_rows}` : "";
+      if (!force && signature === clipsSignature) return;
+      clipsSignature = signature;
+      if (!dataset) {
+        clipsData = {clips: [], seconds: 0};
+        renderClips("");
+        return;
+      }
+      // Another dataset's clips, and the references made from them, go at once, not when the new list arrives.
+      if (dataset.id !== clipsDataset) {
+        clipsData = {clips: [], seconds: 0};
+        renderClips(dataset.id);
+      }
+      try {
+        const data = await (await fetch(`/api/dataset-clips?dataset=${encodeURIComponent(dataset.id)}`)).json();
+        if (data.ok && $("trainingDataset").value === dataset.id) {
+          clipsData = data;
+          renderClips(dataset.id);
+        }
+      } catch (_) {
+        clipsSignature = "";
+      }
+    }
+
+    // The saved epochs of the model named in step 2, each used to say the same test line.
+    function savedEpochs(kind) {
+      const name = modelSlug($("trainingModelName").value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const pattern = new RegExp(kind === "gpt" ? `^${name}-e(\\d+)\\.ckpt$` : `^${name}_e(\\d+)_s\\d+\\.pth$`);
+      return ((state && state.models && state.models[kind]) || []).filter(row => pattern.test(row.name)).length;
+    }
+
+    let compareRowsSignature = "";
+    let compareChosen = "";
+    function renderCompare() {
+      const kind = $("compareKind").value;
+      const count = savedEpochs(kind);
+      const job = state && state.jobs && state.jobs.compare;
+      const running = Boolean(job && job.status === "running");
+      // Models are listed once WSL runs; until then the comparison itself finds the epochs.
+      const listed = Boolean(state && state.models_listed);
+      $("compareStop").hidden = !running;
+      $("compareRun").disabled = running || (listed && !count) || !$("compareReference").value;
+      $("compareInfo").textContent = !$("compareReference").options.length
+        ? "Compare needs a clip of 3 to 10 seconds in this dataset, as the reference."
+        : !listed
+        ? "Generates one line with each saved epoch, so you can choose the best by ear."
+        : (count
+          ? `Generates one line with each of the ${count} saved ${kind === "gpt" ? "GPT" : "SoVITS"} epochs of ${modelSlug($("trainingModelName").value)}, so you can choose the best by ear.`
+          : `${modelSlug($("trainingModelName").value)} has no saved ${kind === "gpt" ? "GPT" : "SoVITS"} epochs yet. Train it first.`);
+      if (!job) return;
+      const last = (job.lines || []).slice(-1)[0] || "Starting...";
+      $("compareStatus").textContent = running ? last : (job.status === "failed" ? `${last} See Logs for details.` : (job.status === "stopped" ? "Stopped." : (compareChosen || "Done.")));
+      $("compareStatus").className = job.status === "failed" ? "status-line bad" : (!running && compareChosen ? "status-line good" : "status-line");
+      const results = job.results || [];
+      const signature = results.map(row => row.url).join("|");
+      if (signature === compareRowsSignature) return;
+      compareRowsSignature = signature;
+      const list = $("compareResults");
+      list.innerHTML = "";
+      results.forEach(row => {
+        const line = document.createElement("div");
+        line.className = "compare-row";
+        const label = document.createElement("span");
+        label.textContent = `${row.kind === "gpt" ? "GPT" : "SoVITS"} epoch ${row.epoch}`;
+        const audio = document.createElement("audio");
+        audio.src = row.url;
+        audio.dataset.label = label.textContent;
+        const use = document.createElement("button");
+        use.className = "secondary";
+        use.textContent = "Use this";
+        use.onclick = () => {
+          // Text to Voice and Mic to Voice speak with this epoch from now on.
+          [["gptModel", row.gpt], ["sovitsModel", row.sovits], ["relayGptModel", row.gpt], ["relaySovitsModel", row.sovits]].forEach(([id, path]) => {
+            if (Array.from($(id).options).some(option => option.value === path)) $(id).value = path;
+          });
+          saveRelaySettings();
+          compareChosen = `Text to Voice and Mic to Voice now use ${label.textContent}.`;
+          $("compareStatus").className = "status-line good";
+          $("compareStatus").textContent = compareChosen;
+        };
+        line.append(label, audio, use);
+        list.appendChild(line);
+        attachPlayer(audio);
+      });
+    }
+
+    function fillCompareReferences() {
+      // Clips that can be a reference: 3 to 10 seconds long.
+      const select = $("compareReference");
+      const old = select.value;
+      select.innerHTML = "";
+      (clipsData.clips || []).filter(clip => clip.duration >= 3 && clip.duration <= 10).forEach(clip => option(select, clip.wav, clip.text));
+      if (Array.from(select.options).some(item => item.value === old)) select.value = old;
+      renderCompare();
+    }
+
+    // One player for the clip list and the files waiting to be added. A row's button plays its
+    // audio; pressing it again, or another row's, stops it.
+    let clipButton = null;
+    let clipObjectUrl = "";
+    function stopClip() {
+      clipAudio.pause();
+      clipAudio.removeAttribute("src");
+      clipAudio.load();
+      if (clipButton) clipButton.innerHTML = PLAY_ICON;
+      if (clipObjectUrl) URL.revokeObjectURL(clipObjectUrl);
+      clipButton = null;
+      clipObjectUrl = "";
+      clipPlaying = "";
+    }
+    clipAudio.onended = stopClip;
+
+    function playRowAudio(key, button, source) {
+      const playing = clipPlaying === key;
+      stopClip();
+      if (playing) return;
+      clipPlaying = key;
+      clipButton = button;
+      button.innerHTML = STOP_ICON;
+      // A file not yet added plays from the computer.
+      if (source instanceof Blob) clipObjectUrl = URL.createObjectURL(source);
+      clipAudio.src = clipObjectUrl || source;
+      clipAudio.volume = playerVolume;
+      clipAudio.play().catch(() => { if (clipPlaying === key) stopClip(); });
+    }
+
+    function rowPlayButton(label) {
+      const play = document.createElement("button");
+      play.type = "button";
+      play.className = "secondary icon-button";
+      play.innerHTML = PLAY_ICON;
+      play.setAttribute("aria-label", `Play ${label}`);
+      return play;
+    }
+
+    function clipRow(clip) {
+      const row = document.createElement("div");
+      row.className = "clip-row";
+      const play = rowPlayButton(clip.wav);
+      play.onclick = () => playRowAudio(clip.wav, play, clip.url);
+      const text = document.createElement("input");
+      text.value = clip.text;
+      text.setAttribute("aria-label", `Transcript of ${clip.wav}`);
+      text.title = clip.wav;
+      let saved = clip.text;
+      text.onchange = async () => {
+        try {
+          saved = (await post("/api/dataset-clip-text", {dataset_id: clipsDataset, wav: clip.wav, text: text.value})).text;
+          text.value = saved;
+        } catch (error) {
+          text.value = saved;
+          showError(error.message);
+        }
+      };
+      const length = document.createElement("span");
+      length.className = "clip-length";
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "secondary icon-button";
+      remove.title = "Delete this clip";
+      remove.setAttribute("aria-label", `Delete ${clip.wav}`);
+      remove.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+      remove.onclick = async () => {
+        if (clipPlaying === clip.wav) stopClip();
+        const next = row.nextElementSibling || row.previousElementSibling;
+        try {
+          await post("/api/dataset-clip-delete", {dataset_id: clipsDataset, wav: clip.wav});
+          await refresh();
+          await loadClips(true);
+          if (next && next.isConnected) next.querySelector("button:last-child").focus();
+        } catch (error) {
+          showError(error.message);
+        }
+      };
+      row.append(play, text, length, remove);
+      return {row, play, length};
+    }
+
+    function renderClips(datasetId) {
+      if (datasetId !== clipsDataset) {
+        stopClip();
+        clipRows.clear();
+        $("clipList").innerHTML = "";
+        clipsDataset = datasetId;
+      }
+      const clips = clipsData.clips || [];
+      const names = new Set(clips.map(clip => clip.wav));
+      clipRows.forEach((parts, wav) => {
+        if (names.has(wav)) return;
+        if (clipPlaying === wav) stopClip();
+        parts.row.remove();
+        clipRows.delete(wav);
+      });
+      let problems = 0;
+      clips.forEach(clip => {
+        if (!clipRows.has(clip.wav)) {
+          const parts = clipRow(clip);
+          clipRows.set(clip.wav, parts);
+          $("clipList").appendChild(parts.row);
+        }
+        const parts = clipRows.get(clip.wav);
+        const problem = clipProblem(clip.duration);
+        if (problem) problems++;
+        parts.length.textContent = formatLength(clip.duration);
+        parts.length.title = problem;
+        parts.row.classList.toggle("warn", Boolean(problem));
+      });
+      const summary = $("clipSummary");
+      summary.hidden = !clips.length;
+      summary.textContent = `${clips.length} clip${clips.length === 1 ? "" : "s"}, ${formatLength(clipsData.seconds)} in total.`
+        + (problems ? ` Training skips ${problems} of them: see the lengths marked in yellow.` : "")
+        + (clips.length && clipsData.seconds < 60 ? " A minute or more of clips trains a better voice." : "");
+      summary.classList.toggle("warn", problems > 0);
+      fillCompareReferences();
     }
 
     // Redrawn only when a dataset or the choice changes, so keyboard focus stays in the list.
@@ -3782,15 +5132,26 @@ HTML = r"""<!doctype html>
       datasetUploadFiles.forEach((file, index) => {
         const row = document.createElement("div");
         row.className = "upload-row";
+        const play = rowPlayButton(file.name);
+        play.onclick = () => playRowAudio(file, play, file);
+        // A file that plays while the list is redrawn keeps its stop button.
+        if (clipPlaying === file) {
+          play.innerHTML = STOP_ICON;
+          clipButton = play;
+        }
         const name = document.createElement("div");
         name.className = "file-name";
         name.title = file.name;
         name.textContent = file.name;
         const transcript = document.createElement("input");
-        transcript.value = datasetUploadTexts.has(file) ? datasetUploadTexts.get(file) : suggestedTranscript(file.name);
-        transcript.placeholder = "Exact spoken transcript";
-        transcript.dataset.uploadTranscript = String(index);
-        transcript.oninput = () => datasetUploadTexts.set(file, transcript.value);
+        transcript.value = datasetUploadTexts.get(file) || "";
+        transcript.placeholder = datasetUploadTexts.has(file) ? "Exact spoken transcript" : "Writing the transcript...";
+        transcript.setAttribute("aria-label", `Transcript of ${file.name}`);
+        transcript.oninput = () => {
+          datasetUploadTexts.set(file, transcript.value);
+          updateUploadButton();
+        };
+        datasetUploadInputs.set(file, transcript);
         const remove = document.createElement("button");
         remove.type = "button";
         remove.className = "secondary icon-button";
@@ -3798,14 +5159,77 @@ HTML = r"""<!doctype html>
         remove.setAttribute("aria-label", `Remove ${file.name}`);
         remove.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>';
         remove.onclick = () => {
-          datasetUploadFiles.splice(index, 1);
+          if (clipPlaying === file) stopClip();
+          datasetUploadFiles = datasetUploadFiles.filter(other => other !== file);
           renderDatasetUploads();
         };
-        row.append(name, transcript, remove);
+        row.append(play, name, transcript, remove);
         list.appendChild(row);
       });
+      $("datasetUploadHint").hidden = !datasetUploadFiles.length;
+      updateUploadButton();
+    }
+
+    let uploadBusy = false;
+    function updateUploadButton() {
       const selected = state && (state.datasets || []).find(dataset => dataset.id === $("trainingDataset").value);
-      $("uploadDatasetAudio").disabled = !datasetUploadFiles.length || !selected;
+      const waiting = datasetUploadFiles.some(file => !datasetUploadTexts.has(file));
+      $("uploadDatasetAudio").hidden = !datasetUploadFiles.length;
+      $("uploadDatasetAudio").disabled = uploadBusy || !datasetUploadFiles.length || !selected || waiting;
+    }
+
+    function setUploadTranscript(file, text) {
+      datasetUploadTexts.set(file, text);
+      const input = datasetUploadInputs.get(file);
+      if (input) {
+        input.value = text;
+        input.placeholder = "Exact spoken transcript";
+      }
+      updateUploadButton();
+    }
+
+    // Speech recognition writes the transcripts, one file at a time, in the dataset's language.
+    function queueTranscripts(files) {
+      transcriptQueue.push(...files.filter(file => !datasetUploadTexts.has(file)));
+      runTranscripts();
+    }
+
+    async function runTranscripts() {
+      if (transcriptBusy) return;
+      transcriptBusy = true;
+      let failure = "";
+      try {
+        while (transcriptQueue.length) {
+          const file = transcriptQueue.shift();
+          if (!datasetUploadFiles.includes(file) || datasetUploadTexts.has(file)) continue;
+          if (failure) {
+            setUploadTranscript(file, suggestedTranscript(file.name));
+            continue;
+          }
+          const left = 1 + transcriptQueue.filter(other => datasetUploadFiles.includes(other) && !datasetUploadTexts.has(other)).length;
+          $("datasetUploadProgress").className = "status-line";
+          $("datasetUploadProgress").textContent = `Writing transcripts, ${left} left...`;
+          // The first transcript also loads, and the first time downloads, the speech model.
+          const slow = setTimeout(() => {
+            $("datasetUploadProgress").textContent = `Writing transcripts, ${left} left. The first time also downloads the speech model (about 480 MB)...`;
+          }, 8000);
+          try {
+            const result = await post("/api/dataset-transcribe", {dataset_id: $("trainingDataset").value, filename: file.name, audio_base64: await fileToBase64(file)});
+            if (!datasetUploadTexts.has(file)) setUploadTranscript(file, result.text);
+          } catch (error) {
+            failure = error.message;
+            if (!datasetUploadTexts.has(file)) setUploadTranscript(file, suggestedTranscript(file.name));
+          } finally {
+            clearTimeout(slow);
+          }
+        }
+        $("datasetUploadProgress").className = failure ? "status-line bad" : "status-line";
+        $("datasetUploadProgress").textContent = failure
+          ? `Automatic transcripts failed, so the file names were used. ${failure}`
+          : (datasetUploadFiles.length ? "Transcripts written." : "");
+      } finally {
+        transcriptBusy = false;
+      }
     }
 
     function fileToBase64(file) {
@@ -4944,10 +6368,21 @@ HTML = r"""<!doctype html>
       }
     }
 
-    async function refresh() {
-      if (refreshBusy) return;
-      refreshBusy = true;
-      try {
+    // A refresh asked for while another runs waits for it and runs once more, as the one running
+    // asked with the choices from before.
+    let refreshRunning = null;
+    let refreshQueued = null;
+    function refresh() {
+      if (refreshRunning) {
+        // Also after a refresh that failed, as when the dashboard restarts.
+        if (!refreshQueued) refreshQueued = refreshRunning.catch(() => {}).then(() => { refreshQueued = null; return refresh(); });
+        return refreshQueued;
+      }
+      refreshRunning = refreshOnce().finally(() => { refreshRunning = null; });
+      return refreshRunning;
+    }
+
+    async function refreshOnce() {
       const res = await fetch(`/api/state?dataset=${encodeURIComponent(voiceDataset)}`);
       state = await res.json();
       if (state.config_error && !configErrorShown) {
@@ -4991,15 +6426,23 @@ HTML = r"""<!doctype html>
         $("datasetPrepareStatus").className = preparation.status === "failed" ? "status-line bad" : (preparation.status === "done" ? "status-line good" : "status-line");
         $("prepareDataset").disabled = preparation.status === "running";
       }
-      const jobLine = (key, element) => {
+      const jobLine = (key, element, bar) => {
         const job = state.jobs && state.jobs[key];
+        const progress = job && job.progress;
+        $(bar).hidden = !(job && job.status === "running" && progress);
         if (!job) { $(element).textContent = ""; return; }
-        const text = job.status === "running" ? "Running..." : `${job.status}${job.returncode !== null && job.returncode !== undefined ? ` (exit ${job.returncode})` : ""}`;
+        let text = job.status === "running" ? "Running..." : `${job.status}${job.returncode !== null && job.returncode !== undefined ? ` (exit ${job.returncode})` : ""}`;
+        if (job.status === "running" && progress) {
+          text = progress.epoch ? `Epoch ${progress.epoch} of ${progress.epochs} done` : "Starting...";
+          if (progress.seconds_left) text += `, about ${Math.max(1, Math.round(progress.seconds_left / 60))} min left`;
+          $(bar).firstElementChild.style.width = `${Math.min(100, 100 * progress.epoch / progress.epochs)}%`;
+        }
         $(element).textContent = text;
         $(element).className = job.status === "failed" ? "status-line bad" : (job.status === "done" ? "status-line good" : "status-line");
       };
-      jobLine("train-sovits", "trainSovitsStatus");
-      jobLine("train-gpt", "trainGptStatus");
+      jobLine("train-sovits", "trainSovitsStatus", "trainSovitsBar");
+      jobLine("train-gpt", "trainGptStatus", "trainGptBar");
+      renderCompare();
       const trainingJob = ["dataset-sync", "dataset-prepare", "train-sovits", "train-gpt"].map(key => state.jobs[key]).find(job => job && job.status === "running");
       $("trainingJobsStatus").textContent = trainingJob ? `${trainingJob.name} is running` : "";
       const jobLogs = Object.values(state.jobs || {})
@@ -5013,12 +6456,10 @@ HTML = r"""<!doctype html>
       $("modelCount").textContent = savedModels.length ? `${savedModels.length} files` : (state.models_listed ? "none yet" : "listed once WSL is running");
       savedModels.forEach(row => $("modelList").appendChild(modelLine(row.path, row.size_mb)));
       renderRestore();
+      renderCutStatus();
       showWelcome();
       // Loaded data can move the highlighted element.
       placeTour();
-      } finally {
-        refreshBusy = false;
-      }
     }
 
     function modelLine(label, sizeMb) {
@@ -5039,10 +6480,11 @@ HTML = r"""<!doctype html>
       {title: "Welcome", text: "This tour shows what each part of the dashboard does and how to use it. Use Next and Back, or the arrow keys. Esc ends the tour."},
       {targets: [".tablist"], title: "Tabs", text: "Mic to Voice and Text to Voice speak in a voice. Voice Training creates voices. Logs and System Check help when something does not work."},
       {tab: "training", targets: ["#newDatasetButton"], title: "Create a voice", text: "Every voice starts as a dataset. Press + New dataset, then give it a name and a language."},
-      {tab: "training", targets: ["#clipsStep", "#noDatasets"], title: "Add clips", text: "Choose one or more clean 3 to 10 second clips. Each clip needs the exact words spoken in it, which you can edit before the clips are added."},
+      {tab: "training", targets: ["#clipsStep", "#noDatasets"], title: "Add clips", text: "Add clips, or long recordings, which are cut into clips at pauses. Speech recognition writes each transcript. Check them in the list, where every clip can be played, corrected or deleted."},
       {tab: "training", targets: ["#prepareStep", "#noDatasets"], title: "Sync the clips", text: "Sync Only copies the clips to WSL, which is all Text to Voice and Mic to Voice need. Sync again after adding clips."},
       {tab: "training", targets: ["#trainPanel", "#noDatasets"], title: "Train the voice", text: "Training makes the voice closer to its clips, after Sync & Prepare. It takes a while, and it stops the voice first to free the GPU."},
-      {tab: "training", targets: ["#trainingModeRestore"], title: "Restore audio", text: "Clean up noisy or low-quality recordings before training. Each result is added to the list, to restore again or add to a dataset."},
+      {tab: "training", targets: ["#compareStep", "#noDatasets"], title: "Compare epochs", text: "Training saves the voice every few epochs. Compare says one test line with each saved epoch, so you can keep the one that sounds best."},
+      {tab: "training", targets: ["#trainingModeRestore"], title: "Restore audio", text: "Clean up recordings before training: remove music, echo or noise, and restore missing high frequencies. Each result is added to the list, to restore again or add to a dataset."},
       {tab: "generate", targets: ["#targetText", "#tab-generate .no-voice-note"], title: "Text to Voice", text: "Type what the voice should say.", noVoiceText: "Here you type what a voice should say. It needs a voice first, made on Voice Training."},
       {tab: "generate", voice: true, targets: [".voice-line"], title: "Choose the voice", text: "Pick the voice and a reference clip. The clip's tone shapes how the line sounds, and you can play it here."},
       {tab: "generate", voice: true, targets: [".compose-actions"], title: "Generate", text: "Generate makes the line. The voice engine starts by itself the first time, which takes a moment. The gear opens the models, the text language and finer controls."},
@@ -5526,6 +6968,7 @@ HTML = r"""<!doctype html>
       $("datasetAudioFiles").value = "";
       renderDatasetUploads();
       fillTrainingDatasets(state ? state.datasets : []);
+      loadClips(true);
     };
     $("trainingModelName").value = localStorage.getItem("voiceDashboardTrainingModelName") || $("trainingModelName").value;
     const updateTrainingModelName = () => {
@@ -5560,40 +7003,238 @@ HTML = r"""<!doctype html>
       }
     };
 
-    $("datasetAudioFiles").onchange = () => {
-      // Added to the list, which can also hold recordings from Restore audio.
-      datasetUploadFiles.push(...Array.from($("datasetAudioFiles").files || []));
-      $("datasetAudioFiles").value = "";
-      renderDatasetUploads();
+    // Recordings longer than this are cut into clips at pauses on the server; shorter ones are clips.
+    const CUT_LONGER_THAN = 20;
+
+    function audioSeconds(file) {
+      // The length of an audio file, or 0 when the browser cannot read it.
+      return new Promise(resolve => {
+        const url = URL.createObjectURL(file);
+        const audio = new Audio();
+        const timer = setTimeout(() => done(0), 10000);
+        function done(seconds) {
+          clearTimeout(timer);
+          audio.removeAttribute("src");
+          URL.revokeObjectURL(url);
+          resolve(Number.isFinite(seconds) ? seconds : 0);
+        }
+        audio.preload = "metadata";
+        audio.onloadedmetadata = () => done(audio.duration);
+        audio.onerror = () => done(0);
+        audio.src = url;
+      });
+    }
+
+    let cutSending = "";
+    const UPLOAD_LIMIT = 4 * 1024 ** 3;
+    async function sendToCut(file, datasetId) {
+      if (file.size > UPLOAD_LIMIT) throw new Error("Files over 4 GB cannot be sent. Cut the recording into shorter files first.");
+      const query = `dataset=${encodeURIComponent(datasetId)}&filename=${encodeURIComponent(file.name)}`;
+      const response = await fetch(`/api/dataset-cut?${query}`, {method: "POST", headers: {"Content-Type": "application/octet-stream"}, body: file});
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || result.ok === false) throw new Error(result.error || "The upload failed.");
+    }
+
+    // A voice as one file: both models and the reference clips.
+    const importVoiceFile = document.createElement("input");
+    importVoiceFile.type = "file";
+    importVoiceFile.accept = ".zip";
+    importVoiceFile.hidden = true;
+    document.body.appendChild(importVoiceFile);
+    function shareStatus(text, kind = "") {
+      $("shareStatus").className = `status-line ${kind}`;
+      $("shareStatus").textContent = text;
+    }
+    document.querySelectorAll("[data-import-voice]").forEach(button => { button.onclick = () => importVoiceFile.click(); });
+    importVoiceFile.onchange = async () => {
+      const file = importVoiceFile.files[0];
+      importVoiceFile.value = "";
+      if (!file) return;
+      if (file.size > UPLOAD_LIMIT) return showError("This file is over 4 GB, far larger than a voice file.");
+      const buttons = Array.from(document.querySelectorAll("[data-import-voice]"));
+      buttons.forEach(button => { button.disabled = true; button.textContent = "Importing..."; });
+      shareStatus(`Importing ${file.name}...`);
+      recentActivity(`Importing the voice ${file.name}...`);
+      try {
+        const response = await fetch("/api/voice-import", {method: "POST", headers: {"Content-Type": "application/zip"}, body: file});
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok || result.ok === false) throw new Error(result.error || "The import failed.");
+        // The imported voice becomes the voice of Text to Voice and Mic to Voice.
+        voiceDataset = result.dataset;
+        try { localStorage.setItem("voiceDashboardVoiceDataset", voiceDataset); } catch (_) {}
+        refsSignature = "";
+        modelsSignature = "";
+        await refresh();
+        const pairs = [["gptModel", result.gpt], ["sovitsModel", result.sovits], ["relayGptModel", result.gpt], ["relaySovitsModel", result.sovits]];
+        const found = pairs.every(([id, path]) => Array.from($(id).options).some(item => item.value === path));
+        pairs.forEach(([id, path]) => {
+          if (Array.from($(id).options).some(item => item.value === path)) $(id).value = path;
+        });
+        saveRelaySettings();
+        shareStatus(found ? `Imported ${result.name}. Text to Voice and Mic to Voice now use it.` : `Imported ${result.name}. Choose its models in Settings.`, "good");
+        recentActivity(`Imported the voice ${result.name}.`);
+      } catch (error) {
+        shareStatus("");
+        showError(error.message);
+      } finally {
+        buttons.forEach(button => { button.disabled = false; button.textContent = "Import a voice"; });
+      }
+    };
+    $("exportVoice").onclick = async () => {
+      $("exportVoice").disabled = true;
+      shareStatus("Packing the voice...");
+      try {
+        const result = await post("/api/voice-export", {gpt: $("gptModel").value, sovits: $("sovitsModel").value, dataset_id: voiceDataset,
+          reference: $("reference").value, prompt_text: $("promptText").value, extra_references: Array.from(auxSelected)});
+        const link = document.createElement("a");
+        link.href = result.url;
+        link.download = result.name;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        shareStatus(`Saved as ${result.name}.`, "good");
+      } catch (error) {
+        shareStatus("");
+        showError(error.message);
+      } finally {
+        $("exportVoice").disabled = false;
+      }
     };
 
-    $("uploadDatasetAudio").onclick = async () => {
-      if (!datasetUploadFiles.length) return;
-      const transcripts = Array.from(document.querySelectorAll("[data-upload-transcript]")).map(input => input.value.trim());
-      if (transcripts.some(text => !text)) return showError("Every selected audio file needs a transcript.");
-      $("uploadDatasetAudio").disabled = true;
+    $("compareKind").onchange = renderCompare;
+    $("trainingModelName").addEventListener("input", renderCompare);
+    $("compareRun").onclick = async () => {
+      $("compareRun").disabled = true;
       try {
-        for (let index = 0; index < datasetUploadFiles.length; index++) {
-          const file = datasetUploadFiles[index];
-          $("datasetUploadProgress").textContent = `Converting and adding ${index + 1} of ${datasetUploadFiles.length}: ${file.name}`;
+        await post("/api/compare-epochs", {model: $("trainingModelName").value, kind: $("compareKind").value, dataset_id: $("trainingDataset").value,
+          reference: $("compareReference").value, text: $("compareText").value});
+        compareRowsSignature = null;
+        compareChosen = "";
+        $("compareResults").innerHTML = "";
+        $("compareStatus").className = "status-line";
+        $("compareStatus").textContent = "Starting...";
+        refresh();
+      } catch (error) {
+        showError(error.message);
+        renderCompare();
+      }
+    };
+
+    $("datasetAddFiles").onclick = () => $("datasetAudioFiles").click();
+    $("datasetAudioFiles").onchange = async () => {
+      // Clips join the list, which can also hold recordings from Restore audio; long recordings
+      // are cut into clips on the server.
+      const picked = Array.from($("datasetAudioFiles").files || []);
+      $("datasetAudioFiles").value = "";
+      const datasetId = $("trainingDataset").value;
+      const clips = [];
+      const long = [];
+      // A length the browser cannot read is 0; ffmpeg on the server reads more formats.
+      for (const file of picked) {
+        const seconds = await audioSeconds(file);
+        (seconds === 0 || seconds > CUT_LONGER_THAN ? long : clips).push(file);
+      }
+      if ($("trainingDataset").value !== datasetId) return;
+      if (clips.length) {
+        datasetUploadFiles.push(...clips);
+        renderDatasetUploads();
+        queueTranscripts(clips);
+      }
+      for (const file of long) {
+        cutSending = file.name;
+        $("datasetCutStatus").className = "status-line";
+        $("datasetCutStatus").textContent = `Sending ${file.name}...`;
+        try {
+          await sendToCut(file, datasetId);
+        } catch (error) {
+          showError(`${file.name}: ${error.message}`);
+        } finally {
+          cutSending = "";
+        }
+      }
+      if (long.length) refresh();
+    };
+
+    // Clips the server has cut join the list of files to check, with their transcripts, once each.
+    const cutTaken = new Set();
+    async function takeCutClips(job) {
+      for (const clip of job.results || []) {
+        if (cutTaken.has(clip.url) || job.dataset !== $("trainingDataset").value) continue;
+        cutTaken.add(clip.url);
+        try {
+          const response = await fetch(clip.url);
+          if (!response.ok) continue;
+          const file = new File([await response.blob()], clip.name, {type: "audio/wav"});
+          if (job.dataset !== $("trainingDataset").value) continue;
+          datasetUploadTexts.set(file, clip.text);
+          datasetUploadFiles.push(file);
+          renderDatasetUploads();
+        } catch (_) {
+          cutTaken.delete(clip.url);
+        }
+      }
+    }
+
+    function renderCutStatus() {
+      const job = state && state.jobs && state.jobs["dataset-cut"];
+      if (job) takeCutClips(job);
+      const mine = Boolean(job && job.dataset === $("trainingDataset").value);
+      const running = Boolean(mine && job.status === "running");
+      $("datasetCutStop").hidden = !running;
+      // A recording on its way to the server says so until it has arrived.
+      if (cutSending) return;
+      if (!mine) {
+        $("datasetCutStatus").textContent = "";
+        return;
+      }
+      const last = (job.lines || []).slice(-1)[0] || "Starting...";
+      $("datasetCutStatus").textContent = running ? last : (job.status === "stopped" ? "Cutting stopped." : (job.status === "failed" ? `${last} See Logs for details.` : last));
+      $("datasetCutStatus").className = job.status === "failed" ? "status-line bad" : "status-line";
+    }
+
+    $("uploadDatasetAudio").onclick = async () => {
+      if (uploadBusy || !datasetUploadFiles.length) return;
+      if (datasetUploadFiles.some(file => !(datasetUploadTexts.get(file) || "").trim())) return showError("Every selected audio file needs a transcript.");
+      const datasetId = $("trainingDataset").value;
+      const total = datasetUploadFiles.length;
+      uploadBusy = true;
+      updateUploadButton();
+      let added = 0;
+      try {
+        // The list as it is now: a file removed meanwhile is not sent, and a transcript edited
+        // meanwhile is sent as it is. Switching datasets empties the list, which ends the upload.
+        while (datasetUploadFiles.length && $("trainingDataset").value === datasetId) {
+          const file = datasetUploadFiles[0];
+          $("datasetUploadProgress").className = "status-line";
+          $("datasetUploadProgress").textContent = `Adding ${added + 1} of ${total}: ${file.name}`;
+          const audio = await fileToBase64(file);
+          if (!datasetUploadFiles.includes(file)) continue;
           await post("/api/upload-dataset-audio", {
-            dataset_id: $("trainingDataset").value,
+            dataset_id: datasetId,
             filename: file.name,
-            audio_base64: await fileToBase64(file),
-            text: transcripts[index],
+            audio_base64: audio,
+            text: (datasetUploadTexts.get(file) || "").trim(),
             speaker: "",
             language: ""
           });
+          added++;
+          // An added file leaves the list, so a failure later does not add it twice. Only its row
+          // goes, so typing in another row goes on.
+          datasetUploadFiles = datasetUploadFiles.filter(other => other !== file);
+          if (clipPlaying === file) stopClip();
+          const input = datasetUploadInputs.get(file);
+          if (input) input.parentElement.remove();
+          $("datasetUploadHint").hidden = !datasetUploadFiles.length;
         }
-        $("datasetUploadProgress").textContent = `${datasetUploadFiles.length} file(s) added successfully.`;
-        datasetUploadFiles = [];
-        $("datasetAudioFiles").value = "";
-        renderDatasetUploads();
-        await refresh();
+        $("datasetUploadProgress").textContent = `${added} file${added === 1 ? "" : "s"} added.`;
       } catch (error) {
+        $("datasetUploadProgress").className = "status-line bad";
+        $("datasetUploadProgress").textContent = `${added} of ${total} added. The rest are still in the list.`;
         showError(error.message);
       } finally {
-        $("uploadDatasetAudio").disabled = !datasetUploadFiles.length;
+        uploadBusy = false;
+        updateUploadButton();
+        if (added) await refresh();
       }
     };
 
@@ -5632,7 +7273,17 @@ HTML = r"""<!doctype html>
       } catch (error) { showError(error.message); }
     };
     document.querySelectorAll("[data-stop]").forEach(btn => {
-      btn.onclick = async () => { await post("/api/stop-job", {key: btn.dataset.stop}); refresh(); };
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try {
+          await post("/api/stop-job", {key: btn.dataset.stop});
+        } catch (error) {
+          showError(error.message);
+        } finally {
+          btn.disabled = false;
+          refresh();
+        }
+      };
     });
     $("generate").onclick = async () => {
       const ref = state.references.find(r => r.id === $("reference").value);
@@ -5702,7 +7353,9 @@ HTML = r"""<!doctype html>
     let restoreListSignature = "";
     // The result to show when it appears, if the view is still on the recording it is made from.
     let restoreAwait = null;
-    const RESTORE_SETTING_IDS = ["restoreDenoise", "restoreEnhance", "restoreQuality", "restoreKeep", "restoreModel", "restorePieces"];
+    const RESTORE_SETTING_IDS = ["restoreMusic", "restoreMusicModel", "restoreEcho", "restoreDenoise", "restoreEnhance", "restoreQuality", "restoreKeep", "restoreModel", "restorePieces"];
+    // The options that need restore_env, which Setup-Restore-Env.bat creates.
+    const LAVASR_IDS = ["restoreDenoise", "restoreEnhance", "restoreQuality", "restoreKeep", "restoreModel", "restorePieces"];
 
     function setTrainingMode(mode) {
       $("tab-training").dataset.mode = mode;
@@ -5740,10 +7393,11 @@ HTML = r"""<!doctype html>
       }
       if (!items.some(item => item.id === restoreFocus)) restoreFocus = items.length ? items[0].id : "";
       [...restoreChecked].forEach(id => { if (!items.some(item => item.id === id)) restoreChecked.delete(id); });
+      // Music and echo removal run in WSL, so the tab works before restore_env is installed.
       $("restoreMissing").hidden = Boolean(restore.installed);
-      $("restoreEmpty").hidden = !restore.installed || items.length > 0;
-      $("restoreSteps").hidden = !restore.installed || !items.length;
-      $("restoreAddButton").disabled = !restore.installed;
+      LAVASR_IDS.forEach(id => { $(id).disabled = !restore.installed; });
+      $("restoreEmpty").hidden = items.length > 0;
+      $("restoreSteps").hidden = !items.length;
       // Redrawn only when the list or the recording in view changes, so focus stays put.
       const signature = restoreFocus + "|" + items.map(item => item.id).join(",");
       if (signature !== restoreListSignature) {
@@ -5754,7 +7408,7 @@ HTML = r"""<!doctype html>
       const running = status === "running";
       $("restoreRun").disabled = running || !restoreFocus;
       if (job) {
-        const progress = (job.lines || []).filter(line => /^(Loading|Restored|Failed|Done|\d+ of \d+ file)/.test(line)).slice(-1)[0] || "Starting...";
+        const progress = (job.lines || []).filter(line => /^(Loading|Downloading|Separated|Restored|Failed|Done|\d+ of \d+ file)/.test(line)).slice(-1)[0] || "Starting...";
         const failed = `${/ failed\.$/.test(progress) ? progress : "Failed."} See Logs for details.`;
         $("restoreStatus").textContent = running ? progress : (status === "done" ? "Done." : (status === "failed" ? failed : "Stopped."));
         $("restoreStatus").className = status === "failed" ? "status-line bad" : (status === "done" ? "status-line good" : "status-line");
@@ -5834,8 +7488,10 @@ HTML = r"""<!doctype html>
 
     function restoreSettings() {
       return {
-        denoise: $("restoreDenoise").checked,
-        enhance: $("restoreEnhance").checked,
+        music: $("restoreMusic").checked ? $("restoreMusicModel").value : "",
+        echo: $("restoreEcho").checked,
+        denoise: $("restoreDenoise").checked && !$("restoreDenoise").disabled,
+        enhance: $("restoreEnhance").checked && !$("restoreEnhance").disabled,
         quality: $("restoreQuality").value,
         keep_below: $("restoreKeep").value ? Number($("restoreKeep").value) * 1000 : null,
         model: $("restoreModel").value,
@@ -5896,9 +7552,13 @@ HTML = r"""<!doctype html>
     };
     $("restoreToDataset").onclick = async () => {
       if (!state || !(state.datasets || []).length) return showError("Create a dataset first, on the Train tab.");
-      const items = restoreTargets().map(restoreItem).filter(Boolean);
+      const chosen = restoreTargets().map(restoreItem).filter(Boolean);
+      const long = chosen.filter(item => Number(item.duration) > CUT_LONGER_THAN);
+      const items = chosen.filter(item => !long.includes(item));
       const files = [];
+      $("restoreToDataset").disabled = true;
       try {
+        if (long.length) await post("/api/dataset-cut-restored", {dataset_id: $("trainingDataset").value, item_ids: long.map(item => item.id)});
         for (const item of items) {
           const response = await fetch(item.url);
           if (!response.ok) throw new Error(`${item.name} could not be loaded. It may have been deleted.`);
@@ -5906,12 +7566,16 @@ HTML = r"""<!doctype html>
         }
       } catch (error) {
         return showError(error.message);
+      } finally {
+        $("restoreToDataset").disabled = false;
       }
       datasetUploadFiles.push(...files);
       renderDatasetUploads();
+      queueTranscripts(files);
       setTrainingMode("train");
+      if (long.length) refresh();
       $("clipsStep").scrollIntoView({block: "start"});
-      $("datasetUploadProgress").textContent = `${items.length} restored recording${items.length === 1 ? "" : "s"} ready. Check each transcript, then press Add Files to Dataset.`;
+
     };
     $("restoreDownload").onclick = () => {
       const item = restoreItem(restoreFocus);
@@ -5960,6 +7624,7 @@ def main():
             stream.reconfigure(encoding="utf-8", errors="replace")
     log(f"Local Voice UI starting on http://localhost:{port}")
     threading.Thread(target=kill_orphan_restore_workers, daemon=True).start()
+    threading.Thread(target=clean_old_temp_files, daemon=True).start()
     if CONFIG_ERROR:
         log(CONFIG_ERROR)
     server = DashboardServer(("127.0.0.1", port), Handler)
@@ -5968,9 +7633,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        for key in ("ptt-helper", "relay-asr", "restore"):
+        for key in ("ptt-helper", "relay-asr", "restore", "dataset-cut", "compare"):
             proc = JOBS.get(key)
-            if proc and proc.process and proc.process.poll() is None:
+            if proc and proc.running():
                 proc.stop()
         if API_PROCESS and API_PROCESS.process and API_PROCESS.process.poll() is None:
             stop_api()
