@@ -868,6 +868,96 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual([epoch for epoch, _ in dashboard.model_epochs("joe", "sovits")], [8, 16])
             self.assertEqual(dashboard.model_epochs("nobody", "sovits"), [])
 
+    def test_v2proplus_trains_with_its_own_decoder_and_folder(self):
+        dashboard.write_s2_config(1, 1, 1, "joe")
+        pro = json.loads((self.root / "TEMP/joe_s2.json").read_text())
+        dashboard.write_s2_config(1, 1, 1, "joe", version="v2ProPlus")
+        plus = json.loads((self.root / "TEMP/joe_s2.json").read_text())
+        # GPT-SoVITS's s2v2ProPlus.json differs from s2v2Pro.json in the decoder alone.
+        self.assertEqual((plus["model"]["upsample_initial_channel"], plus["model"]["upsample_kernel_sizes"]), (768, [20, 16, 8, 2, 2]))
+        self.assertEqual((pro["model"]["upsample_initial_channel"], pro["model"]["upsample_kernel_sizes"]), (512, [16, 16, 8, 2, 2]))
+        self.assertEqual((plus["version"], plus["model"]["version"], plus["save_weight_dir"]), ("v2ProPlus", "v2ProPlus", "SoVITS_weights_v2ProPlus"))
+        self.assertEqual(plus["train"]["pretrained_s2G"], "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth")
+        self.assertEqual(plus["train"]["pretrained_s2D"], "GPT_SoVITS/pretrained_models/v2Pro/s2Dv2ProPlus.pth")
+        for config in (pro, plus):
+            config["model"].pop("upsample_initial_channel"), config["model"].pop("upsample_kernel_sizes")
+            for key in ("pretrained_s2G", "pretrained_s2D"):
+                config["train"].pop(key)
+            for key in ("version", "save_weight_dir"):
+                config.pop(key)
+            config["model"].pop("version")
+        self.assertEqual(pro, plus)
+
+        ok, missing = subprocess.CompletedProcess([], 0, "", ""), subprocess.CompletedProcess([], 1, "", "")
+        with (
+            patch.object(dashboard, "dataset_descriptor", return_value={"name": "Test"}),
+            patch.object(dashboard, "free_gpu_for"),
+            patch.object(dashboard.ManagedProcess, "start"),
+        ):
+            # An older GPT-SoVITS without the v2ProPlus models says so before training starts.
+            with patch.object(dashboard, "run_wsl", side_effect=[ok, missing]):
+                with self.assertRaisesRegex(RuntimeError, "missing the pretrained v2ProPlus models"):
+                    dashboard.start_train("sovits", 1, 1, 1, "test", "joe", "v2ProPlus")
+            self.assertNotIn("train-sovits", dashboard.JOBS)
+            with self.assertRaisesRegex(RuntimeError, "Choose v2Pro or v2ProPlus"):
+                dashboard.start_train("sovits", 1, 1, 1, "test", "joe", "v4")
+            with patch.object(dashboard, "run_wsl", return_value=ok):
+                dashboard.start_train("sovits", 1, 1, 1, "test", "joe", "v2ProPlus")
+        self.assertEqual(dashboard.JOBS["train-sovits"].name, "SoVITS training: joe (v2ProPlus)")
+        self.assertEqual(json.loads((self.root / "TEMP/joe_s2.json").read_text())["version"], "v2ProPlus")
+
+    def test_each_version_has_its_own_epochs(self):
+        for folder, name in [("SoVITS_weights_v2Pro", "joe_e4_s10.pth"), ("SoVITS_weights_v2Pro", "joe_e8_s20.pth"),
+                             ("SoVITS_weights_v2ProPlus", "joe_e4_s10.pth"), ("GPT_weights_v2Pro", "joe-e5.ckpt"),
+                             ("GPT_SoVITS/pretrained_models/v2Pro", "s2Gv2Pro.pth"), ("GPT_SoVITS/pretrained_models/v2Pro", "s2Gv2ProPlus.pth")]:
+            (self.root / folder).mkdir(parents=True, exist_ok=True)
+            (self.root / folder / name).write_bytes(b"x")
+        models = dashboard.model_files()
+        self.assertEqual([(row["path"], row["version"]) for row in models["sovits"][-2:]],
+                         [("GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth", "v2Pro"), ("GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth", "v2ProPlus")])
+        self.assertEqual(dashboard.model_epochs("joe", "sovits"), [(4, "SoVITS_weights_v2Pro/joe_e4_s10.pth"), (8, "SoVITS_weights_v2Pro/joe_e8_s20.pth")])
+        self.assertEqual(dashboard.model_epochs("joe", "sovits", "v2ProPlus"), [(4, "SoVITS_weights_v2ProPlus/joe_e4_s10.pth")])
+        self.assertEqual(dashboard.model_epochs("joe", "gpt", "v2ProPlus"), [(5, "GPT_weights_v2Pro/joe-e5.ckpt")])
+
+    def test_gpt_epochs_are_compared_with_a_trained_sovits_of_either_version(self):
+        for folder, name in [("GPT_weights_v2Pro", "joe-e5.ckpt"), ("SoVITS_weights_v2Pro", "joe_e8_s20.pth"),
+                             ("GPT_SoVITS/pretrained_models/v2Pro", "s2Gv2ProPlus.pth")]:
+            (self.root / folder).mkdir(parents=True, exist_ok=True)
+            (self.root / folder / name).write_bytes(b"x")
+        reference = {"id": "ref", "text": "Hello.", "lang": "en", "wsl_path": "/d/ref.wav"}
+        with (
+            patch.object(dashboard, "dataset_descriptor", return_value={"id": "joe", "language": "en"}),
+            patch.object(dashboard, "parse_references", return_value=[reference]),
+            patch.object(dashboard, "wake_wsl"),
+            patch.object(dashboard, "compare_epochs") as compare,
+        ):
+            for version in ("v2ProPlus", "v2Pro"):
+                with self.subTest(version=version):
+                    dashboard.start_compare("joe", "gpt", "joe", "ref.wav", "Hi.", version)
+                    dashboard.JOBS["compare"].thread.join(5)
+                    # No v2ProPlus SoVITS is trained, so the trained v2Pro one speaks, not the pretrained v2ProPlus.
+                    self.assertEqual(compare.call_args.args[1]["other"], "SoVITS_weights_v2Pro/joe_e8_s20.pth")
+
+    def test_a_v2proplus_voice_is_installed_with_its_version(self):
+        datasets = self.root / "datasets"
+        datasets.mkdir()
+        archive = self.root / "voice.zip"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("voice.json", json.dumps({"format": 1, "name": "Joe", "language": "en", "version": "v2ProPlus", "gpt": "joe.ckpt", "sovits": "joe.pth",
+                                                      "reference": {"file": "reference.wav", "text": "Hello.", "language": "en"}, "extra_references": []}))
+            bundle.writestr("models/joe.ckpt", b"gpt")
+            bundle.writestr("models/joe.pth", b"sovits")
+            bundle.writestr("reference.wav", b"audio")
+        with (
+            patch.object(dashboard, "DATASETS_DIR", datasets),
+            patch.object(dashboard, "run_wsl", return_value=subprocess.CompletedProcess([], 0, "", "")),
+            patch.object(dashboard, "convert_audio", side_effect=lambda source, target, sample_rate=44100: shutil.copyfile(source, target)),
+            patch.object(dashboard, "model_files"),
+        ):
+            result = dashboard.import_voice(archive)
+        self.assertEqual((result["gpt"], result["sovits"]), ("GPT_weights_v2Pro/joe.ckpt", "SoVITS_weights_v2ProPlus/joe.pth"))
+        self.assertEqual((self.root / "SoVITS_weights_v2ProPlus" / "joe.pth").read_bytes(), b"sovits")
+
     def test_a_voice_survives_export_and_import(self):
         dataset_id = self.make_dataset()
         root = dashboard.DATASETS_DIR / dataset_id
@@ -893,8 +983,8 @@ class DashboardTests(unittest.TestCase):
         with zipfile.ZipFile(path) as bundle:
             self.assertEqual(sorted(bundle.namelist()), ["extra-1.wav", "models/joe-e10.ckpt", "models/joe_e8_s1.pth", "reference.wav", "voice.json"])
             manifest = json.loads(bundle.read("voice.json"))
-        self.assertEqual((manifest["name"], manifest["language"], manifest["reference"]["text"], manifest["extra_references"][0]["text"]),
-                         ("Clip Test", "en", "Reference words.", "More words."))
+        self.assertEqual((manifest["name"], manifest["language"], manifest["version"], manifest["reference"]["text"], manifest["extra_references"][0]["text"]),
+                         ("Clip Test", "en", "v2Pro", "Reference words.", "More words."))
         with self.assertRaisesRegex(RuntimeError, "reference clip of 3 to 10 seconds"):
             dashboard.export_voice("GPT_weights_v2Pro/joe-e10.ckpt", "SoVITS_weights_v2Pro/joe_e8_s1.pth", dataset_id, "more", "", [])
         with self.assertRaisesRegex(RuntimeError, "Choose a GPT and a SoVITS model"):
@@ -919,6 +1009,250 @@ class DashboardTests(unittest.TestCase):
             bundle.writestr("voice.json", json.dumps({**manifest, "version": "v4"}))
         with self.assertRaisesRegex(RuntimeError, "GPT-SoVITS v4"):
             dashboard.import_voice(self.root / "tmp" / "other.zip")
+
+    def write_speech(self, path, background=20, loud=8000, clip_at=None, seconds=3.0, rate=44100):
+        """Speech-like audio: half-second bursts with pauses, over a background of the given level."""
+        rng = __import__("random").Random(7)
+        samples = []
+        for i in range(int(rate * seconds)):
+            value = rng.uniform(-background, background)
+            if (i // (rate // 2)) % 2 == 0:
+                value += loud * ((i // 40) % 2 * 2 - 1)
+            if clip_at:
+                value = max(-clip_at, min(clip_at, value)) * 32767 / clip_at
+            samples.append(int(max(-32768, min(32767, value))))
+        with wave.open(str(path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(rate)
+            wav.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+
+    def test_transcripts_are_compared_by_their_words(self):
+        self.assertEqual(dashboard.transcript_difference("Please, remain calm!", "please remain calm", "en"), 0.0)
+        self.assertEqual(dashboard.transcript_difference("Please remain calm now.", "Change remain calm now.", "en"), 0.25)
+        self.assertEqual(dashboard.transcript_difference("Up to 1210 degrees.", "Up to 1,210 degrees.", "en"), 0.0)
+        self.assertEqual(dashboard.transcript_difference("Hello there.", "", "en"), 1.0)
+        self.assertEqual(dashboard.transcript_difference("", "", "en"), 0.0)
+        # Chinese has no spaces between words, so its characters are compared.
+        self.assertEqual(dashboard.transcript_difference("你好，世界。", "你好世界", "zh"), 0.0)
+        self.assertEqual(dashboard.transcript_difference("你好世界", "你好地界", "zh"), 0.25)
+        # Korean spacing varies, so its letters are compared.
+        self.assertEqual(dashboard.transcript_difference("안녕하세요 세계", "안녕 하세요 세계", "ko"), 0.0)
+
+    def test_clip_sound_finds_noise_quiet_and_clipping(self):
+        cases = {"clean": {}, "noisy": {"background": 3000}, "quiet": {"loud": 200, "background": 2},
+                 "clipped": {"clip_at": 4000}}
+        sounds = {}
+        for name, options in cases.items():
+            self.write_speech(self.root / f"{name}.wav", **options)
+            sounds[name] = dashboard.clip_sound(self.root / f"{name}.wav")
+        self.assertGreater(sounds["clean"]["speech_db"], dashboard.CHECK_NOISE_DB)
+        self.assertLess(sounds["noisy"]["speech_db"], dashboard.CHECK_NOISE_DB)
+        self.assertGreater(sounds["noisy"]["speech_db"], dashboard.CHECK_FLAT_DB)
+        # A steady tone has no speech standing out at all.
+        self.write_wav(self.root / "tone.wav", 2.0)
+        self.assertLess(dashboard.clip_sound(self.root / "tone.wav")["speech_db"], dashboard.CHECK_FLAT_DB)
+        self.assertLess(sounds["quiet"]["peak_db"], dashboard.CHECK_QUIET_DB)
+        self.assertGreater(sounds["clean"]["peak_db"], dashboard.CHECK_QUIET_DB)
+        self.assertGreaterEqual(sounds["clipped"]["clipped"], dashboard.CHECK_CLIPPED_PLACES)
+        self.assertEqual(sounds["clean"]["clipped"], 0)
+        (self.root / "broken.wav").write_bytes(b"RIFF nonsense")
+        self.assertIsNone(dashboard.clip_sound(self.root / "broken.wav"))
+        # A file cut short in the middle of a sample is still measured.
+        data = (self.root / "clean.wav").read_bytes()
+        (self.root / "cut.wav").write_bytes(data[:-1])
+        self.assertGreater(dashboard.clip_sound(self.root / "cut.wav")["speech_db"], dashboard.CHECK_NOISE_DB)
+
+    def test_the_check_names_each_clip_to_look_at(self):
+        dataset_id = self.make_dataset()
+        root = dashboard.DATASETS_DIR / dataset_id
+        for name, options, text in [("good", {}, "Good words."), ("noisy", {"background": 3000}, "Noisy words."),
+                                    ("clipped", {"clip_at": 4000}, "Clipped words."), ("again", {}, "Good words."),
+                                    ("wrong", {"seconds": 2.0}, "Something else entirely.")]:
+            self.write_speech(self.root / f"{name}.wav", **options)
+            dashboard.add_dataset_clip(root, self.root / f"{name}.wav", name, f"{name}.wav", text)
+        heard = {"good.wav": "Good words.", "noisy.wav": "Noisy words.", "clipped.wav": "Clipped words.", "again.wav": "Good words.",
+                 "wrong.wav": "Not what it says."}
+        with patch.object(dashboard, "transcribe_dataset_wav", side_effect=lambda path, language: heard[Path(path).name]):
+            dashboard.start_dataset_check(dataset_id)
+            job = dashboard.JOBS["dataset-check"]
+            job.thread.join(timeout=60)
+        self.assertEqual(job.status, "done", job.lines)
+        found = {row["wav"]: row for row in job.results}
+        self.assertEqual(sorted(found), ["again.wav", "clipped.wav", "noisy.wav", "wrong.wav"])
+        self.assertIn("Loud background", found["noisy.wav"]["problems"][0])
+        self.assertIn("Distorted", found["clipped.wav"]["problems"][0])
+        self.assertEqual(found["again.wav"]["problems"], ["The same audio as good.wav."])
+        self.assertEqual((found["wrong.wav"]["problems"], found["wrong.wav"]["heard"]),
+                         (["The transcript differs from what speech recognition hears."], "Not what it says."))
+        self.assertIsNone(found["noisy.wav"]["heard"])
+        self.assertEqual(job.lines[-1], "Done. 4 of 5 clips need a look.")
+        with patch.object(dashboard, "transcribe_dataset_wav", side_effect=lambda path, language: time.sleep(0.2) or "Words."):
+            dashboard.start_dataset_check(dataset_id)
+            with self.assertRaisesRegex(RuntimeError, "already running"):
+                dashboard.start_dataset_check(dataset_id)
+            dashboard.JOBS["dataset-check"].stop()
+        self.assertEqual(dashboard.JOBS["dataset-check"].status, "stopped")
+
+    def make_speaking_voice(self):
+        """A dataset with a reference clip that has spoken on Text to Voice."""
+        dataset_id = self.make_dataset()
+        for folder, name in [("GPT_weights_v2Pro", "joe-e10.ckpt"), ("SoVITS_weights_v2Pro", "joe_e8_s1.pth")]:
+            (self.root / folder).mkdir(parents=True, exist_ok=True)
+            (self.root / folder / name).write_bytes(b"weights")
+        root = dashboard.DATASETS_DIR / dataset_id
+        self.write_wav(self.root / "ref.wav", 4.0)
+        dashboard.add_dataset_clip(root, self.root / "ref.wav", "ref", "ref.wav", "Reference words.")
+        dashboard.save_speech_settings(dataset_id, dashboard.speech_settings_from_generation({
+            "gpt": "GPT_weights_v2Pro/joe-e10.ckpt", "sovits": "SoVITS_weights_v2Pro/joe_e8_s1.pth",
+            "ref_audio_path": "/home/me/datasets/clip-test/wavs/ref.wav", "aux_ref_audio_paths": [],
+            "prompt_text": "Reference words.", "text_lang": "en", "top_k": "20", "speed_factor": "1.1", "seed": "-1",
+        }))
+        return dataset_id
+
+    def fake_engine(self, sent):
+        wav = io.BytesIO()
+        with wave.open(wav, "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(32000)
+            out.writeframes(struct.pack("<3200h", *[3000 * ((i // 20) % 2 * 2 - 1) for i in range(3200)]))
+
+        def urlopen(request, timeout=None):
+            sent.append(json.loads(request.data))
+            return contextlib.nullcontext(io.BytesIO(wav.getvalue()))
+
+        return urlopen
+
+    def test_a_voice_speaks_for_other_programs_as_on_text_to_voice(self):
+        dataset_id = self.make_speaking_voice()
+        self.assertEqual(dashboard.speech_voices(), [{"id": dataset_id, "name": "Clip Test"}])
+        sent = []
+        with (
+            patch.object(dashboard, "api_ready", return_value=True),
+            patch.object(dashboard, "set_api_weights") as weights,
+            patch.object(dashboard.urllib.request, "urlopen", self.fake_engine(sent)),
+        ):
+            audio, content_type = dashboard.speak_for_api({"input": " Hello  there. ", "voice": "clip test", "response_format": "wav", "speed": 2})
+        self.assertEqual((audio[:4], content_type), (b"RIFF", "audio/wav"))
+        weights.assert_called_once_with("GPT_weights_v2Pro/joe-e10.ckpt", "SoVITS_weights_v2Pro/joe_e8_s1.pth")
+        payload = sent[0]
+        self.assertEqual((payload["text"], payload["prompt_text"], payload["top_k"], payload["speed_factor"]), ("Hello there.", "Reference words.", 20, 2.2))
+        self.assertTrue(payload["ref_audio_path"].endswith("/clip-test/wavs/ref.wav"))
+        for body, message in [({"input": "", "voice": dataset_id}, "input is empty"), ({"input": "Hi.", "voice": "alloy"}, "no voice named 'alloy'"),
+                              ({"input": "Hi.", "voice": dataset_id, "response_format": "ogg"}, "response_format must be"),
+                              ({"input": "Hi.", "voice": dataset_id, "speed": 9}, "speed must be")]:
+            with self.subTest(body=body), self.assertRaisesRegex(dashboard.SpeechApiError, message):
+                dashboard.speak_for_api(body)
+        # Nothing starts the engine while training uses the GPU.
+        with patch.object(dashboard, "api_ready", return_value=False), patch.object(dashboard, "gpu_busy", return_value=True), \
+                patch.object(dashboard, "start_api") as start_api:
+            with self.assertRaisesRegex(dashboard.SpeechApiError, "Training or another GPU job"):
+                dashboard.speak_for_api({"input": "Hi.", "voice": dataset_id})
+            start_api.assert_not_called()
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "Needs ffmpeg")
+    def test_speech_comes_in_the_format_asked_for(self):
+        dataset_id = self.make_speaking_voice()
+        with (
+            patch.object(dashboard, "api_ready", return_value=True),
+            patch.object(dashboard, "set_api_weights"),
+            patch.object(dashboard.urllib.request, "urlopen", self.fake_engine([])),
+        ):
+            mp3, mp3_type = dashboard.speak_for_api({"input": "Hi.", "voice": dataset_id})
+            pcm, pcm_type = dashboard.speak_for_api({"input": "Hi.", "voice": dataset_id, "response_format": "pcm"})
+        self.assertEqual(mp3_type, "audio/mpeg")
+        self.assertTrue(mp3.startswith(b"ID3") or mp3[0] == 0xFF)
+        # A tenth of a second at 32 kHz becomes 2400 samples at OpenAI's 24 kHz.
+        self.assertEqual((pcm_type, abs(len(pcm) // 2 - 2400) < 50), ("audio/pcm", True))
+
+    def test_the_speech_api_answers_in_openai_shape(self):
+        dataset_id = self.make_speaking_voice()
+        port = self.start_server()
+        status, _, body = self.request(port, "GET", "/v1/audio/voices", Host=f"127.0.0.1:{port}")
+        self.assertEqual((status, json.loads(body)), (200, {"voices": [{"id": dataset_id, "name": "Clip Test"}]}))
+        status, _, body = self.request(port, "GET", "/v1/models", Host=f"localhost:{port}")
+        self.assertEqual(json.loads(body)["data"][0]["id"], "gpt-sovits")
+        status, _, body = self.request(port, "POST", "/v1/audio/speech", body=json.dumps({"input": "Hi.", "voice": "nobody"}), Host=f"127.0.0.1:{port}")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["error"]["param"], "voice")
+        # Programs in Docker name this PC host.docker.internal; the dashboard itself stays local.
+        self.assertEqual(self.request(port, "GET", "/v1/audio/voices", Host=f"host.docker.internal:{port}")[0], 200)
+        self.assertEqual(self.request(port, "GET", "/api/state", Host=f"host.docker.internal:{port}")[0], 403)
+        self.assertEqual(self.request(port, "GET", "/v1/audio/voices", Host=f"evil.example:{port}")[0], 403)
+        with patch.object(dashboard, "SPEECH_API_KEY", "secret"):
+            speech = json.dumps({"input": "Hi.", "voice": "nobody"})
+            status, _, body = self.request(port, "POST", "/v1/audio/speech", body=speech, Host=f"127.0.0.1:{port}", Authorization="Bearer wrong")
+            self.assertEqual((status, json.loads(body)["error"]["type"]), (401, "invalid_request_error"))
+            self.assertEqual(self.request(port, "POST", "/v1/audio/speech", body=speech, Host=f"127.0.0.1:{port}", Authorization="Bearer secret")[0], 400)
+            # Open WebUI lists the voices without the key.
+            self.assertEqual(self.request(port, "GET", "/v1/audio/voices", Host=f"127.0.0.1:{port}")[0], 200)
+        # A body that is not a JSON object is the client's mistake.
+        for body in ["not json", "[1, 2]", json.dumps({"input": ["a", "b"], "voice": dataset_id})]:
+            with self.subTest(body=body):
+                status, _, answer = self.request(port, "POST", "/v1/audio/speech", body=body, Host=f"127.0.0.1:{port}")
+                self.assertEqual((status, json.loads(answer)["error"]["type"]), (400, "invalid_request_error"))
+
+    def test_a_voice_whose_model_is_gone_says_so(self):
+        dataset_id = self.make_speaking_voice()
+        (self.root / "SoVITS_weights_v2Pro" / "joe_e8_s1.pth").unlink()
+        with patch.object(dashboard, "api_ready", return_value=True), patch.object(dashboard, "set_api_weights") as weights:
+            with self.assertRaisesRegex(dashboard.SpeechApiError, "SoVITS model of Clip Test, SoVITS_weights_v2Pro/joe_e8_s1.pth, is no longer"):
+                dashboard.speak_for_api({"input": "Hi.", "voice": dataset_id})
+        weights.assert_not_called()
+
+    def test_the_reference_text_follows_its_clip_unless_edited(self):
+        dataset_id = self.make_speaking_voice()
+        settings = json.loads((dashboard.DATASETS_DIR / dataset_id / "speech.json").read_text(encoding="utf-8"))
+        # Text to Voice sent the clip's own transcript, so a later correction of the clip counts.
+        self.assertNotIn("prompt_text", settings)
+        dashboard.update_dataset_clip(dataset_id, "ref.wav", "Corrected words.")
+        sent = []
+        with patch.object(dashboard, "api_ready", return_value=True), patch.object(dashboard, "set_api_weights"), \
+                patch.object(dashboard.urllib.request, "urlopen", self.fake_engine(sent)):
+            dashboard.speak_for_api({"input": "Hi.", "voice": dataset_id, "response_format": "wav"})
+            self.assertEqual(sent[-1]["prompt_text"], "Corrected words.")
+            # A reference text edited on Text to Voice is kept.
+            dashboard.save_speech_settings(dataset_id, {**settings, "prompt_text": "Edited words."})
+            dashboard.speak_for_api({"input": "Hi.", "voice": dataset_id, "response_format": "wav"})
+            self.assertEqual(sent[-1]["prompt_text"], "Edited words.")
+
+    def test_the_check_goes_on_when_a_clip_is_deleted_meanwhile(self):
+        dataset_id = self.make_dataset()
+        root = dashboard.DATASETS_DIR / dataset_id
+        for name in ("a", "b", "c"):
+            # Lengths differ, so no clip is the same audio as another.
+            self.write_speech(self.root / f"{name}.wav", seconds=1.5 + ord(name) / 100)
+            dashboard.add_dataset_clip(root, self.root / f"{name}.wav", name, f"{name}.wav", f"Words {name}.")
+        heard = []
+
+        def transcribe(path, language):
+            if Path(path).name == "a.wav":
+                dashboard.delete_dataset_clip(dataset_id, "b.wav")
+            Path(path).read_bytes()
+            heard.append(Path(path).name)
+            return f"Words {Path(path).stem}."
+
+        with patch.object(dashboard, "transcribe_dataset_wav", side_effect=transcribe):
+            dashboard.start_dataset_check(dataset_id)
+            job = dashboard.JOBS["dataset-check"]
+            job.thread.join(timeout=30)
+        self.assertEqual((job.status, heard, job.lines[-1]), ("done", ["a.wav", "c.wav"], "Done. No problems found in 3 clips."))
+
+    def test_cantonese_transcripts_are_compared_only_with_large_v3(self):
+        self.make_dataset()
+        dataset_id = dashboard.create_dataset("Yue", language="yue")["id"]
+        root = dashboard.DATASETS_DIR / dataset_id
+        self.write_speech(self.root / "a.wav")
+        dashboard.add_dataset_clip(root, self.root / "a.wav", "a", "a.wav", "你哋好。")
+        for model, compared in [("", False), ("large-v3", True)]:
+            with self.subTest(model=model), patch.object(dashboard, "DATASET_ASR_MODEL", model), \
+                    patch.object(dashboard, "transcribe_dataset_wav", return_value="你们好。") as transcribe:
+                dashboard.start_dataset_check(dataset_id)
+                job = dashboard.JOBS["dataset-check"]
+                job.thread.join(timeout=30)
+                self.assertEqual(transcribe.called, compared)
+                self.assertEqual("large-v3 dataset_asr_model" in job.lines[-1], not compared, job.lines[-1])
 
     def test_cutting_finds_sparse_speech_and_splits_long_speech(self):
         rng = __import__("random").Random(3)

@@ -1,4 +1,4 @@
-$projectRoot = $PSScriptRoot
+$projectRoot = Split-Path -Parent $PSScriptRoot
 
 $config = $null
 $configPath = Join-Path $projectRoot 'config.json'

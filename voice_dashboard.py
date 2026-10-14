@@ -1,9 +1,12 @@
+import array
 import json
 import base64
 import contextlib
 import ctypes
 import hashlib
+import hmac
 import io
+import math
 import os
 import re
 import shutil
@@ -13,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -115,6 +119,9 @@ GPU_JOBS = ("dataset-prepare", "train-sovits", "train-gpt")
 MIN_REFERENCE_SECONDS = 3.0
 MAX_REFERENCE_SECONDS = 10.0
 LANGUAGES = {"en", "zh", "ja", "ko", "yue"}
+# SoVITS model versions. v2ProPlus has a larger decoder. Both share the GPT model and the features
+# that preparation extracts, as their pretrained models have the same quantizer.
+SOVITS_VERSIONS = ("v2Pro", "v2ProPlus")
 MODEL_LIST = {"checked_at": 0.0, "listed": False, "models": {"gpt": [], "sovits": []}}
 
 APP_LOG = []
@@ -560,29 +567,39 @@ def parse_references(dataset_id, valid_only=True):
     return refs
 
 
+def sovits_version(path):
+    """The version of a SoVITS model, from its folder or the name of a pretrained one."""
+    return "v2ProPlus" if "v2ProPlus" in str(path) else "v2Pro"
+
+
 def model_files():
-    def collect(folder, pattern):
-        base = WSL_GSV_WIN / folder
+    def collect(folders, pattern):
         rows = []
-        try:
-            for path in base.glob(pattern):
-                if path.is_file():
-                    rows.append(
-                        {
-                            "name": path.name,
-                            "path": f"{folder}/{path.name}",
-                            "mtime": path.stat().st_mtime,
-                            "size_mb": round(path.stat().st_size / (1024 * 1024), 1),
-                        }
-                    )
-        except OSError:
-            pass
+        for folder in folders:
+            try:
+                for path in (WSL_GSV_WIN / folder).glob(pattern):
+                    if path.is_file():
+                        rows.append(
+                            {
+                                "name": path.name,
+                                "path": f"{folder}/{path.name}",
+                                "version": sovits_version(f"{folder}/{path.name}"),
+                                "mtime": path.stat().st_mtime,
+                                "size_mb": round(path.stat().st_size / (1024 * 1024), 1),
+                            }
+                        )
+            except OSError:
+                pass
         rows.sort(key=lambda row: row["mtime"], reverse=True)
         return rows
 
+    # Trained models first, newest first, then the pretrained ones they start from.
     models = {
-        "gpt": collect("GPT_weights_v2Pro", "*.ckpt") + collect("GPT_SoVITS/pretrained_models", "s1v3.ckpt"),
-        "sovits": collect("SoVITS_weights_v2Pro", "*.pth") + collect("GPT_SoVITS/pretrained_models/v2Pro", "s2Gv2Pro.pth"),
+        "gpt": collect([f"GPT_weights_{version}" for version in SOVITS_VERSIONS], "*.ckpt")
+        + collect(["GPT_SoVITS/pretrained_models"], "s1v3.ckpt"),
+        "sovits": collect([f"SoVITS_weights_{version}" for version in SOVITS_VERSIONS], "*.pth")
+        + collect(["GPT_SoVITS/pretrained_models/v2Pro"], "s2Gv2Pro.pth")
+        + collect(["GPT_SoVITS/pretrained_models/v2Pro"], "s2Gv2ProPlus.pth"),
     }
     MODEL_LIST.update(models=models, checked_at=time.time(), listed=True)
     return models
@@ -912,6 +929,161 @@ def delete_dataset_clip(dataset_id, wav):
     log(f"Deleted {wav} from dataset {descriptor['name']}.")
 
 
+# Dataset check. Measured on clean game recordings, speech stood 20 dB or more above the quietest
+# moments of each clip, and noise 10 dB below the speech brought that to about 17 dB.
+CHECK_NOISE_DB = 16
+# Less than this, and nothing stands out: a tone, a hum, or noise without speech.
+CHECK_FLAT_DB = 6
+CHECK_QUIET_DB = -30
+# Places where three or more samples in a row are at full volume, where the sound was cut off.
+CHECK_CLIPPED_PLACES = 10
+# The share of a transcript's words that speech recognition hears differently.
+CHECK_MISMATCH = 0.3
+
+
+def clip_sound(path):
+    """The loudest level of a 16-bit WAV clip in dB below full volume, how far its speech stands
+    above its quietest moments, the places where it is clipped, and a digest of its samples.
+    None when the file cannot be read."""
+    try:
+        with wave.open(str(path), "rb") as audio:
+            if audio.getsampwidth() != 2:
+                return None
+            rate = audio.getframerate() * audio.getnchannels()
+            frames = audio.readframes(audio.getnframes())
+    except (OSError, EOFError, wave.Error):
+        return None
+    # A file cut short can end in half a sample.
+    samples = array.array("h", frames[:len(frames) // 2 * 2])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    if not samples:
+        return None
+    step = max(1, int(rate * 0.02))
+    levels = sorted(
+        10 * math.log10(max(sum(x * x for x in samples[i:i + step]) / step, 1) / 32768 ** 2)
+        for i in range(0, max(1, len(samples) - step + 1), step)
+    )
+    clipped = run = rail = 0
+    for x in samples:
+        side = 1 if x >= 32760 else (-1 if x <= -32760 else 0)
+        if side and side == rail:
+            run += 1
+        else:
+            clipped += run >= 3
+            run, rail = (1, side) if side else (0, 0)
+    clipped += run >= 3
+    peak = max(max(samples), -min(samples))
+    return {
+        "peak_db": 20 * math.log10(max(peak, 1) / 32768),
+        # The loud 5 % of a clip is speech, and its quietest 10 % the background between words.
+        "speech_db": levels[int(len(levels) * 0.95)] - levels[int(len(levels) * 0.1)],
+        "clipped": clipped,
+        "digest": hashlib.sha1(samples.tobytes()).hexdigest(),
+    }
+
+
+def transcript_words(text, language):
+    """A transcript as words to compare, without case or punctuation; Chinese, Japanese and
+    Cantonese as characters, as they have no spaces between words, and Korean too, as its
+    spacing varies."""
+    text = unicodedata.normalize("NFKC", str(text or "")).lower()
+    # 1,210 and 1210 are one number.
+    text = re.sub(r"(?<=\d),(?=\d{3}\b)", "", text)
+    text = "".join(" " if unicodedata.category(char)[0] in "PS" else char for char in text)
+    if language in {"zh", "ja", "yue", "ko"}:
+        return [char for char in text if not char.isspace()]
+    return text.split()
+
+
+def transcript_difference(expected, heard, language):
+    """The words that differ between two transcripts, as a share of the expected words."""
+    expected, heard = transcript_words(expected, language), transcript_words(heard, language)
+    if not expected:
+        return 1.0 if heard else 0.0
+    previous = list(range(len(heard) + 1))
+    for i, word in enumerate(expected, 1):
+        current = [i]
+        for j, other in enumerate(heard, 1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (word != other)))
+        previous = current
+    return previous[-1] / len(expected)
+
+
+def start_dataset_check(dataset_id):
+    descriptor = dataset_descriptor(dataset_id)
+    with STATE_LOCK:
+        current = JOBS.get("dataset-check")
+        if current and current.running():
+            raise RuntimeError("A dataset check is already running.")
+        job = ThreadJob(f"Check {descriptor['name']}", lambda job: check_dataset(job, descriptor["id"]))
+        job.dataset_id = descriptor["id"]
+        job.results = []
+        JOBS["dataset-check"] = job
+        job.start()
+    log(f"Checking the clips of {descriptor['name']}.")
+
+
+def check_dataset(job, dataset_id):
+    """Find clips that can make a voice worse. Each clip with problems goes to job.results with
+    what was found, and, when its transcript differs, the words speech recognition heard."""
+    descriptor = dataset_descriptor(dataset_id)
+    clips = dataset_clips(dataset_id)["clips"]
+    found = {}
+
+    def flag(wav, problem, heard=None):
+        with STATE_LOCK:
+            if wav not in found:
+                found[wav] = {"wav": wav, "problems": [], "heard": None}
+                job.results.append(found[wav])
+            found[wav]["problems"].append(problem)
+            if heard is not None:
+                found[wav]["heard"] = heard
+
+    job.say(f"Checking the sound of {len(clips)} clips...")
+    first = {}
+    readable = []
+    for clip in clips:
+        job.check_stop()
+        sound = clip_sound(descriptor["root"] / "wavs" / clip["wav"])
+        if not sound:
+            flag(clip["wav"], "The file cannot be read.")
+            continue
+        readable.append(clip)
+        if sound["peak_db"] < CHECK_QUIET_DB:
+            flag(clip["wav"], f"Very quiet: its loudest moment is {-round(sound['peak_db'])} dB below full volume.")
+        elif sound["speech_db"] < CHECK_FLAT_DB:
+            flag(clip["wav"], "No speech stands out: the sound is about as loud from start to end.")
+        elif sound["speech_db"] < CHECK_NOISE_DB:
+            flag(clip["wav"], f"Loud background: the speech is only {round(sound['speech_db'])} dB above it. Restore audio can remove noise and music.")
+        if sound["clipped"] >= CHECK_CLIPPED_PLACES:
+            flag(clip["wav"], f"Distorted: the sound is cut off at full volume in {sound['clipped']} places.")
+        if sound["digest"] in first:
+            flag(clip["wav"], f"The same audio as {first[sound['digest']]}.")
+        else:
+            first[sound["digest"]] = clip["wav"]
+    language = descriptor["language"]
+    skipped = ""
+    if language == "yue" and "large-v3" not in dataset_asr_model(language):
+        # Whisper before large-v3 writes Cantonese as Mandarin, which would flag every transcript.
+        skipped = " Cantonese transcripts are compared only with a large-v3 dataset_asr_model in config.json."
+        readable = []
+    else:
+        job.say(f"Sound checked. Comparing transcripts with what speech recognition hears, 0 of {len(readable)}...")
+    for index, clip in enumerate(readable, 1):
+        job.check_stop()
+        try:
+            heard = transcribe_dataset_wav(descriptor["root"] / "wavs" / clip["wav"], language)
+        except FileNotFoundError:
+            # Deleted while the check runs.
+            continue
+        if transcript_difference(clip["text"], heard, language) >= CHECK_MISMATCH:
+            flag(clip["wav"], "The transcript differs from what speech recognition hears.", heard)
+        if index % 10 == 0 or index == len(readable):
+            job.say(f"Comparing transcripts with what speech recognition hears, {index} of {len(readable)}...")
+    job.say((f"Done. {len(found)} of {len(clips)} clips need a look." if found else f"Done. No problems found in {len(clips)} clips.") + skipped)
+
+
 # Dataset transcripts come from faster-whisper in the speech recognition server, with a larger
 # model than Mic to Voice uses, since a transcript is written once and should be exact.
 DATASET_ASR_MODEL = str(APP_CONFIG.get("dataset_asr_model") or "")
@@ -926,11 +1098,17 @@ def ensure_relay_asr():
     if relay_asr_ready():
         return
     start_relay_asr()
-    for _ in range(80):
+    # A cold start, as after booting, reads its libraries from disk and can take a minute.
+    for _ in range(480):
         if relay_asr_ready():
             return
+        with STATE_LOCK:
+            proc = JOBS.get("relay-asr")
+        if proc and not proc.running():
+            detail = " ".join(proc.lines[-3:])[-300:]
+            raise RuntimeError(f"Speech recognition stopped while starting. {detail}".strip())
         time.sleep(0.25)
-    raise RuntimeError("Speech recognition did not start. See Logs for details.")
+    raise RuntimeError("Speech recognition did not start within 2 minutes. See Logs for details.")
 
 
 def transcribe_dataset_wav(wav_path, language):
@@ -1990,9 +2168,10 @@ train_semantic_path: logs/{model_name}/6-name2semantic.tsv
     return f"{WSL_GSV_ROOT}/TEMP/{model_name}_s1.yaml"
 
 
-def write_s2_config(epochs, batch_size, save_every, model_name="voice-model", include_model_version=True):
+def write_s2_config(epochs, batch_size, save_every, model_name="voice-model", include_model_version=True, version="v2Pro"):
     runtime = voice_runtime()
     model_name = slugify(model_name, "voice-model")
+    plus = version == "v2ProPlus"
     config = {
         "train": {
             "log_interval": 100,
@@ -2012,8 +2191,8 @@ def write_s2_config(epochs, batch_size, save_every, model_name="voice-model", in
             "c_kl": 1.0,
             "text_low_lr_rate": 0.4,
             "grad_ckpt": False,
-            "pretrained_s2G": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth",
-            "pretrained_s2D": "GPT_SoVITS/pretrained_models/v2Pro/s2Dv2Pro.pth",
+            "pretrained_s2G": f"GPT_SoVITS/pretrained_models/v2Pro/s2G{version}.pth",
+            "pretrained_s2D": f"GPT_SoVITS/pretrained_models/v2Pro/s2D{version}.pth",
             "if_save_latest": True,
             "if_save_every_weights": True,
             "save_every_epoch": int(save_every),
@@ -2046,20 +2225,21 @@ def write_s2_config(epochs, batch_size, save_every, model_name="voice-model", in
             "resblock_kernel_sizes": [3, 7, 11],
             "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
             "upsample_rates": [10, 8, 2, 2, 2],
-            "upsample_initial_channel": 512,
-            "upsample_kernel_sizes": [16, 16, 8, 2, 2],
+            # GPT-SoVITS's configs/s2v2ProPlus.json differs from s2v2Pro.json only in these two.
+            "upsample_initial_channel": 768 if plus else 512,
+            "upsample_kernel_sizes": [20 if plus else 16, 16, 8, 2, 2],
             "n_layers_q": 3,
             "use_spectral_norm": False,
             "gin_channels": 1024,
             "semantic_frame_rate": "25hz",
             "freeze_quantizer": True,
-            "version": "v2Pro",
+            "version": version,
         },
         "s2_ckpt_dir": f"logs/{model_name}",
         "content_module": "cnhubert",
-        "save_weight_dir": "SoVITS_weights_v2Pro",
+        "save_weight_dir": f"SoVITS_weights_{version}",
         "name": model_name,
-        "version": "v2Pro",
+        "version": version,
     }
     if not include_model_version:
         config["model"].pop("version", None)
@@ -2319,8 +2499,10 @@ def prepare_tts_dataset_job(dataset_id, model_name):
     log(f"Preparing dataset {descriptor['name']} for model {model_name}.")
 
 
-def start_train(kind, epochs, batch_size, save_every, dataset_id="", model_name="voice-model"):
+def start_train(kind, epochs, batch_size, save_every, dataset_id="", model_name="voice-model", version="v2Pro"):
     descriptor = dataset_descriptor(dataset_id)
+    if version not in SOVITS_VERSIONS:
+        raise RuntimeError("Choose v2Pro or v2ProPlus.")
     if job_running(f"train-{kind}"):
         raise RuntimeError(f"{'GPT' if kind == 'gpt' else 'SoVITS'} training is already running.")
     refuse_gpu_conflicts("training")
@@ -2332,6 +2514,12 @@ def start_train(kind, epochs, batch_size, save_every, dataset_id="", model_name=
     )
     if check.returncode != 0:
         raise RuntimeError("Training features are missing. Run Sync & Prepare before starting training.")
+    if kind == "sovits" and version != "v2Pro":
+        pretrained = f"{WSL_GSV_ROOT}/GPT_SoVITS/pretrained_models/v2Pro"
+        check = run_wsl(f"test -s {shquote(f'{pretrained}/s2G{version}.pth')} -a -s {shquote(f'{pretrained}/s2D{version}.pth')}", timeout=15)
+        if check.returncode != 0:
+            raise RuntimeError(f"GPT-SoVITS is missing the pretrained {version} models, s2G{version}.pth and s2D{version}.pth in "
+                               "GPT_SoVITS/pretrained_models/v2Pro. Update GPT-SoVITS, or train v2Pro.")
     free_gpu_for("training")
     if kind == "gpt":
         config_path = write_s1_config(epochs, batch_size, save_every, model_name)
@@ -2342,13 +2530,15 @@ def start_train(kind, epochs, batch_size, save_every, dataset_id="", model_name=
         )
         name = f"GPT training: {model_name}"
     elif kind == "sovits":
-        config_path = write_s2_config(epochs, batch_size, save_every, model_name)
+        config_path = write_s2_config(epochs, batch_size, save_every, model_name, version=version)
         script = (
             voice_environment() + "ulimit -l 2097152; "
             f"cd {shquote(WSL_GSV_ROOT)} && "
+            # s2_train.py saves its checkpoints in this folder but does not create it.
+            f"mkdir -p {shquote(f'logs/{model_name}/logs_s2_{version}')} && "
             f"{shquote(WSL_PYTHON)} -s GPT_SoVITS/s2_train.py --config {shquote(config_path)}"
         )
-        name = f"SoVITS training: {model_name}"
+        name = f"SoVITS training: {model_name}" + (f" ({version})" if version != "v2Pro" else "")
     else:
         raise ValueError("Unknown training kind.")
     key = f"train-{kind}"
@@ -2392,7 +2582,7 @@ def export_voice(gpt, sovits, dataset_id, reference_id, prompt_text, extra_ids):
         "format": VOICE_FILE_FORMAT,
         "name": descriptor["name"],
         "language": descriptor["language"],
-        "version": "v2Pro",
+        "version": sovits_version(sovits),
         "gpt": Path(gpt).name,
         "sovits": Path(sovits).name,
         "reference": {"file": "reference.wav", "text": clean_transcript(prompt_text) or reference["text"], "language": reference["lang"]},
@@ -2451,8 +2641,9 @@ def import_voice(path):
             raise RuntimeError("This is not a voice file from Local Voice Systems.") from exc
         if manifest.get("format") != VOICE_FILE_FORMAT:
             raise RuntimeError("This voice file is from a newer version of Local Voice Systems. Update the dashboard.")
-        if manifest.get("version") != "v2Pro":
-            raise RuntimeError(f"This voice is for GPT-SoVITS {manifest.get('version')}, and the dashboard uses v2Pro.")
+        version = manifest.get("version")
+        if version not in SOVITS_VERSIONS:
+            raise RuntimeError(f"This voice is for GPT-SoVITS {version}, and the dashboard uses v2Pro and v2ProPlus.")
         gpt = f"models/{Path(str(manifest.get('gpt'))).name}"
         sovits = f"models/{Path(str(manifest.get('sovits'))).name}"
         references = [manifest.get("reference") or {}, *(manifest.get("extra_references") or [])][:10]
@@ -2466,7 +2657,7 @@ def import_voice(path):
                 or max(bundle.getinfo(gpt).file_size, bundle.getinfo(sovits).file_size) > 4 * 1024 ** 3):
             raise RuntimeError("The voice file holds files far larger than a voice needs.")
         gpt_path = install_weight(bundle, gpt, "GPT_weights_v2Pro")
-        sovits_path = install_weight(bundle, sovits, "SoVITS_weights_v2Pro")
+        sovits_path = install_weight(bundle, sovits, f"SoVITS_weights_{version}")
         name = str(manifest.get("name") or "Imported voice").strip()[:60] or "Imported voice"
         base, counter = name, 2
         while (DATASETS_DIR / dataset_id_for_name(name)).exists():
@@ -2497,27 +2688,206 @@ def import_voice(path):
     if result.returncode != 0:
         log(f"The imported voice's clips could not be synced: {result.stdout} {result.stderr}")
         raise RuntimeError("The voice was imported, but its clips could not be copied to WSL. Press Sync Only on Voice Training.")
+    save_speech_settings(dataset_id, {
+        "gpt": gpt_path, "sovits": sovits_path, "reference": "reference",
+        "extra_references": [f"extra-{index}" for index in range(1, len(references))],
+        "prompt_text": clean_transcript(references[0]["text"]), "text_lang": language_code(manifest.get("language")),
+    })
     model_files()
     log(f"Imported the voice {name}.")
     return {"dataset": dataset_id, "name": name, "gpt": gpt_path, "sovits": sovits_path, "reference": "reference"}
 
 
+# OpenAI-style speech for other programs on this PC: POST /v1/audio/speech, and the lists that
+# Open WebUI reads, GET /v1/audio/voices, /v1/audio/models and /v1/models. A voice speaks as it
+# last did on Text to Voice, with the models, reference clip and settings kept in speech.json.
+SPEECH_SETTINGS = "speech.json"
+SPEECH_API_KEY = str(APP_CONFIG.get("api_key") or "")
+SPEECH_MODEL = "gpt-sovits"
+SPEECH_FORMATS = {
+    "mp3": ("audio/mpeg", ["-f", "mp3", "-c:a", "libmp3lame", "-b:a", "128k"]),
+    "opus": ("audio/ogg", ["-f", "ogg", "-c:a", "libopus", "-b:a", "64k"]),
+    "aac": ("audio/aac", ["-f", "adts", "-c:a", "aac", "-b:a", "128k"]),
+    "flac": ("audio/flac", ["-f", "flac"]),
+    "wav": ("audio/wav", None),
+    # OpenAI's pcm: 24 kHz, 16-bit signed little-endian, one channel, no header.
+    "pcm": ("audio/pcm", ["-f", "s16le", "-ar", "24000", "-ac", "1"]),
+}
+SPEECH_TUNING = ("text_split_method", "seed", "top_k", "top_p", "temperature", "speed_factor", "fragment_interval", "repetition_penalty")
+
+
+class SpeechApiError(Exception):
+    """An error answered in OpenAI's shape."""
+
+    def __init__(self, status, message, kind="invalid_request_error", param=None):
+        super().__init__(message)
+        self.status = status
+        self.kind = kind
+        self.param = param
+
+    def body(self):
+        return {"error": {"message": str(self), "type": self.kind, "param": self.param, "code": None}}
+
+
+def save_speech_settings(dataset_id, settings):
+    """Keep how a voice last spoke on Text to Voice, for the speech API."""
+    try:
+        descriptor = dataset_descriptor(dataset_id)
+    except (RuntimeError, ValueError):
+        return
+    if not (settings.get("gpt") and settings.get("sovits") and settings.get("reference")):
+        return
+    reference = next((ref for ref in parse_references(descriptor["id"], valid_only=False) if ref["id"] == settings["reference"]), None)
+    if reference and clean_transcript(settings.get("prompt_text")) == clean_transcript(reference["text"]):
+        # Only a reference text edited on Text to Voice is kept. Otherwise the clip's transcript is
+        # read when the voice speaks, so a later correction of it counts.
+        settings = {key: value for key, value in settings.items() if key != "prompt_text"}
+    write_text_atomic(descriptor["root"] / SPEECH_SETTINGS, json.dumps(settings, indent=2))
+
+
+def speech_settings_from_generation(body):
+    return {
+        "gpt": str(body.get("gpt") or ""),
+        "sovits": str(body.get("sovits") or ""),
+        # Clips by name, so a voice still finds them if the datasets folder in WSL moves.
+        "reference": Path(str(body.get("ref_audio_path") or "")).stem,
+        "extra_references": [Path(str(path)).stem for path in body.get("aux_ref_audio_paths") or []],
+        "prompt_text": clean_transcript(body.get("prompt_text")),
+        "text_lang": language_code(body.get("text_lang")),
+        **{key: body[key] for key in SPEECH_TUNING if key in body},
+    }
+
+
+def speech_voices():
+    """The voices other programs can use: those that have spoken a line on Text to Voice."""
+    return [{"id": row["id"], "name": row["name"]} for row in list_datasets() if (DATASETS_DIR / row["id"] / SPEECH_SETTINGS).is_file()]
+
+
+def speech_voice(name):
+    wanted = str(name or "").strip().lower()
+    voices = speech_voices()
+    voice = next((row for row in voices if wanted in {row["id"].lower(), row["name"].lower()}), None)
+    if not voice:
+        names = ", ".join(row["id"] for row in voices) or "none yet. Speak a line with a voice on Text to Voice first"
+        raise SpeechApiError(400, f"There is no voice named {name!r}. Voices: {names}.", param="voice")
+    return voice
+
+
+def speak_for_api(body):
+    """Speak the text of an OpenAI-style request. Returns the audio and its content type."""
+    if WSL_PATHS_ERROR:
+        raise SpeechApiError(503, WSL_PATHS_ERROR, "server_error")
+    if not isinstance(body.get("input"), str):
+        raise SpeechApiError(400, "input must be text.", param="input")
+    text = " ".join(body["input"].split())
+    if not text:
+        raise SpeechApiError(400, "input is empty.", param="input")
+    if len(text) > 4096:
+        raise SpeechApiError(400, "input is longer than 4096 characters.", param="input")
+    response_format = str(body.get("response_format") or "mp3").lower()
+    if response_format not in SPEECH_FORMATS:
+        raise SpeechApiError(400, f"response_format must be one of {', '.join(SPEECH_FORMATS)}.", param="response_format")
+    try:
+        speed = float(body.get("speed", 1.0))
+    except (TypeError, ValueError):
+        speed = None
+    if speed is None or not 0.25 <= speed <= 4.0:
+        raise SpeechApiError(400, "speed must be a number from 0.25 to 4.0.", param="speed")
+    voice = speech_voice(body.get("voice"))
+    descriptor = dataset_descriptor(voice["id"])
+    settings = json.loads((descriptor["root"] / SPEECH_SETTINGS).read_text(encoding="utf-8"))
+    references = {ref["id"]: ref for ref in parse_references(descriptor["id"], valid_only=False)}
+    reference = references.get(settings.get("reference"))
+    if not reference or not reference["valid_reference"]:
+        raise SpeechApiError(400, f"The reference clip of {voice['name']} is no longer in its dataset. Speak a line with it on Text to Voice again.",
+                             param="voice")
+    extras = [references[ref_id]["wsl_path"] for ref_id in settings.get("extra_references") or []
+              if ref_id in references and ref_id != reference["id"] and references[ref_id]["valid_aux_reference"]]
+    # Without this, the engine would speak with its pretrained models instead of a missing one.
+    models = model_files()
+    if not models["gpt"] and not models["sovits"]:
+        raise SpeechApiError(503, "The models of GPT-SoVITS cannot be read. Run System Check in the dashboard.", "server_error")
+    for kind, label in (("gpt", "GPT"), ("sovits", "SoVITS")):
+        if settings.get(kind) not in {row["path"] for row in models[kind]}:
+            raise SpeechApiError(400, f"The {label} model of {voice['name']}, {settings.get(kind)}, is no longer in GPT-SoVITS. "
+                                      "Speak a line with the voice on Text to Voice again.", param="voice")
+    if not api_ready():
+        # As with Mic to Voice, nothing starts by itself while a job uses the GPU.
+        if gpu_busy():
+            raise SpeechApiError(503, "Training or another GPU job is running, and the voice engine starts when it ends.", "server_error")
+        start_api(settings["gpt"], settings["sovits"])
+        for _ in range(720):
+            if api_ready():
+                break
+            if API_PROCESS and not API_PROCESS.running():
+                raise SpeechApiError(503, "The voice engine stopped while starting. See Logs in the dashboard.", "server_error")
+            time.sleep(0.25)
+        else:
+            raise SpeechApiError(503, "The voice engine did not start within 3 minutes.", "server_error")
+    tuning = {key: settings[key] for key in SPEECH_TUNING if key in settings}
+    payload = {
+        "text": text, "text_lang": settings.get("text_lang") or descriptor["language"],
+        "ref_audio_path": reference["wsl_path"], "aux_ref_audio_paths": extras,
+        "prompt_text": settings.get("prompt_text") or reference["text"], "prompt_lang": reference["lang"],
+        "text_split_method": str(tuning.get("text_split_method", "cut5")),
+        "seed": int(tuning.get("seed", -1)),
+        "top_k": int(tuning.get("top_k", 15)),
+        "top_p": float(tuning.get("top_p", 0.6)),
+        "temperature": float(tuning.get("temperature", 0.6)),
+        "speed_factor": float(tuning.get("speed_factor", 1.0)) * speed,
+        "fragment_interval": float(tuning.get("fragment_interval", 0.3)),
+        "repetition_penalty": float(tuning.get("repetition_penalty", 1.35)),
+        "batch_size": 1, "media_type": "wav", "parallel_infer": True, "streaming_mode": 0,
+    }
+    request = urllib.request.Request(API_URL + "/tts", data=json.dumps(payload).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+    started = time.time()
+    with GENERATION_LOCK:
+        try:
+            set_api_weights(settings["gpt"], settings["sovits"])
+            with urllib.request.urlopen(request, timeout=600) as response:
+                wav = response.read()
+        except urllib.error.HTTPError as exc:
+            raise SpeechApiError(500, f"The voice engine could not speak this: {exc.read().decode('utf-8', errors='replace')[:300]}",
+                                 "server_error") from exc
+    if not wav.startswith(b"RIFF"):
+        raise SpeechApiError(500, f"The voice engine could not speak this: {wav.decode('utf-8', errors='replace')[:300]}", "server_error")
+    content_type, ffmpeg_args = SPEECH_FORMATS[response_format]
+    audio = wav
+    if ffmpeg_args:
+        result = subprocess.run(["ffmpeg", "-v", "error", "-i", "pipe:0", *ffmpeg_args, "pipe:1"], input=wav, capture_output=True,
+                                timeout=120, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if result.returncode != 0 or not result.stdout:
+            raise SpeechApiError(500, f"ffmpeg could not make {response_format}: {result.stderr.decode('utf-8', errors='replace')[-300:]}",
+                                 "server_error")
+        audio = result.stdout
+    log(f"Speech API: {voice['name']} said {len(text)} characters in {time.time() - started:.1f}s.")
+    return audio, content_type
+
+
 COMPARE_DIR = OUTPUT_DIR / "compare"
 
 
-def model_epochs(model_name, kind):
+def model_epochs(model_name, kind, version="v2Pro"):
     """The saved checkpoints of a trained model, as (epoch, path) pairs. GPT training saves
-    name-eN.ckpt and SoVITS training name_eN_sSTEPS.pth."""
+    name-eN.ckpt and SoVITS training name_eN_sSTEPS.pth, in the folder of its version."""
     name = re.escape(slugify(model_name, "voice-model"))
     pattern = re.compile(rf"^{name}-e(\d+)\.ckpt$" if kind == "gpt" else rf"^{name}_e(\d+)_s\d+\.pth$")
-    rows = [(int(match.group(1)), row["path"]) for row in model_files()[kind] if (match := pattern.match(row["name"]))]
-    return sorted(rows)
+    epochs = {}
+    # The list is newest first, so of two files for one epoch the newer is kept.
+    for row in model_files()[kind]:
+        if (match := pattern.match(row["name"])) and (kind == "gpt" or sovits_version(row["path"]) == version):
+            epochs.setdefault(int(match.group(1)), row["path"])
+    return sorted(epochs.items())
 
 
-def start_compare(model_name, kind, dataset_id, reference_wav, text):
-    """Generate one line with each saved epoch of a model, the other model at its last epoch."""
+def start_compare(model_name, kind, dataset_id, reference_wav, text, version="v2Pro"):
+    """Generate one line with each saved epoch of a model, the other model at its last epoch.
+    The SoVITS model is of the version given."""
     if kind not in {"gpt", "sovits"}:
         raise RuntimeError("Choose GPT or SoVITS epochs to compare.")
+    if version not in SOVITS_VERSIONS:
+        raise RuntimeError("Choose v2Pro or v2ProPlus.")
     text = " ".join(str(text or "").split())
     if not text:
         raise RuntimeError("Type a test line first.")
@@ -2530,13 +2900,19 @@ def start_compare(model_name, kind, dataset_id, reference_wav, text):
     reference = next((ref for ref in parse_references(descriptor["id"]) if f"{ref['id']}.wav" == reference_wav), None)
     if not reference:
         raise RuntimeError("Choose a reference clip of 3 to 10 seconds.")
-    epochs = model_epochs(model_name, kind)
+    epochs = model_epochs(model_name, kind, version)
     if not epochs:
-        raise RuntimeError(f"{slugify(model_name, 'voice-model')} has no saved {'GPT' if kind == 'gpt' else 'SoVITS'} epochs yet.")
+        label = "GPT" if kind == "gpt" else ("SoVITS" if version == "v2Pro" else f"{version} SoVITS")
+        raise RuntimeError(f"{slugify(model_name, 'voice-model')} has no saved {label} epochs yet.")
     other_kind = "sovits" if kind == "gpt" else "gpt"
-    others = model_epochs(model_name, other_kind)
+    others = model_epochs(model_name, other_kind, version)
+    if not others and other_kind == "sovits":
+        # A trained SoVITS of the other version still speaks closer to the voice than a pretrained one.
+        others = [row for other_version in SOVITS_VERSIONS if other_version != version
+                  for row in model_epochs(model_name, "sovits", other_version)]
     # Without saved epochs of the other model, the pretrained one GPT-SoVITS starts from.
-    other = others[-1][1] if others else next((row["path"] for row in model_files()[other_kind] if "pretrained" in row["path"]), "")
+    other = others[-1][1] if others else next((row["path"] for row in model_files()[other_kind] if "pretrained" in row["path"]
+                                               and (other_kind == "gpt" or sovits_version(row["path"]) == version)), "")
     if not other:
         raise RuntimeError("The pretrained models of GPT-SoVITS are missing. Run System Check.")
     settings = {"name": slugify(model_name, "voice-model"), "kind": kind, "epochs": epochs, "other": other,
@@ -2694,6 +3070,9 @@ class Handler(BaseHTTPRequestHandler):
         The Origin check stops other sites' pages; local tools such as ptt_helper.py send no Origin."""
         port = self.server.server_address[1]
         hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        # Programs in Docker reach this PC as host.docker.internal, a name no other site can own.
+        if urllib.parse.urlparse(self.path).path.startswith("/v1/"):
+            hosts.add(f"host.docker.internal:{port}")
         if self.headers.get("Host", "").lower() not in hosts:
             return False
         origin = self.headers.get("Origin")
@@ -2707,6 +3086,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def speech_api_allowed(self):
+        """With api_key in config.json, the speech API speaks only for requests that carry it."""
+        if not SPEECH_API_KEY or hmac.compare_digest(self.headers.get("Authorization", "").encode(), f"Bearer {SPEECH_API_KEY}".encode()):
+            return True
+        self.send_json(SpeechApiError(401, "Incorrect API key. Use the api_key from config.json.").body(), 401)
+        return False
+
+    def send_audio(self, data, content_type):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def send_text(self, text, content_type="text/html"):
         body = text.encode("utf-8")
@@ -2725,6 +3118,15 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed_url.path
         if path == "/":
             self.send_text(HTML)
+            return
+        # The lists answer without api_key: Open WebUI sends the key only with speech requests.
+        if path in {"/v1/audio/voices", "/v1/audio/models", "/v1/models"}:
+            if path == "/v1/audio/voices":
+                self.send_json({"voices": speech_voices()})
+            elif path == "/v1/audio/models":
+                self.send_json({"models": [{"id": SPEECH_MODEL}]})
+            else:
+                self.send_json({"object": "list", "data": [{"id": SPEECH_MODEL, "object": "model", "created": 0, "owned_by": "local-voice-systems"}]})
             return
         if path == "/api/ptt-state":
             with PTT_CONDITION:
@@ -2894,6 +3296,27 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(403)
             return
         path = urllib.parse.urlparse(self.path).path
+        if path == "/v1/audio/speech":
+            if not self.speech_api_allowed():
+                return
+            try:
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if not 0 < length <= 1024 * 1024:
+                        raise ValueError
+                    body = json.loads(self.rfile.read(length).decode("utf-8"))
+                    if not isinstance(body, dict):
+                        raise ValueError
+                except ValueError as exc:
+                    raise SpeechApiError(400, "The body must be a JSON object of up to 1 MB.") from exc
+                audio, content_type = speak_for_api(body)
+                self.send_audio(audio, content_type)
+            except SpeechApiError as exc:
+                self.send_json(exc.body(), exc.status)
+            except Exception as exc:
+                log(f"Speech API error: {exc}")
+                self.send_json(SpeechApiError(500, str(exc), "server_error").body(), 500)
+            return
         if path == "/api/voice-import":
             source = None
             try:
@@ -2973,7 +3396,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "url": f"/api/voice-download/{file.name}?name={urllib.parse.quote(name)}", "name": name})
                 return
             if path == "/api/compare-epochs":
-                start_compare(body.get("model"), body.get("kind"), body.get("dataset_id"), body.get("reference"), body.get("text"))
+                start_compare(body.get("model"), body.get("kind"), body.get("dataset_id"), body.get("reference"), body.get("text"),
+                              body.get("version") or "v2Pro")
+                self.send_json({"ok": True})
+                return
+            if path == "/api/dataset-check":
+                start_dataset_check(body.get("dataset_id"))
                 self.send_json({"ok": True})
                 return
             if path == "/api/dataset-cut-restored":
@@ -3051,6 +3479,7 @@ class Handler(BaseHTTPRequestHandler):
                         int(body.get("save_every", 5)),
                         body.get("dataset_id") or "",
                         body.get("model_name") or "voice-model",
+                        body.get("version") or "v2Pro",
                     )
                 self.send_json({"ok": True})
                 return
@@ -3124,6 +3553,8 @@ class Handler(BaseHTTPRequestHandler):
                     output.write_bytes(data)
                 if body.get("relay"):
                     prune_relay_outputs()
+                else:
+                    save_speech_settings(body.get("voice"), speech_settings_from_generation(body))
                 log(f"Generated {output.name} in {time.time() - started:.1f}s.")
                 url = "/outputs/" + output.relative_to(OUTPUT_DIR).as_posix()
                 self.send_json({"ok": True, "url": url, "name": output.name})
@@ -3263,6 +3694,8 @@ HTML = r"""<!doctype html>
       padding: 9px 12px;
       font: inherit;
     }
+    /* Fields are as high as buttons; with only a minimum, their text made them 40.3 and 41 px. */
+    input:not([type="checkbox"]):not([type="range"]), select { height: var(--control-height); }
     textarea { min-height: 92px; resize: vertical; }
     input:not([type="checkbox"]):not([type="range"]):focus, select:focus, textarea:focus {
       outline: 2px solid var(--accent-soft);
@@ -3461,7 +3894,7 @@ HTML = r"""<!doctype html>
     .compare-list { display: grid; gap: var(--space-3); }
     .compare-row { display: grid; grid-template-columns: 9em minmax(0, 1fr) auto; gap: var(--space-2); align-items: center; }
     @media (max-width: 600px) { .compare-row { grid-template-columns: minmax(0, 1fr) auto; grid-auto-flow: dense; } .compare-row .player { grid-column: 1 / -1; } }
-    .training-project input + label { margin-top: var(--space-3); }
+    .training-project input + label, .training-project select + label { margin-top: var(--space-3); }
     /* The file chooser as a plain button, without the field box around it. */
     #datasetAudioFiles { border: 0; background: transparent; padding: 0; min-height: 0; color: var(--muted); }
     #datasetAudioFiles::file-selector-button { height: var(--control-height); margin-right: 12px; padding: 0 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel-3); color: var(--text); font: inherit; font-weight: 700; cursor: pointer; }
@@ -3474,6 +3907,9 @@ HTML = r"""<!doctype html>
     .clip-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; gap: var(--space-2); align-items: center; }
     .clip-row .clip-length { color: var(--muted); font-size: 12px; white-space: nowrap; text-align: right; min-width: 5.5em; }
     .clip-row.warn .clip-length { color: var(--warn); }
+    .clip-note { grid-column: 2 / -1; display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-2); align-items: center; color: var(--warn); font-size: 12px; margin-bottom: var(--space-1); }
+    .clip-note .heard { color: var(--text); }
+    .clip-check { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; }
     .upload-row .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
     .models {
       display: grid;
@@ -4183,6 +4619,12 @@ HTML = r"""<!doctype html>
             <div class="step" id="clipsStep">
               <div class="step-head"><h3><span class="step-number">1</span>Clips</h3><span class="status-line" id="trainingDatasetStatus"></span></div>
               <div class="small clip-summary" id="clipSummary"></div>
+              <div class="clip-check" id="checkRow" hidden>
+                <button class="secondary" id="checkClips" title="Finds clips with a wrong transcript, noise, distortion, or the same audio twice">Check clips</button>
+                <button class="danger" data-stop="dataset-check" id="checkClipsStop" hidden>Stop</button>
+                <label id="checkFilterLabel" hidden><input type="checkbox" id="checkFilter" /> Only clips to look at</label>
+                <span class="status-line" id="checkStatus"></span>
+              </div>
               <div class="clip-list" id="clipList" aria-label="Clips in the dataset"></div>
               <div class="row">
                 <button class="secondary" id="datasetAddFiles">+ Add audio</button>
@@ -4218,6 +4660,10 @@ HTML = r"""<!doctype html>
               <div class="grid2">
                 <div class="training-project">
                   <h4>SoVITS</h4>
+                  <label for="sovitsVersion">Version</label><select id="sovitsVersion">
+                    <option value="v2Pro">v2Pro</option>
+                    <option value="v2ProPlus">v2ProPlus, better quality, more GPU memory</option>
+                  </select>
                   <label for="sovitsEpochs">Total epochs</label><input id="sovitsEpochs" type="number" value="16" min="1" />
                   <label for="sovitsBatch">Batch size</label><input id="sovitsBatch" type="number" value="1" min="1" />
                   <label for="sovitsSave">Save every N epochs</label><input id="sovitsSave" type="number" value="4" min="1" />
@@ -4474,6 +4920,10 @@ HTML = r"""<!doctype html>
           <button class="secondary" data-import-voice>Import a voice</button>
         </div>
         <div class="small">One file with both models and the reference clips, to give to someone or to keep.</div>
+      </div>
+      <div>
+        <h3>Use in other programs</h3>
+        <div class="small">Programs that work with OpenAI's speech service, such as Open WebUI and SillyTavern, can speak with your voices at <strong id="speechApiAddress">http://127.0.0.1:8790/v1</strong>. A voice is offered there once it has spoken a line here, and it speaks with that line's models, reference clip and settings.</div>
       </div>
       <div>
         <h3>Generation</h3>
@@ -4895,7 +5345,15 @@ HTML = r"""<!doctype html>
     function savedEpochs(kind) {
       const name = modelSlug($("trainingModelName").value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const pattern = new RegExp(kind === "gpt" ? `^${name}-e(\\d+)\\.ckpt$` : `^${name}_e(\\d+)_s\\d+\\.pth$`);
-      return ((state && state.models && state.models[kind]) || []).filter(row => pattern.test(row.name)).length;
+      const version = $("sovitsVersion").value;
+      const epochs = ((state && state.models && state.models[kind]) || [])
+        .filter(row => kind === "gpt" || row.version === version)
+        .map(row => pattern.exec(row.name)).filter(Boolean).map(match => match[1]);
+      return new Set(epochs).size;
+    }
+
+    function sovitsLabel() {
+      return $("sovitsVersion").value === "v2Pro" ? "SoVITS" : `${$("sovitsVersion").value} SoVITS`;
     }
 
     let compareRowsSignature = "";
@@ -4914,8 +5372,8 @@ HTML = r"""<!doctype html>
         : !listed
         ? "Generates one line with each saved epoch, so you can choose the best by ear."
         : (count
-          ? `Generates one line with each of the ${count} saved ${kind === "gpt" ? "GPT" : "SoVITS"} epochs of ${modelSlug($("trainingModelName").value)}, so you can choose the best by ear.`
-          : `${modelSlug($("trainingModelName").value)} has no saved ${kind === "gpt" ? "GPT" : "SoVITS"} epochs yet. Train it first.`);
+          ? `Generates one line with ${count === 1 ? "the one" : `each of the ${count}`} saved ${kind === "gpt" ? "GPT" : sovitsLabel()} epoch${count === 1 ? "" : "s"} of ${modelSlug($("trainingModelName").value)}, so you can choose the best by ear.`
+          : `${modelSlug($("trainingModelName").value)} has no saved ${kind === "gpt" ? "GPT" : sovitsLabel()} epochs yet. Train it first.`);
       if (!job) return;
       const last = (job.lines || []).slice(-1)[0] || "Starting...";
       $("compareStatus").textContent = running ? last : (job.status === "failed" ? `${last} See Logs for details.` : (job.status === "stopped" ? "Stopped." : (compareChosen || "Done.")));
@@ -5016,6 +5474,8 @@ HTML = r"""<!doctype html>
         try {
           saved = (await post("/api/dataset-clip-text", {dataset_id: clipsDataset, wav: clip.wav, text: text.value})).text;
           text.value = saved;
+          checkCorrected.add(checkKey(clip.wav));
+          renderClipNotes();
         } catch (error) {
           text.value = saved;
           showError(error.message);
@@ -5025,7 +5485,7 @@ HTML = r"""<!doctype html>
       length.className = "clip-length";
       const remove = document.createElement("button");
       remove.type = "button";
-      remove.className = "secondary icon-button";
+      remove.className = "secondary icon-button clip-delete";
       remove.title = "Delete this clip";
       remove.setAttribute("aria-label", `Delete ${clip.wav}`);
       remove.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>';
@@ -5034,16 +5494,115 @@ HTML = r"""<!doctype html>
         const next = row.nextElementSibling || row.previousElementSibling;
         try {
           await post("/api/dataset-clip-delete", {dataset_id: clipsDataset, wav: clip.wav});
+          // A clip added later under this name is not the one the check heard.
+          checkGone.add(checkKey(clip.wav));
           await refresh();
           await loadClips(true);
-          if (next && next.isConnected) next.querySelector("button:last-child").focus();
+          if (next && next.isConnected) next.querySelector(".clip-delete").focus();
         } catch (error) {
           showError(error.message);
         }
       };
-      row.append(play, text, length, remove);
-      return {row, play, length};
+      const note = document.createElement("div");
+      note.className = "clip-note";
+      note.hidden = true;
+      row.append(play, text, length, remove, note);
+      return {row, play, length, note, text, setSaved: value => { saved = value; }};
     }
+
+    // What the last check of this dataset found, by clip. A transcript corrected since is not
+    // flagged again.
+    let checkFound = new Map();
+    let checkSignature = "";
+    const checkCorrected = new Set();
+    const checkGone = new Set();
+    const checkKey = wav => `${clipsDataset}/${wav}`;
+    function renderCheck() {
+      const job = state && state.jobs && state.jobs["dataset-check"];
+      const mine = Boolean(job && job.dataset === clipsDataset);
+      const running = Boolean(mine && job.status === "running");
+      $("checkClips").disabled = running;
+      $("checkClipsStop").hidden = !running;
+      const results = mine ? job.results || [] : [];
+      const signature = (mine ? job.dataset : "") + "|" + results.map(row => `${row.wav}:${row.problems.length}`).join("|");
+      if (signature !== checkSignature) {
+        checkSignature = signature;
+        checkFound = new Map(results.map(row => [row.wav, row]));
+        renderClipNotes();
+      }
+      if (!mine) {
+        $("checkStatus").textContent = "";
+        return;
+      }
+      const last = (job.lines || []).slice(-1)[0] || "Starting...";
+      $("checkStatus").textContent = job.status === "stopped" ? `Check stopped. ${checkFound.size} clip${checkFound.size === 1 ? "" : "s"} found so far.`
+        : (job.status === "failed" ? `${last} See Logs for details.` : last);
+      $("checkStatus").className = job.status === "failed" ? "status-line bad" : "status-line";
+    }
+
+    function clipProblems(wav) {
+      const found = checkFound.get(wav);
+      if (!found || checkGone.has(checkKey(wav))) return [];
+      return found.problems.filter(problem => !(checkCorrected.has(checkKey(wav)) && problem.startsWith("The transcript differs")));
+    }
+
+    function renderClipNotes() {
+      // With nothing left to look at, as in another dataset or once all are corrected, the filter
+      // turns off rather than hide every clip.
+      const count = Array.from(clipRows.keys()).filter(wav => clipProblems(wav).length).length;
+      if (!count) $("checkFilter").checked = false;
+      $("checkFilterLabel").hidden = !count;
+      clipRows.forEach((parts, wav) => {
+        const problems = clipProblems(wav);
+        const found = checkFound.get(wav);
+        parts.note.innerHTML = "";
+        parts.note.hidden = !problems.length;
+        if (problems.length) {
+          const text = document.createElement("span");
+          text.textContent = problems.join(" ");
+          parts.note.append(text);
+          if (found.heard !== null && !checkCorrected.has(checkKey(wav))) {
+            const heard = document.createElement("span");
+            heard.className = "heard";
+            heard.textContent = found.heard ? `Heard: "${found.heard}"` : "Heard no words.";
+            parts.note.append(heard);
+            if (found.heard) {
+              const use = document.createElement("button");
+              use.type = "button";
+              use.className = "secondary";
+              use.textContent = "Use heard text";
+              use.onclick = async () => {
+                try {
+                  const saved = (await post("/api/dataset-clip-text", {dataset_id: clipsDataset, wav, text: found.heard})).text;
+                  parts.text.value = saved;
+                  parts.setSaved(saved);
+                  checkCorrected.add(checkKey(wav));
+                  renderClipNotes();
+                } catch (error) { showError(error.message); }
+              };
+              parts.note.append(use);
+            }
+          }
+        }
+        parts.row.hidden = $("checkFilter").checked && !problems.length;
+      });
+    }
+    $("checkFilter").onchange = renderClipNotes;
+
+    $("checkClips").onclick = async () => {
+      $("checkClips").disabled = true;
+      try {
+        await post("/api/dataset-check", {dataset_id: clipsDataset});
+        checkCorrected.clear();
+        checkGone.clear();
+        $("checkStatus").className = "status-line";
+        $("checkStatus").textContent = "Starting...";
+        refresh();
+      } catch (error) {
+        showError(error.message);
+        $("checkClips").disabled = false;
+      }
+    };
 
     function renderClips(datasetId) {
       if (datasetId !== clipsDataset) {
@@ -5076,9 +5635,16 @@ HTML = r"""<!doctype html>
       });
       const summary = $("clipSummary");
       summary.hidden = !clips.length;
-      summary.textContent = `${clips.length} clip${clips.length === 1 ? "" : "s"}, ${formatLength(clipsData.seconds)} in total.`
+      $("checkRow").hidden = !clips.length;
+      const short = clips.filter(clip => clip.duration !== null && clip.duration < 2).length;
+      const long = clips.filter(clip => clip.duration > 10).length;
+      const middle = clips.filter(clip => clip.duration >= 2 && clip.duration <= 10).length;
+      summary.textContent = `${clips.length} clip${clips.length === 1 ? "" : "s"}, ${formatLength(clipsData.seconds)} in total`
+        + (short || long ? `: ${short} under 2 s, ${middle} of 2 to 10 s, ${long} over 10 s.` : ".")
         + (problems ? ` Training skips ${problems} of them: see the lengths marked in yellow.` : "")
         + (clips.length && clipsData.seconds < 60 ? " A minute or more of clips trains a better voice." : "");
+      checkSignature = "";
+      renderCheck();
       summary.classList.toggle("warn", problems > 0);
       fillCompareReferences();
     }
@@ -5291,9 +5857,14 @@ HTML = r"""<!doctype html>
       return 20 * Math.log10(Math.max(rms, 0.000001));
     }
 
+    function modelLabel(row) {
+      const plus = row.version === "v2ProPlus" && !row.path.endsWith(".ckpt");
+      return `${row.name} (${plus ? "v2ProPlus, " : ""}${row.size_mb} MB)`;
+    }
+
     function fillSelect(select, rows, oldValue) {
       select.innerHTML = "";
-      rows.forEach(row => option(select, row.path, `${row.name} (${row.size_mb} MB)`));
+      rows.forEach(row => option(select, row.path, modelLabel(row)));
       if (oldValue && rows.some(row => row.path === oldValue)) select.value = oldValue;
     }
 
@@ -6457,6 +7028,7 @@ HTML = r"""<!doctype html>
       savedModels.forEach(row => $("modelList").appendChild(modelLine(row.path, row.size_mb)));
       renderRestore();
       renderCutStatus();
+      renderCheck();
       showWelcome();
       // Loaded data can move the highlighted element.
       placeTour();
@@ -6480,7 +7052,7 @@ HTML = r"""<!doctype html>
       {title: "Welcome", text: "This tour shows what each part of the dashboard does and how to use it. Use Next and Back, or the arrow keys. Esc ends the tour."},
       {targets: [".tablist"], title: "Tabs", text: "Mic to Voice and Text to Voice speak in a voice. Voice Training creates voices. Logs and System Check help when something does not work."},
       {tab: "training", targets: ["#newDatasetButton"], title: "Create a voice", text: "Every voice starts as a dataset. Press + New dataset, then give it a name and a language."},
-      {tab: "training", targets: ["#clipsStep", "#noDatasets"], title: "Add clips", text: "Add clips, or long recordings, which are cut into clips at pauses. Speech recognition writes each transcript. Check them in the list, where every clip can be played, corrected or deleted."},
+      {tab: "training", targets: ["#clipsStep", "#noDatasets"], title: "Add clips", text: "Add clips, or long recordings, which are cut into clips at pauses. Speech recognition writes each transcript. Check them in the list, where every clip can be played, corrected or deleted. Check clips finds clips with a wrong transcript, noise or distortion."},
       {tab: "training", targets: ["#prepareStep", "#noDatasets"], title: "Sync the clips", text: "Sync Only copies the clips to WSL, which is all Text to Voice and Mic to Voice need. Sync again after adding clips."},
       {tab: "training", targets: ["#trainPanel", "#noDatasets"], title: "Train the voice", text: "Training makes the voice closer to its clips, after Sync & Prepare. It takes a while, and it stops the voice first to free the GPU."},
       {tab: "training", targets: ["#compareStep", "#noDatasets"], title: "Compare epochs", text: "Training saves the voice every few epochs. Compare says one test line with each saved epoch, so you can keep the one that sounds best."},
@@ -7101,13 +7673,21 @@ HTML = r"""<!doctype html>
       }
     };
 
+    $("speechApiAddress").textContent = `${location.origin}/v1`;
     $("compareKind").onchange = renderCompare;
+    // The version chosen last is kept, as Compare epochs looks for SoVITS epochs of that version.
+    try { $("sovitsVersion").value = localStorage.getItem("voiceDashboardSovitsVersion") || "v2Pro"; } catch (_) {}
+    if (!$("sovitsVersion").value) $("sovitsVersion").value = "v2Pro";
+    $("sovitsVersion").addEventListener("change", () => {
+      try { localStorage.setItem("voiceDashboardSovitsVersion", $("sovitsVersion").value); } catch (_) {}
+      renderCompare();
+    });
     $("trainingModelName").addEventListener("input", renderCompare);
     $("compareRun").onclick = async () => {
       $("compareRun").disabled = true;
       try {
         await post("/api/compare-epochs", {model: $("trainingModelName").value, kind: $("compareKind").value, dataset_id: $("trainingDataset").value,
-          reference: $("compareReference").value, text: $("compareText").value});
+          reference: $("compareReference").value, text: $("compareText").value, version: $("sovitsVersion").value});
         compareRowsSignature = null;
         compareChosen = "";
         $("compareResults").innerHTML = "";
@@ -7262,7 +7842,7 @@ HTML = r"""<!doctype html>
     }));
     $("trainSovits").onclick = async () => {
       try {
-        await post("/api/start-train", {kind: "sovits", dataset_id: $("trainingDataset").value, model_name: $("trainingModelName").value, epochs: $("sovitsEpochs").value, batch_size: $("sovitsBatch").value, save_every: $("sovitsSave").value});
+        await post("/api/start-train", {kind: "sovits", dataset_id: $("trainingDataset").value, model_name: $("trainingModelName").value, version: $("sovitsVersion").value, epochs: $("sovitsEpochs").value, batch_size: $("sovitsBatch").value, save_every: $("sovitsSave").value});
         refresh();
       } catch (error) { showError(error.message); }
     };
