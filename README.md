@@ -101,13 +101,13 @@ The first time, the dashboard offers a short tour that explains each page. **Gui
 
 1. On **Voice Training**, create a dataset and press **+ Add audio**. Speech recognition writes each transcript; check them before adding.
    Recordings over 20 seconds are cut into clips at pauses. The clip list plays, corrects and deletes clips.
-   **Check clips** finds clips with a wrong transcript, background noise, distortion, or the same audio twice, and **Use heard text** puts in what speech recognition hears.
+   **Check clips** finds clips with a wrong transcript, background noise, distortion, the same audio twice, or a length that training skips, and **Use heard text** puts in what speech recognition hears.
    Press **Sync Only**. The other tabs read clips from the copy in WSL, so sync again after adding clips.
 2. On **Text to Voice**, choose the voice and reference clip, enter text, and press **Generate**.
    **Settings** holds the models, such as the pretrained `s1v3.ckpt` / `s2Gv2Pro.pth`, and **Text language**, which follows the dataset's language.
-3. On **Mic to Voice**, hold push-to-talk, speak, then release. Choose audio output in **Settings**.
-   Opening the tab starts speech recognition, the voice engine, and the global push-to-talk key. **Stop Everything** stops them.
-   **Sync & Prepare** and training stop them first to free GPU memory, and nothing starts by itself while those run.
+3. On **Mic to Voice**, press **Start**, then hold push-to-talk, speak, and release. Choose audio output in **Settings**.
+   **Start** turns on speech recognition, the voice engine, and the global push-to-talk key, and **Stop Everything** stops them.
+   **Sync & Prepare** and training stop them first to free GPU memory.
    Mic to Voice understands English speech and speaks it in the selected voice, whatever the dataset's language.
 
 Datasets can be English, Chinese, Japanese, Korean, or Cantonese.

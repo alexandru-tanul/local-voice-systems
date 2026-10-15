@@ -152,9 +152,7 @@ let relayLastLevelDb = -120;
 let relayCurrentItem = null;
 let relayPlaybackResolve = null;
 let armRelayWhenReady = false;
-// Mic to Voice starts its services once each time the tab opens. After Stop Everything they
-// stay off until the tab is opened again or Start is pressed.
-let autoStartPending = false;
+// Mic to Voice's services start only when Start is pressed.
 let systemStartBusy = false;
 // Stop Everything raises it, so a start that is still waiting, for example for the microphone
 // prompt, does not go on.
@@ -318,11 +316,10 @@ function formatLength(seconds) {
   return `${Math.floor(whole / 60)} min ${whole % 60} s`;
 }
 
-function clipProblem(seconds) {
-  if (seconds === null || seconds === undefined) return "The file cannot be read.";
-  if (seconds <= 0.6) return "Training skips clips of 0.6 s or less.";
-  if (seconds >= 54) return "Training skips clips of 54 s or more.";
-  return "";
+// The server says which clips training skips, and why; see training_skips in dashboard/datasets.py.
+function clipProblem(clip) {
+  if (clip.duration === null || clip.duration === undefined) return "The file cannot be read.";
+  return clip.skipped || "";
 }
 
 async function loadClips(force = false) {
@@ -637,7 +634,7 @@ function renderClips(datasetId) {
       $("clipList").appendChild(parts.row);
     }
     const parts = clipRows.get(clip.wav);
-    const problem = clipProblem(clip.duration);
+    const problem = clipProblem(clip);
     if (problem) problems++;
     parts.length.textContent = formatLength(clip.duration);
     parts.length.title = problem;
@@ -822,7 +819,7 @@ loadRelaySettings();
 if (relaySavedSettings.relayVolume !== undefined && Number(relaySavedSettings.relayVolume) <= 4) {
   $("relayVolume").value = Math.round(Number(relaySavedSettings.relayVolume) / 4 * 100);
 }
-function activateTab(name, autoStart = true) {
+function activateTab(name) {
   if (!$(`tab-${name}`)) name = "relay";
   document.body.dataset.tab = name;
   document.querySelectorAll(".tab-button").forEach(button => {
@@ -835,8 +832,6 @@ function activateTab(name, autoStart = true) {
   });
   if (location.hash !== `#${name}`) history.replaceState(null, "", `#${name}`);
   try { localStorage.setItem("voiceDashboardTab", name); } catch (_) {}
-  autoStartPending = name === "relay" && autoStart;
-  autoStartSystem();
   renderStartButton();
   // Before the first status arrives, the page is still loading and has nothing to show.
   if (name === "relay" && lastSystemSnapshot) renderRelayCenter();
@@ -1338,17 +1333,17 @@ function relayPrimaryState(item) {
   if (!hint && relayCurrentItem && item && item !== relayCurrentItem) hint = "Another line is still being generated or played.";
   if (!hint) {
     if (relayListening && !relayAudioCtx) hint = "Speech recognition is starting.";
-    else if (system.status === "stopped" && (systemStartBusy || autoStartPending)) hint = "Starting speech recognition and the voice engine.";
-    else if (system.status === "stopped" && !relayListening && state && state.gpu_busy) hint = "Training is using the GPU, so nothing started by itself. Press Start to load the voice anyway.";
-    else if (system.status === "stopped" && !relayListening) hint = "Everything is stopped. Press Start to turn it back on.";
+    else if (system.status === "stopped" && systemStartBusy) hint = "Starting speech recognition and the voice engine.";
+    else if (system.status === "stopped" && !relayListening && state && state.gpu_busy) hint = "Training is using the GPU. Press Start to load the voice anyway.";
+    else if (system.status === "stopped" && !relayListening) hint = "Press Start to turn on speech recognition and the voice engine.";
     else if (system.status === "starting") hint = system.message || "Starting the system.";
     else if (system.status === "failed" || system.status === "degraded") hint = system.message || "";
   }
   return {key: "ready", icon: "", label: "Hold to talk", hint};
 }
 
-// Mic to Voice can start without a click now, but browsers refuse to play sound on a page that
-// was never clicked.
+// The system can already be running when the page loads, as after a reload, but browsers refuse
+// to play sound on a page that was never clicked.
 function needsPageClick() {
   return Boolean(navigator.userActivation) && !navigator.userActivation.hasBeenActive;
 }
@@ -1807,7 +1802,6 @@ function updateSystemView(system) {
     lastSystemStatus = status;
     renderRelayCenter();
   }
-  autoStartSystem();
   renderStartButton();
   // Stop Everything stays clickable: services can be running even while the
   // system status reads "stopped", and stop-system is safe to call at any time.
@@ -1830,25 +1824,17 @@ function hasVoice() {
   return Boolean(state && (state.datasets || []).some(dataset => dataset.wav_count > 0));
 }
 
-// Start shows only on Mic to Voice: as Retry after a failed start, and as Start after Stop Everything.
+// Start shows only on Mic to Voice: as Start while the system is stopped, and as Retry after a
+// failed start. During training it still loads the voice, for example to test a checkpoint.
 function renderStartButton() {
   const status = (lastSystemSnapshot || {}).status || "";
   const failed = status === "failed" || status === "degraded";
-  $("startSystem").hidden = document.body.dataset.tab !== "relay" || systemStartBusy || autoStartPending
+  $("startSystem").hidden = document.body.dataset.tab !== "relay" || systemStartBusy
     || !hasVoice() || !(failed || status === "stopped");
   $("startSystem").textContent = failed ? "Retry" : "Start";
 }
 
-function autoStartSystem() {
-  if (!autoStartPending || systemStartBusy || document.body.dataset.tab !== "relay" || !lastSystemSnapshot || !hasVoice()) return;
-  autoStartPending = false;
-  // Training keeps the GPU. Start still loads the voice on purpose, for example to test a checkpoint.
-  if (lastSystemSnapshot.status === "stopped" && !state.gpu_busy) startSystem(true);
-  // The hint said it was starting while this was undecided.
-  else renderRelayCenter();
-}
-
-async function startSystem(auto = false) {
+async function startSystem() {
   const token = ++startToken;
   systemStartBusy = true;
   renderStartButton();
@@ -1860,13 +1846,7 @@ async function startSystem(auto = false) {
     saveRelaySettings();
     await refreshRelayDevices();
     if (token !== startToken) return;
-    const result = await post("/api/start-system", {...relayModels(), binding: $("relayPttKey").value, auto});
-    if (result.started === false) {
-      // A GPU job started meanwhile; the page learns it from the next state.
-      armRelayWhenReady = false;
-      await refresh();
-      return;
-    }
+    await post("/api/start-system", {...relayModels(), binding: $("relayPttKey").value});
     recentActivity("System startup requested.");
     await refreshSystem();
   } catch (error) {
@@ -2056,7 +2036,7 @@ function modelLine(label, sizeMb) {
 }
 
 // Guided tour. The page darkens except for one highlighted element, and a pop-up beside it
-// explains it. The tour moves through the tabs; opening Mic to Voice starts nothing meanwhile.
+// explains it. The tour moves through the tabs.
 // Steps marked "voice" show controls that exist only once a voice does.
 const TOUR_STEPS = [
   {title: "Welcome", text: "This tour shows what each part of the dashboard does and how to use it. Use Next and Back, or the arrow keys. Esc ends the tour."},
@@ -2071,11 +2051,11 @@ const TOUR_STEPS = [
   {tab: "generate", voice: true, targets: [".voice-line"], title: "Choose the voice", text: "Pick the voice and a reference clip. The clip's tone shapes how the line sounds, and you can play it here."},
   {tab: "generate", voice: true, targets: [".compose-actions"], title: "Generate", text: "Generate makes the line. The voice engine starts by itself the first time, which takes a moment. The gear opens the models, the text language and finer controls."},
   {tab: "generate", targets: ["#tab-generate .history"], title: "Your lines", text: "Every line you generate is listed here. Click one to play it again."},
-  {tab: "relay", targets: ["#relayPttButton", "#relayCapture .no-voice-note"], title: "Mic to Voice", text: "Hold this button or your push-to-talk key, speak English, and release. Your words are spoken in the voice.", noVoiceText: "Here you speak, and your words are spoken in a voice. It needs a voice first, made on Voice Training."},
+  {tab: "relay", targets: ["#relayPttButton", "#relayCapture .no-voice-note"], title: "Mic to Voice", text: "Press Start to turn on speech recognition and the voice engine. Then hold this button or your push-to-talk key, speak English, and release. Your words are spoken in the voice.", noVoiceText: "Here you speak, and your words are spoken in a voice. It needs a voice first, made on Voice Training."},
   {tab: "relay", voice: true, targets: ["#relaySetPttKey"], title: "Push-to-talk key", text: "Click to choose another key. It also works while another app, such as a game, is in front."},
   {tab: "relay", voice: true, targets: [".relay-options"], title: "Options", text: "With Hold to talk off, the microphone listens all the time instead. With Speak automatically off, your words are only written down. The gear sets the output device, the volume and the voice."},
   {tab: "relay", targets: ["#relayHistory"], title: "Recordings", text: "Everything you said in this session is listed here, to read or play again."},
-  {targets: ["#systemIsland"], title: "Status bar", text: "Shows whether speech recognition, the voice engine and the global key are running. Mic to Voice starts them when you open it, and Stop Everything stops them and frees the GPU."},
+  {targets: ["#systemIsland"], title: "Status bar", text: "Shows whether speech recognition, the voice engine and the global key are running. Start on Mic to Voice starts them, and Stop Everything stops them and frees the GPU."},
   {targets: ["#openGuide"], title: "Take the tour again", text: "Press Guide to see this tour again at any time."},
 ];
 let tour = null;
@@ -2087,20 +2067,18 @@ function startTour() {
     steps: TOUR_STEPS.filter(step => !step.voice || hasVoice()),
     index: 0,
     returnTab: document.body.dataset.tab,
-    resumeAutoStart: autoStartPending,
     returnFocus: document.activeElement,
   };
-  autoStartPending = false;
   $("tour").hidden = false;
   showTourStep();
 }
 
 function endTour() {
   if (!tour) return;
-  const {returnTab, resumeAutoStart, returnFocus} = tour;
+  const {returnTab, returnFocus} = tour;
   tour = null;
   $("tour").hidden = true;
-  activateTab(returnTab, resumeAutoStart);
+  activateTab(returnTab);
   refresh();
   if (returnFocus && returnFocus.focus) returnFocus.focus();
 }
@@ -2124,7 +2102,7 @@ function tourTarget(step) {
 
 function showTourStep() {
   const step = tour.steps[tour.index];
-  if (step.tab && document.body.dataset.tab !== step.tab) activateTab(step.tab, false);
+  if (step.tab && document.body.dataset.tab !== step.tab) activateTab(step.tab);
   if (step.tab === "training") setTrainingMode("train");
   const target = tourTarget(step);
   if (target) target.scrollIntoView({block: "center", inline: "nearest"});
@@ -2425,12 +2403,11 @@ document.addEventListener("keydown", event => {
   }
 });
 
-$("startSystem").onclick = () => startSystem(false);
+$("startSystem").onclick = () => startSystem();
 
 $("stopSystem").onclick = async () => {
   $("stopSystem").disabled = true;
   armRelayWhenReady = false;
-  autoStartPending = false;
   startToken += 1;
   stopRelayListening();
   try {

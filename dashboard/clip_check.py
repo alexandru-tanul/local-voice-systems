@@ -1,5 +1,5 @@
-"""Check clips: finds clips with a wrong transcript, background noise, distortion, or the same
-audio twice."""
+"""Check clips: finds clips with a wrong transcript, background noise, distortion, the same audio
+twice, or a length that training skips."""
 
 import array
 import hashlib
@@ -108,8 +108,9 @@ def start_dataset_check(dataset_id):
 
 
 def check_dataset(job, dataset_id):
-    """Find clips that can make a voice worse. Each clip with problems goes to job.results with
-    what was found, and, when its transcript differs, the words speech recognition heard."""
+    """Find clips that can make a voice worse, and those that training skips. Each clip with
+    problems goes to job.results with what was found, and, when its transcript differs, the words
+    speech recognition heard."""
     descriptor = datasets.dataset_descriptor(dataset_id)
     clips = datasets.dataset_clips(dataset_id)["clips"]
     found = {}
@@ -133,6 +134,8 @@ def check_dataset(job, dataset_id):
             flag(clip["wav"], "The file cannot be read.")
             continue
         readable.append(clip)
+        if clip["skipped"]:
+            flag(clip["wav"], clip["skipped"])
         if sound["peak_db"] < CHECK_QUIET_DB:
             flag(clip["wav"], f"Very quiet: its loudest moment is {-round(sound['peak_db'])} dB below full volume.")
         elif sound["speech_db"] < CHECK_FLAT_DB:

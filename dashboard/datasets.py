@@ -291,17 +291,30 @@ def add_dataset_audio(dataset_id, filename, audio_base64, text, speaker="", lang
     return dataset_summary(dataset_descriptor(dataset_id))
 
 
-# SoVITS training skips clips this short or this long (GPT_SoVITS/module/data_utils.py).
-TRAINING_MIN_SECONDS = 0.6
-TRAINING_MAX_SECONDS = 54.0
-
-
 def wav_seconds(path):
     try:
         with wave.open(str(path), "rb") as audio:
             return round(audio.getnframes() / audio.getframerate(), 2)
     except (OSError, EOFError, ZeroDivisionError, wave.Error):
         return None
+
+
+# SoVITS training keeps only clips longer than 0.6 s and shorter than 54 s
+# (GPT_SoVITS/module/data_utils.py).
+TRAINING_MIN_SECONDS = 0.6
+TRAINING_MAX_SECONDS = 54.0
+
+
+def training_skips(seconds):
+    """Why training skips a clip of this length, or "" when it uses it. The page shows the reason
+    at the clip's length, and Check clips lists the clip."""
+    if seconds is None:
+        return ""
+    if seconds <= TRAINING_MIN_SECONDS:
+        return f"Training skips clips of {TRAINING_MIN_SECONDS:g} s or less."
+    if seconds >= TRAINING_MAX_SECONDS:
+        return f"Training skips clips of {TRAINING_MAX_SECONDS:g} s or more."
+    return ""
 
 
 def dataset_clips(dataset_id):
@@ -316,11 +329,13 @@ def dataset_clips(dataset_id):
             version = int(path.stat().st_mtime)
         except OSError:
             version = 0
+        duration = wav_seconds(path)
         clips.append(
             {
                 "wav": wav,
                 "text": entry.get("text", ""),
-                "duration": wav_seconds(path),
+                "duration": duration,
+                "skipped": training_skips(duration),
                 "url": f"/datasets/{descriptor['id']}/wavs/{urllib.parse.quote(wav)}?v={version}",
             }
         )

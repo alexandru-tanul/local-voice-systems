@@ -402,12 +402,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = read_json(self)
             if path == "/api/start-system":
-                if body.get("auto") and jobs.gpu_busy():
-                    self.send_json({"ok": True, "started": False})
-                    return
                 # The startup worker checks the models once WSL is running; see model_pair.
                 system.start_system(body.get("gpt") or "", body.get("sovits") or "", body.get("binding") or "ShiftLeft")
-                self.send_json({"ok": True, "started": True})
+                self.send_json({"ok": True})
                 return
             if path == "/api/stop-system":
                 system.stop_system()

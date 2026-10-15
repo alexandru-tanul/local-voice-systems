@@ -102,12 +102,15 @@ class ManagedProcess:
         return self.process is not None and self.process.poll() is None
 
     def stop(self):
+        running = self.running()
+        if running:
+            # Marked before the stop script, as the program it ends would otherwise count as failed.
+            self.status = "stopping"
         if self.stop_script:
             wsl.stop_in_wsl(self.stop_script)
-        if not self.running():
+        if not running:
             # Already ended: keep "done" or "failed" instead of reporting "stopped".
             return
-        self.status = "stopping"
         try:
             self.process.terminate()
             self.process.wait(timeout=5)

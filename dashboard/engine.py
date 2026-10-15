@@ -70,15 +70,18 @@ def start_api(gpt_path, sovits_path):
 
 def stop_api():
     global API_PROCESS, API_GPT_PATH, API_SOVITS_PATH
-    try:
-        urllib.request.urlopen(config.API_URL + "/control?command=exit", timeout=1)
-    except Exception:
-        pass
     if API_PROCESS:
         API_PROCESS.stop()
     else:
         # An engine left by an earlier dashboard run.
         wsl.stop_in_wsl(wsl.WSL_STOP_SCRIPTS["api"])
+    # The engine's own exit command, for one that the stop script did not reach. It comes after
+    # stop(), which marks the engine as stopping, so the end it causes is not taken for a failure.
+    if api_ready():
+        try:
+            urllib.request.urlopen(config.API_URL + "/control?command=exit", timeout=1)
+        except Exception:
+            pass
     API_PROCESS = None
     API_GPT_PATH = None
     API_SOVITS_PATH = None

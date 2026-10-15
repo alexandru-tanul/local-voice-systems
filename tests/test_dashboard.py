@@ -383,6 +383,31 @@ class DashboardTests(unittest.TestCase):
             missing.start()
         self.assertEqual(missing.snapshot()["status"], "failed")
 
+    def test_a_job_ended_by_its_stop_script_reports_stopped(self):
+        proc = dashboard.jobs.ManagedProcess("Training", [sys.executable, "-c", "import time; time.sleep(30)"], stop_script="pkill")
+        proc.start()
+
+        def pkill(script):
+            # As pkill in WSL does: the program ends, and wsl.exe with it, before stop() goes on.
+            proc.process.kill()
+            proc.process.wait(timeout=10)
+            time.sleep(0.3)
+
+        with patch.object(dashboard.wsl, "stop_in_wsl", side_effect=pkill), patch.object(dashboard.jobs, "log") as log:
+            proc.stop()
+        self.assertEqual(proc.snapshot()["status"], "stopped")
+        self.assertEqual([call.args[0] for call in log.call_args_list], ["Training stopped."])
+
+    def test_stopping_the_engine_marks_it_stopped_before_its_exit_command(self):
+        order = []
+        engine = MagicMock(**{"stop.side_effect": lambda: order.append("stop")})
+        with patch.object(dashboard.engine, "API_PROCESS", engine), patch.object(dashboard.engine, "api_ready", return_value=True), \
+                patch.object(urllib.request, "urlopen", side_effect=lambda url, timeout: order.append(url.rsplit("/", 1)[1])):
+            dashboard.engine.stop_api()
+            self.assertIsNone(dashboard.engine.API_PROCESS)
+        # The exit command ends the engine, which ManagedProcess takes for a failure unless stop() came first.
+        self.assertEqual(order, ["stop", "control?command=exit"])
+
     @unittest.skipUnless(all(importlib.util.find_spec(name) for name in ("librosa", "torch")), "Needs restore_env's audio libraries")
     def test_detect_finds_where_a_recording_stops(self):
         import librosa
@@ -448,18 +473,17 @@ class DashboardTests(unittest.TestCase):
             dashboard.jobs.free_gpu_for("training")
             stop_api.assert_called_once()
 
-    def test_a_starting_gpu_job_keeps_the_voice_from_starting_itself(self):
+    def test_start_loads_the_voice_during_a_gpu_job(self):
         dashboard.config.APP_CONFIG["tts_device"] = "cuda"
         port = self.start_server()
-        start = lambda auto: json.loads(self.request(port, "POST", "/api/start-system", body=json.dumps({"auto": auto}), Host=f"127.0.0.1:{port}")[2])
+        body = json.dumps({"gpt": "a.ckpt", "sovits": "b.pth"})
         with patch.object(dashboard.system, "start_system") as start_system:
             with dashboard.jobs.gpu_reserved():
                 self.assertTrue(dashboard.jobs.gpu_busy())
-                self.assertEqual(start(True), {"ok": True, "started": False})
-                start_system.assert_not_called()
-                # Start pressed on purpose still loads the voice.
-                self.assertEqual(start(False), {"ok": True, "started": True})
-                start_system.assert_called_once()
+                # Start is pressed on purpose, for example to test a checkpoint during training.
+                answer = self.request(port, "POST", "/api/start-system", body=body, Host=f"127.0.0.1:{port}")[2]
+                self.assertEqual(json.loads(answer), {"ok": True})
+                start_system.assert_called_once_with("a.ckpt", "b.pth", "ShiftLeft")
         self.assertFalse(dashboard.jobs.gpu_busy())
 
     def test_a_running_job_fails_before_it_stops_the_voice(self):
@@ -785,6 +809,10 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual([(clip["wav"], clip["duration"], clip["text"]) for clip in listed["clips"]],
                          [("one.wav", 2.0, "First line."), ("two.wav", 0.5, "Short."), ("three.wav", 3.0, "Third line.")])
         self.assertEqual(listed["seconds"], 5.5)
+        # SoVITS training keeps clips longer than 0.6 s and shorter than 54 s.
+        self.assertEqual([clip["skipped"] for clip in listed["clips"]], ["", "Training skips clips of 0.6 s or less.", ""])
+        self.assertEqual([dashboard.datasets.training_skips(seconds) for seconds in (0.6, 0.61, 53.99, 54.0, None)],
+                         ["Training skips clips of 0.6 s or less.", "", "", "Training skips clips of 54 s or more.", ""])
         self.assertTrue(listed["clips"][0]["url"].startswith(f"/datasets/{dataset_id}/wavs/one.wav?v="))
         self.assertEqual(dashboard.datasets.update_dataset_clip(dataset_id, "one.wav", " First |  line\nagain. "), "First line again.")
         with self.assertRaisesRegex(RuntimeError, "needs its transcript"):
@@ -1113,25 +1141,26 @@ class DashboardTests(unittest.TestCase):
         root = dashboard.config.DATASETS_DIR / dataset_id
         for name, options, text in [("good", {}, "Good words."), ("noisy", {"background": 3000}, "Noisy words."),
                                     ("clipped", {"clip_at": 4000}, "Clipped words."), ("again", {}, "Good words."),
-                                    ("wrong", {"seconds": 2.0}, "Something else entirely.")]:
+                                    ("wrong", {"seconds": 2.0}, "Something else entirely."), ("short", {"seconds": 0.5}, "Hi.")]:
             self.write_speech(self.root / f"{name}.wav", **options)
             dashboard.datasets.add_dataset_clip(root, self.root / f"{name}.wav", name, f"{name}.wav", text)
         heard = {"good.wav": "Good words.", "noisy.wav": "Noisy words.", "clipped.wav": "Clipped words.", "again.wav": "Good words.",
-                 "wrong.wav": "Not what it says."}
+                 "wrong.wav": "Not what it says.", "short.wav": "Hi."}
         with patch.object(dashboard.asr, "transcribe_dataset_wav", side_effect=lambda path, language: heard[Path(path).name]):
             dashboard.clip_check.start_dataset_check(dataset_id)
             job = dashboard.jobs.JOBS["dataset-check"]
             job.thread.join(timeout=60)
         self.assertEqual(job.status, "done", job.lines)
         found = {row["wav"]: row for row in job.results}
-        self.assertEqual(sorted(found), ["again.wav", "clipped.wav", "noisy.wav", "wrong.wav"])
+        self.assertEqual(sorted(found), ["again.wav", "clipped.wav", "noisy.wav", "short.wav", "wrong.wav"])
+        self.assertEqual(found["short.wav"]["problems"][0], "Training skips clips of 0.6 s or less.")
         self.assertIn("Loud background", found["noisy.wav"]["problems"][0])
         self.assertIn("Distorted", found["clipped.wav"]["problems"][0])
         self.assertEqual(found["again.wav"]["problems"], ["The same audio as good.wav."])
         self.assertEqual((found["wrong.wav"]["problems"], found["wrong.wav"]["heard"]),
                          (["The transcript differs from what speech recognition hears."], "Not what it says."))
         self.assertIsNone(found["noisy.wav"]["heard"])
-        self.assertEqual(job.lines[-1], "Done. 4 of 5 clips need a look.")
+        self.assertEqual(job.lines[-1], "Done. 5 of 6 clips need a look.")
         with patch.object(dashboard.asr, "transcribe_dataset_wav", side_effect=lambda path, language: time.sleep(0.2) or "Words."):
             dashboard.clip_check.start_dataset_check(dataset_id)
             with self.assertRaisesRegex(RuntimeError, "already running"):

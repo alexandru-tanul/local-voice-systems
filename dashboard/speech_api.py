@@ -125,7 +125,7 @@ def speak_for_api(body):
             raise SpeechApiError(400, f"The {label} model of {voice['name']}, {settings.get(kind)}, is no longer in GPT-SoVITS. "
                                       "Speak a line with the voice on Text to Voice again.", param="voice")
     if not engine.api_ready():
-        # As with Mic to Voice, nothing starts by itself while a job uses the GPU.
+        # While a job uses the GPU, a program cannot start the voice engine.
         if jobs.gpu_busy():
             raise SpeechApiError(503, "Training or another GPU job is running, and the voice engine starts when it ends.", "server_error")
         engine.start_api(settings["gpt"], settings["sovits"])
