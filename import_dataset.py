@@ -20,7 +20,7 @@ import csv
 import sys
 from pathlib import Path
 
-import voice_dashboard as dashboard
+from dashboard import datasets
 
 AUDIO_SUFFIXES = {".wav", ".ogg", ".mp3", ".flac", ".m4a", ".aac", ".opus", ".wma"}
 
@@ -62,9 +62,9 @@ def main():
     transcripts = read_transcripts(args.transcripts) if args.transcripts else {}
 
     if args.existing:
-        dataset_id = dashboard.dataset_descriptor(dashboard.dataset_id_for_name(args.name))["id"]
+        dataset_id = datasets.dataset_descriptor(datasets.dataset_id_for_name(args.name))["id"]
     else:
-        dataset_id = dashboard.create_dataset(args.name, args.speaker, args.language)["id"]
+        dataset_id = datasets.create_dataset(args.name, args.speaker, args.language)["id"]
 
     added = 0
     missing = []
@@ -73,7 +73,7 @@ def main():
         if not text:
             missing.append(path.name)
             continue
-        dashboard.add_dataset_audio(
+        datasets.add_dataset_audio(
             dataset_id,
             path.name,
             base64.b64encode(path.read_bytes()).decode("ascii"),

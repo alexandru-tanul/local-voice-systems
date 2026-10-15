@@ -6,7 +6,7 @@ if (Test-Path -LiteralPath $configPath) {
     try { $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json } catch { }
 }
 
-# Port lookup, the same as in voice_dashboard.py and Launch-Voice-Dashboard.ps1:
+# Port lookup, the same as in dashboard/config.py and Launch-Voice-Dashboard.ps1:
 # VOICE_DASHBOARD_PORT, then config.json "dashboard_port", then 8790.
 $port = 8790
 $configuredPort = 0
