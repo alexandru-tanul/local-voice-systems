@@ -651,6 +651,34 @@ class DashboardTests(unittest.TestCase):
             dashboard.stop_in_wsl(dashboard.WSL_STOP_SCRIPTS["api"])
         self.assertEqual(run.call_args[0][0][-1], dashboard.WSL_STOP_SCRIPTS["api"])
 
+    def test_the_page_and_its_files_are_served(self):
+        port = self.start_server()
+
+        def get(path):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                connection.request("GET", path, headers={"Host": f"127.0.0.1:{port}"})
+                response = connection.getresponse()
+                return response.status, response.getheader("Content-Type"), response.read()
+            finally:
+                connection.close()
+
+        def text(name):
+            return (dashboard.STATIC_DIR / name).read_text(encoding="utf-8").encode("utf-8")
+
+        page = get("/")
+        self.assertEqual(page, (200, "text/html; charset=utf-8", text("index.html")))
+        # The page loads its style and script by these paths.
+        for name, content_type in [("app.css", "text/css"), ("app.js", "text/javascript")]:
+            with self.subTest(name=name):
+                self.assertIn(f'"/static/{name}"'.encode(), page[2])
+                self.assertEqual(get(f"/static/{name}"), (200, f"{content_type}; charset=utf-8", text(name)))
+        # Nothing else is reachable through /static/.
+        for path in ["/static/", "/static/../voice_dashboard.py", "/static/..%2fconfig.json", "/static/C:app.js",
+                     "/static/sub/app.js", "/static/missing.js", "/static/index.py"]:
+            with self.subTest(path=path):
+                self.assertEqual(get(path)[0], 404)
+
     def test_server_rejects_requests_from_other_sites(self):
         port = self.start_server()
 

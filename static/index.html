@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Local Voice Systems</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header>
+    <h1>Local Voice Systems</h1>
+    <nav class="tablist" role="tablist" aria-label="Pages">
+      <button class="tab-button" data-tab="relay" role="tab" aria-selected="false">Mic to Voice</button>
+      <button class="tab-button" data-tab="generate" role="tab" aria-selected="false">Text to Voice</button>
+      <button class="tab-button" data-tab="training" role="tab" aria-selected="false">Voice Training</button>
+      <button class="tab-button tab-tool" data-tab="logs" role="tab" aria-selected="false">Logs</button>
+      <button class="tab-button" data-tab="setup" role="tab" aria-selected="false">System Check</button>
+    </nav>
+    <button class="secondary mini-button guide-button" id="openGuide" title="Take a tour of the dashboard">Guide</button>
+    <div class="sr-only" id="recentActivity" aria-live="polite">Dashboard loaded. System is stopped.</div>
+  </header>
+  <div class="global-error" id="globalError"><span id="globalErrorText"></span><div class="row"><button class="secondary mini-button" id="openErrorLogs">Open Logs</button><button class="danger mini-button" id="dismissError">Dismiss</button></div></div>
+
+  <main>
+      <section id="tab-generate" class="tab-panel side-page" role="tabpanel">
+        <aside class="history" aria-label="Generated lines">
+          <button class="secondary history-new" id="generateNewLine">+ New line</button>
+          <div class="history-list" id="generateHistory" role="listbox" aria-label="Lines generated in this session"></div>
+          <div class="history-foot"><span class="small" id="generateHistoryCount">Nothing generated yet</span></div>
+        </aside>
+        <div class="workspace">
+          <div class="no-voice-note">
+            <p>You have no voice yet. On Voice Training, create a dataset, add one clean 3 to 10 second clip with its exact words, and press Sync Only.</p>
+            <div class="row" style="justify-content: center;"><button data-go="training">Go to Voice Training</button><button class="secondary" data-import-voice>Import a voice</button></div>
+          </div>
+          <div class="compose">
+            <label class="sr-only" for="targetText">Text to speak</label>
+            <textarea id="targetText" placeholder="Type what the voice should say">Please remain calm. Your message is being processed.</textarea>
+            <div class="voice-line">
+              <div><label for="voiceDataset">Voice</label><select id="voiceDataset"></select></div>
+              <div><label for="reference">Reference clip (3-10 s)</label><select id="reference"></select></div>
+              <div><label>Preview</label><audio id="refAudio" data-label="reference clip"></audio></div>
+            </div>
+            <div class="compose-actions">
+              <button id="generate">Generate</button>
+              <button class="secondary icon-button" id="openGenerateSettings" aria-haspopup="dialog" aria-label="Settings" title="Settings: reference text, extra clips, models, and generation settings"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+            </div>
+            <div class="status-line compose-status" id="generateStatus" role="status"></div>
+            <div class="generate-result" id="generateResult" hidden>
+              <audio id="outputAudio" data-label="generated line"></audio>
+              <div class="small output-name" id="outputName"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-relay" class="tab-panel relay-page" role="tabpanel">
+        <button class="secondary mini-button history-toggle" id="historyToggle" aria-expanded="false" aria-controls="relayHistory">Recordings <span id="historyCount"></span></button>
+        <aside class="history" id="relayHistory" aria-label="Recordings">
+          <button class="secondary history-new" id="relayNewRecording">+ New recording</button>
+          <div class="history-list" id="relayQueue" role="listbox" aria-label="Recordings from this session"></div>
+          <div class="history-foot">
+            <span class="small" id="relayQueueCount">0 waiting</span>
+            <button class="secondary mini-button" id="relayClearQueue" hidden>Clear waiting</button>
+          </div>
+        </aside>
+
+        <div class="workspace" id="relayWorkspace" data-view="capture">
+          <div class="capture" id="relayCapture">
+            <div class="no-voice-note">
+              <p>You have no voice yet. Create one on Voice Training, then come back here to speak through it.</p>
+              <div class="row" style="justify-content: center;"><button data-go="training">Go to Voice Training</button><button class="secondary" data-import-voice>Import a voice</button></div>
+            </div>
+            <button class="talk-button" id="relayPttButton" aria-label="Hold to talk" aria-describedby="relayStatusText relayStatusHint">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/><path d="M8 21h8"/></svg>
+            </button>
+            <div class="capture-status" id="relayStatusBox" role="status" aria-live="polite">
+              <span class="status-icon" id="relayStatusIcon" aria-hidden="true"></span>
+              <span class="status-text" id="relayStatusText">Hold to talk</span>
+              <button class="danger mini-button cancel-generation" id="relayCancelCurrent">Cancel</button>
+            </div>
+            <div class="capture-hint" id="relayStatusHint"></div>
+            <div class="shortcut-control">
+              <button class="shortcut" id="relaySetPttKey" type="button" aria-label="Push-to-talk shortcut. Activate to change.">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6 14h.01M18 14h.01M9 14h6"/></svg>
+                <span class="keycaps" id="relayPttKeyLabel"></span>
+              </button>
+              <input id="relayPttKey" type="hidden" value="ShiftLeft" />
+              <span class="shortcut-note" id="relayShortcutNote"></span>
+            </div>
+            <div class="relay-options">
+              <button class="mini-button" id="startSystem" title="Start speech recognition, the voice engine, and the global push-to-talk key" hidden>Start</button>
+              <label class="switch" title="On: record while the key or button is held. Off: voice activation records whenever speech is heard."><input id="relayPushToTalk" type="checkbox" checked /><span class="switch-track" aria-hidden="true"></span>Hold to talk<span class="switch-state" aria-hidden="true"></span></label>
+              <label class="switch" title="On: each transcript is spoken in the selected voice automatically. Off: transcribe only."><input id="relayAutoSpeak" type="checkbox" checked /><span class="switch-track" aria-hidden="true"></span>Speak automatically<span class="switch-state" aria-hidden="true"></span></label>
+              <button class="secondary icon-button" id="openRelaySettings" aria-haspopup="dialog" aria-label="Settings" title="Settings: output device, volume, voice models, and generation settings"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+            </div>
+            <details class="manual-line" id="relayManual">
+              <summary>Type a line instead</summary>
+              <div class="manual-body">
+                <label class="sr-only" for="relayManualText">Line to speak</label>
+                <textarea id="relayManualText" placeholder="Type a line for the voice to speak"></textarea>
+                <button class="mini-button" id="relaySpeakManual">Speak this line</button>
+              </div>
+            </details>
+          </div>
+
+          <div class="result" id="relayResult" hidden>
+            <div>
+              <div class="result-label">Transcript</div>
+              <div class="result-transcript" id="relayTranscript"></div>
+            </div>
+            <div id="relayPlayerBlock" hidden>
+              <div class="result-label">Generated voice</div>
+              <div class="result-player" id="relayPlayer">
+                <audio id="relayAudio" data-label="generated line" data-settings-volume></audio>
+                <button class="secondary mini-button" id="relayPlayThis" hidden>Play</button>
+                <button class="secondary mini-button" id="relayReplayLast">Replay</button>
+              </div>
+            </div>
+            <div class="result-actions" id="relayResultActions"></div>
+            <div class="result-meta" id="relayNowPlaying"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-training" class="tab-panel side-page" role="tabpanel">
+        <aside class="history train-only" aria-label="Datasets">
+          <button class="secondary history-new" id="newDatasetButton" aria-haspopup="dialog">+ New dataset</button>
+          <div class="history-list" id="datasetList" role="listbox" aria-label="Datasets"></div>
+          <div class="history-foot"><span class="small" id="datasetListCount">No datasets yet</span></div>
+        </aside>
+        <aside class="history restore-only" aria-label="Recordings to restore">
+          <button class="secondary history-new" id="restoreAddButton">+ Add audio files</button>
+          <input id="restoreFiles" type="file" accept="audio/*,.wav,.ogg,.mp3,.flac,.m4a" multiple hidden />
+          <div class="history-list" id="restoreList" aria-label="Recordings to restore"></div>
+          <div class="history-foot"><span class="small" id="restoreCount">No audio yet</span></div>
+        </aside>
+        <div class="workspace training-workspace">
+          <!-- The selected dataset. The list on the left sets it. -->
+          <select id="trainingDataset" hidden></select>
+          <div class="mode-tabs" role="tablist" aria-label="Voice Training">
+            <button class="secondary" role="tab" id="trainingModeTrain" data-mode="train" aria-selected="true">Train</button>
+            <button class="secondary" role="tab" id="trainingModeRestore" data-mode="restore" aria-selected="false">Restore audio</button>
+          </div>
+          <div class="empty-note train-only" id="noDatasets" hidden>
+            <p>No voice yet. A voice starts as a dataset: one clean 3 to 10 second clip and its exact words.</p>
+            <button id="newDatasetEmpty" aria-haspopup="dialog">Create a dataset</button>
+          </div>
+          <div class="steps train-only" id="trainingSteps">
+            <div class="step" id="clipsStep">
+              <div class="step-head"><h3><span class="step-number">1</span>Clips</h3><span class="status-line" id="trainingDatasetStatus"></span></div>
+              <div class="small clip-summary" id="clipSummary"></div>
+              <div class="clip-check" id="checkRow" hidden>
+                <button class="secondary" id="checkClips" title="Finds clips with a wrong transcript, noise, distortion, or the same audio twice">Check clips</button>
+                <button class="danger" data-stop="dataset-check" id="checkClipsStop" hidden>Stop</button>
+                <label id="checkFilterLabel" hidden><input type="checkbox" id="checkFilter" /> Only clips to look at</label>
+                <span class="status-line" id="checkStatus"></span>
+              </div>
+              <div class="clip-list" id="clipList" aria-label="Clips in the dataset"></div>
+              <div class="row">
+                <button class="secondary" id="datasetAddFiles">+ Add audio</button>
+                <input id="datasetAudioFiles" type="file" accept="audio/*,.wav,.ogg,.mp3,.flac,.m4a" multiple hidden aria-label="Audio files to add" />
+                <button class="danger" data-stop="dataset-cut" id="datasetCutStop" hidden>Stop cutting</button>
+                <span class="status-line" id="datasetCutStatus"></span>
+              </div>
+              <div class="small">Recordings over 20 seconds are cut into clips at pauses.</div>
+              <div class="small" id="datasetUploadHint" hidden>Transcripts are written automatically. Check each one, then add the files.</div>
+              <div class="upload-list" id="datasetUploadRows"></div>
+              <div class="row"><button id="uploadDatasetAudio" disabled hidden>Add Files to Dataset</button><span class="status-line" id="datasetUploadProgress"></span></div>
+            </div>
+
+            <div class="step" id="prepareStep">
+              <div class="step-head"><h3><span class="step-number">2</span>Prepare</h3><span class="status-line" id="datasetPrepareStatus">Not prepared in this session.</span></div>
+              <div class="small">Sync Only copies the clips to WSL, which is all Text to Voice and Mic to Voice need. Sync &amp; Prepare also extracts the features that training needs, on the GPU.</div>
+              <div class="field-row">
+                <div>
+                  <label for="trainingModelName">Model name</label>
+                  <input id="trainingModelName" value="voice-model" placeholder="Example: station-announcer" />
+                  <div class="small" style="margin-top: 6px;">Saved checkpoints use: <strong id="trainingModelSlug">voice-model</strong></div>
+                </div>
+              </div>
+              <div class="row">
+                <button class="secondary" id="syncDataset">Sync Only</button>
+                <button id="prepareDataset">Sync &amp; Prepare</button>
+                <button class="danger" data-stop="dataset-prepare">Stop Preparation</button>
+              </div>
+            </div>
+
+            <div class="step" id="trainPanel">
+              <div class="step-head"><h3><span class="step-number">3</span>Train</h3><span class="status-line" id="trainingJobsStatus"></span></div>
+              <div class="grid2">
+                <div class="training-project">
+                  <h4>SoVITS</h4>
+                  <label for="sovitsVersion">Version</label><select id="sovitsVersion">
+                    <option value="v2Pro">v2Pro</option>
+                    <option value="v2ProPlus">v2ProPlus, better quality, more GPU memory</option>
+                  </select>
+                  <label for="sovitsEpochs">Total epochs</label><input id="sovitsEpochs" type="number" value="16" min="1" />
+                  <label for="sovitsBatch">Batch size</label><input id="sovitsBatch" type="number" value="1" min="1" />
+                  <label for="sovitsSave">Save every N epochs</label><input id="sovitsSave" type="number" value="4" min="1" />
+                  <div class="row" style="margin-top: 10px;">
+                    <button id="trainSovits">Train SoVITS</button>
+                    <button class="danger" data-stop="train-sovits">Stop</button>
+                  </div>
+                  <div class="status-line" id="trainSovitsStatus" style="margin-top: 8px;"></div>
+                  <div class="progress-bar" id="trainSovitsBar" hidden><span></span></div>
+                </div>
+                <div class="training-project">
+                  <h4>GPT</h4>
+                  <label for="gptEpochs">Total epochs</label><input id="gptEpochs" type="number" value="32" min="1" />
+                  <label for="gptBatch">Batch size</label><input id="gptBatch" type="number" value="1" min="1" />
+                  <label for="gptSave">Save every N epochs</label><input id="gptSave" type="number" value="5" min="1" />
+                  <div class="row" style="margin-top: 10px;">
+                    <button id="trainGpt">Train GPT</button>
+                    <button class="danger" data-stop="train-gpt">Stop</button>
+                  </div>
+                  <div class="status-line" id="trainGptStatus" style="margin-top: 8px;"></div>
+                  <div class="progress-bar" id="trainGptBar" hidden><span></span></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="step" id="compareStep">
+              <div class="step-head"><h3><span class="step-number">4</span>Compare epochs</h3><span class="status-line" id="compareStatus"></span></div>
+              <div class="small" id="compareInfo">Generates one line with each saved epoch, so you can choose the best by ear.</div>
+              <div class="field-row">
+                <div><label for="compareKind">Compare</label><select id="compareKind"><option value="sovits">SoVITS epochs</option><option value="gpt">GPT epochs</option></select></div>
+                <div><label for="compareReference">Reference clip</label><select id="compareReference"></select></div>
+              </div>
+              <div><label for="compareText">Test line</label><input id="compareText" value="This is how my new voice sounds." /></div>
+              <div class="row"><button id="compareRun">Compare</button><button class="danger" data-stop="compare" id="compareStop" hidden>Stop</button></div>
+              <div class="compare-list" id="compareResults"></div>
+            </div>
+
+            <details class="sub">
+              <summary>Saved models <span class="small" id="modelCount"></span></summary>
+              <div class="sub-body"><div class="models" id="modelList" style="border-top: 0; padding-top: 0; margin-top: 0;"></div></div>
+            </details>
+          </div>
+          <div class="restore-only restore-panel">
+            <div class="empty-note" id="restoreEmpty" hidden>
+              <p>Clean up noisy or low-quality recordings before training.</p>
+              <button id="restoreAddEmpty">Add audio files</button>
+            </div>
+            <div class="steps" id="restoreSteps" hidden>
+              <div class="step">
+                <div class="step-head"><h3 id="restoreTitle"></h3><span class="status-line" id="restoreInfo"></span></div>
+                <div id="restoreParentBlock" hidden><label>Before</label><audio id="restoreParent" data-label="recording before restoring"></audio></div>
+                <div><label id="restoreItemLabel">Recording</label><audio id="restoreItem" data-label="recording"></audio></div>
+                <div class="small" id="restoreHistory"></div>
+                <div class="row">
+                  <button class="secondary" id="restoreToDataset">Add to dataset</button>
+                  <button class="secondary" id="restoreDownload">Download</button>
+                  <button class="danger" id="restoreDelete">Delete</button>
+                </div>
+              </div>
+              <div class="step">
+                <div class="step-head"><h3>Restore</h3><span class="status-line" id="restoreStatus"></span></div>
+                <div class="restore-options">
+                  <label><input type="checkbox" id="restoreMusic" /> Remove music and sound effects</label>
+                  <div><select id="restoreMusicModel" aria-label="Separation model">
+                    <option value="best">BS-Roformer, best quality</option>
+                    <option value="main">HP5, main voice only</option>
+                    <option value="all">HP2, all voices</option>
+                  </select></div>
+                  <label><input type="checkbox" id="restoreEcho" /> Remove echo and reverb</label>
+                  <div class="small">These two run on the GPU in WSL.</div>
+                  <div class="small warn-text" id="restoreMissing" hidden>Noise removal and high frequencies need <strong>Setup-Restore-Env.bat</strong>.</div>
+                  <label><input type="checkbox" id="restoreDenoise" /> Remove background noise</label>
+                  <div class="small">Best with Restore high frequencies on.</div>
+                  <label><input type="checkbox" id="restoreEnhance" checked /> Restore high frequencies</label>
+                </div>
+                <div class="field-row">
+                  <div><label for="restoreQuality">Original recording quality</label><select id="restoreQuality">
+                    <option value="detect">Detect from the audio</option>
+                    <option value="file">The file's own quality</option>
+                    <option value="8000">8 kHz</option>
+                    <option value="16000">16 kHz</option>
+                    <option value="22050">22.05 kHz</option>
+                    <option value="24000">24 kHz</option>
+                    <option value="32000">32 kHz</option>
+                    <option value="44100">44.1 kHz</option>
+                    <option value="48000">48 kHz</option>
+                  </select></div>
+                  <div><label for="restoreKeep">Keep the original sound up to (kHz)</label><input id="restoreKeep" type="number" min="1" max="24" step="0.5" placeholder="Automatic" /></div>
+                  <div><label for="restoreModel">LavaSR model</label><select id="restoreModel"><option value="v2">Version 2 (newer)</option><option value="v1">Version 1</option></select></div>
+                </div>
+                <label><input type="checkbox" id="restorePieces" /> Work in short pieces (for long recordings)</label>
+                <div class="row"><button id="restoreRun">Restore</button><button class="danger" data-stop="restore">Stop</button></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-logs" class="tab-panel page page-wide" role="tabpanel">
+        <div class="page-head">
+          <h2>Logs</h2>
+          <div class="log-tools">
+            <input id="logFilter" placeholder="Filter lines" aria-label="Filter log lines" />
+            <label><input id="logFollow" type="checkbox" checked /> Follow new lines</label>
+            <button class="secondary mini-button" id="copyLog">Copy all</button>
+            <span class="status-line" id="logStatus"></span>
+          </div>
+        </div>
+        <pre class="log" id="log" aria-live="off"></pre>
+      </section>
+
+      <section id="tab-setup" class="tab-panel page" role="tabpanel">
+        <div class="page-head"><h2>System Check</h2><span class="small">A read-only check of the software, models, GPU access, and audio devices the voice tools need. It starts nothing and changes nothing.</span></div>
+        <div class="panel">
+          <div class="row">
+            <button id="runSetupCheck">Run System Check</button>
+            <span class="status-line" id="setupSummary">No check has been run.</span>
+          </div>
+          <div class="setup-list" id="setupList"></div>
+          <details class="sub">
+            <summary>What this check inspects</summary>
+            <div class="sub-body">
+              <div class="setup-scope-grid" style="margin-top: 0;">
+                <div class="setup-scope-item">
+                  <strong>Software environment</strong>
+                  <div class="small">The dashboard Python runtime, GPT-SoVITS files in WSL, the speech-recognition environment and model cache, and the global push-to-talk helper.</div>
+                </div>
+                <div class="setup-scope-item">
+                  <strong>Models and GPU</strong>
+                  <div class="small">Counts GPT and SoVITS checkpoints, then asks PyTorch inside WSL whether GPU acceleration is available and which GPU it sees.</div>
+                </div>
+                <div class="setup-scope-item">
+                  <strong>Audio devices</strong>
+                  <div class="small">Briefly requests microphone permission, closes the stream at once, and lists microphone, output, and VB-CABLE devices. No audio is recorded or saved.</div>
+                </div>
+              </div>
+              <div class="setup-legend" style="margin: 0;"><span><strong>Ready:</strong> available now</span><span><strong>Needs configuration:</strong> installed but requires attention</span><span><strong>Missing:</strong> not detected</span></div>
+            </div>
+          </details>
+        </div>
+      </section>
+  </main>
+
+  <div class="island" id="systemIsland" role="region" aria-label="System status and global controls">
+    <div class="island-group" aria-label="Service status">
+      <span class="status-pill" id="relayAsrCard" title="Speech recognition service (local ASR)"><i class="dot" aria-hidden="true"></i>Speech <strong id="relayAsrStatus">Off</strong></span>
+      <span class="status-pill" id="relayTtsCard" title="Voice engine (GPT-SoVITS)"><i class="dot" aria-hidden="true"></i>Voice <strong id="relayTtsStatus">Off</strong></span>
+      <span class="status-pill" id="relayPttCard" title="Global push-to-talk helper (works when this page is not focused)"><i class="dot" aria-hidden="true"></i>Global key <strong id="relayPttStatus">Off</strong></span>
+    </div>
+    <div class="island-group">
+      <span class="island-system-state" id="systemChip" role="status">system stopped</span>
+      <button class="danger mini-button" id="stopSystem" title="Stop all managed services and the microphone. Recordings stay listed.">Stop Everything</button>
+    </div>
+  </div>
+
+  <dialog class="settings-dialog" id="relaySettingsDialog" aria-labelledby="relaySettingsTitle">
+    <form method="dialog" class="settings-head">
+      <h2 id="relaySettingsTitle">Audio and voice settings</h2>
+      <button class="secondary mini-button" value="close">Close</button>
+    </form>
+    <div class="settings-body">
+      <div>
+        <h3>Playback</h3>
+        <div class="relay-block-head">
+          <label for="relayOutputDevice">Output device</label>
+          <button class="secondary mini-button" id="refreshRelayDevices">Refresh</button>
+        </div>
+        <select id="relayOutputDevice"></select>
+        <div class="relay-volume-row" style="margin-top: 10px;">
+          <label for="relayVolume">Volume <span id="relayVolumeLabel">25%</span></label>
+          <input id="relayVolume" type="range" value="25" min="0" max="100" step="1" />
+          <label><input id="relayMonitorLocal" type="checkbox" checked /> Monitor locally</label>
+        </div>
+      </div>
+      <div>
+        <h3>Voice</h3>
+        <div class="grid2">
+          <div><label for="relayDataset" title="The dataset whose clips serve as voice references.">Voice dataset</label><select id="relayDataset"></select></div>
+          <div><label title="The semantic language model checkpoint used to compose speech.">GPT model</label><select id="relayGptModel"></select></div>
+          <div><label title="The acoustic voice checkpoint that produces the selected voice timbre.">SoVITS model</label><select id="relaySovitsModel"></select></div>
+          <div>
+            <label title="The main example clip used for voice character and delivery.">Reference style</label>
+            <select id="relayReference"></select>
+            <audio id="relayRefAudio" data-label="reference clip"></audio>
+          </div>
+        </div>
+        <details class="sub">
+          <summary>Extra reference clips <span class="small" id="relayAuxCount">0 selected</span></summary>
+          <div class="sub-body">
+            <div class="small">Optional additional clips for style. More clips can improve delivery but slow generation.</div>
+            <div class="row"><input id="relayAuxSearch" placeholder="Search clips" aria-label="Search clips" /><button class="secondary mini-button" id="relayClearAuxRefs">Clear</button></div>
+            <div id="relayAuxRefsList" class="check-list" style="height: 190px; margin-top: 0;"></div>
+            <div id="relayAuxSelectedList" class="selected-list" style="margin-top: 0;"></div>
+            <audio id="relayAuxPreview" data-label="clip"></audio>
+            <div class="small" id="relayAuxPreviewStatus"></div>
+          </div>
+        </details>
+      </div>
+      <div>
+        <h3>Generation</h3>
+        <label>Voice preset</label>
+        <div class="preset-row">
+          <button class="secondary mini-button" type="button" data-relay-profile="fast">Fast</button>
+          <button class="secondary mini-button" type="button" data-relay-profile="balanced">Balanced</button>
+          <button class="secondary mini-button" type="button" data-relay-profile="quality">Best Quality</button>
+        </div>
+        <div class="grid3" style="margin-top: 12px;">
+          <div><label title="Limits token choices. Lower values are more consistent; higher values add variation.">Top K</label><input id="relayTopK" type="number" min="1" max="100" value="15" /></div>
+          <div><label title="Controls how much of the probability distribution can be sampled.">Top P</label><input id="relayTopP" type="number" step="0.05" min="0" max="1" value="0.6" /></div>
+          <div><label title="Controls randomness. Lower is steadier; higher is more expressive.">Temperature</label><input id="relayTemperature" type="number" step="0.05" min="0" max="1" value="0.55" /></div>
+          <div><label title="Speech playback speed. 1.0 is normal speed.">Speed</label><input id="relaySpeed" type="number" step="0.05" min="0.5" max="1.5" value="0.95" /></div>
+          <div><label title="Pause inserted between generated fragments.">Pause</label><input id="relayPause" type="number" step="0.05" min="0" max="2" value="0.25" /></div>
+          <div><label title="Discourages repeated words or phrases.">Repetition penalty</label><input id="relayRepPenalty" type="number" step="0.05" min="1" max="2" value="1.35" /></div>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog class="settings-dialog" id="generateSettingsDialog" aria-labelledby="generateSettingsTitle">
+    <form method="dialog" class="settings-head">
+      <h2 id="generateSettingsTitle">Text to Voice settings</h2>
+      <button class="secondary mini-button" value="close">Close</button>
+    </form>
+    <div class="settings-body">
+      <div>
+        <h3>Reference clip</h3>
+        <label for="promptText">Text spoken in the reference clip</label>
+        <textarea id="promptText"></textarea>
+        <div class="small">Filled from the clip. Edit it only if the clip says something else.</div>
+      </div>
+      <details class="sub">
+        <summary>Extra reference clips <span class="small" id="auxCount">0 selected</span></summary>
+        <div class="sub-body">
+          <div class="small">Optional additional clips for style. More clips can improve delivery but slow generation.</div>
+          <div class="row"><input id="auxSearch" placeholder="Search clips" aria-label="Search clips" /><button class="secondary mini-button" id="clearAuxRefs">Clear</button></div>
+          <div id="auxRefsList" class="check-list"></div>
+          <div id="auxSelectedList" class="selected-list"></div>
+          <audio id="auxPreview" data-label="clip"></audio>
+          <div class="small" id="auxPreviewStatus"></div>
+        </div>
+      </details>
+      <div>
+        <h3>Engine and models <span class="status-line" id="engineStatus"></span></h3>
+        <div class="field-row">
+          <div><label for="gptModel">GPT model</label><select id="gptModel"></select></div>
+          <div><label for="sovitsModel">SoVITS model</label><select id="sovitsModel"></select></div>
+        </div>
+        <div class="row" style="margin-top: 10px;"><button class="secondary" id="startApi">Start Engine</button><button class="secondary" id="stopApi">Stop Engine</button><span class="small">Generate starts the engine on its own when it is off.</span></div>
+      </div>
+      <div>
+        <h3>Share this voice <span class="status-line" id="shareStatus"></span></h3>
+        <div class="row">
+          <button class="secondary" id="exportVoice">Export voice</button>
+          <button class="secondary" data-import-voice>Import a voice</button>
+        </div>
+        <div class="small">One file with both models and the reference clips, to give to someone or to keep.</div>
+      </div>
+      <div>
+        <h3>Use in other programs</h3>
+        <div class="small">Programs that work with OpenAI's speech service, such as Open WebUI and SillyTavern, can speak with your voices at <strong id="speechApiAddress">http://127.0.0.1:8790/v1</strong>. A voice is offered there once it has spoken a line here, and it speaks with that line's models, reference clip and settings.</div>
+      </div>
+      <div>
+        <h3>Generation</h3>
+        <div class="grid3">
+          <div><label for="textLang" title="Language of the text to speak. It follows the voice dataset's language when you choose a dataset.">Text language</label><select id="textLang"><option value="en">English</option><option value="zh">Chinese</option><option value="ja">Japanese</option><option value="ko">Korean</option><option value="yue">Cantonese</option></select></div>
+          <div><label for="splitMethod">Slice method</label><select id="splitMethod">
+            <option value="cut5">English punctuation</option>
+            <option value="cut4">Periods only</option>
+            <option value="cut0">Do not split</option>
+          </select></div>
+          <div><label for="seed">Seed</label><input id="seed" type="number" value="-1" /></div>
+          <div><label for="topK">Top K</label><input id="topK" type="number" min="1" max="100" value="15" /></div>
+          <div><label for="repPenalty">Repetition penalty</label><input id="repPenalty" type="number" step="0.05" min="1" max="2" value="1.35" /></div>
+          <div><label for="topP">Top P</label><input id="topP" type="number" step="0.05" min="0" max="1" value="0.6" /></div>
+          <div><label for="temperature">Temperature</label><input id="temperature" type="number" step="0.05" min="0" max="1" value="0.6" /></div>
+          <div><label for="speed">Speed</label><input id="speed" type="number" step="0.05" min="0.5" max="1.5" value="1" /></div>
+          <div><label for="pause">Pause</label><input id="pause" type="number" step="0.05" min="0" max="2" value="0.3" /></div>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog class="settings-dialog small-dialog" id="createDatasetDialog" aria-labelledby="createDatasetTitle">
+    <form method="dialog" class="settings-head">
+      <h2 id="createDatasetTitle">New dataset</h2>
+      <button class="secondary mini-button" value="close">Close</button>
+    </form>
+    <div class="settings-body">
+      <div class="field-row">
+        <div><label for="newDatasetName">Dataset name</label><input id="newDatasetName" placeholder="Example: Station Announcer" /></div>
+        <div><label for="newDatasetLanguage">Language</label><select id="newDatasetLanguage"><option value="en">English</option><option value="zh">Chinese</option><option value="ja">Japanese</option><option value="ko">Korean</option><option value="yue">Cantonese</option></select></div>
+      </div>
+      <div><label for="newDatasetSpeaker">Default speaker name</label><input id="newDatasetSpeaker" value="speaker" /></div>
+      <div><button id="createDataset">Create Dataset</button></div>
+    </div>
+  </dialog>
+
+  <dialog class="settings-dialog small-dialog" id="welcomeDialog" aria-labelledby="welcomeTitle">
+    <div class="settings-body">
+      <h2 id="welcomeTitle">Welcome to Local Voice Systems</h2>
+      <p>Looks like this is your first time here. Do you want a quick rundown?</p>
+      <div class="row">
+        <button id="welcomeYes">Show me</button>
+        <button class="secondary" id="welcomeNo">No thanks</button>
+      </div>
+      <div class="small">You can take the tour later with the Guide button at the top.</div>
+    </div>
+  </dialog>
+
+  <div class="tour" id="tour" hidden>
+    <div class="tour-spot" id="tourSpot"></div>
+    <div class="tour-pop" id="tourPop" role="dialog" aria-modal="true" aria-labelledby="tourTitle" aria-describedby="tourText">
+      <div class="tour-count" id="tourCount"></div>
+      <h2 id="tourTitle"></h2>
+      <p id="tourText"></p>
+      <div class="tour-actions">
+        <button class="secondary" id="tourEnd">End tour</button>
+        <button class="secondary" id="tourBack">Back</button>
+        <button id="tourNext">Next</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
