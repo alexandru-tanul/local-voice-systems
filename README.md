@@ -83,9 +83,9 @@ Optional keys, for when a port is taken or you want a different setting:
 | `dashboard_port` | `8790` | Port of the dashboard page |
 | `asr_port` | `8792` | Port of speech recognition |
 | `tts_port` | `9880` | Port of the voice engine in WSL |
-| `asr_model` | `base.en` | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) model, for example `small.en` for better accuracy |
+| `asr_model` | `base.en` | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) model of Mic to Voice, for example `small.en` for better accuracy; for other languages it uses the same model without `.en`, or `base` for the English-only `distil` models and for a folder or repository ending in `.en` |
 | `dataset_asr_model` | `small.en`, or `small` for other languages | faster-whisper model that writes dataset transcripts |
-| `asr_model_dir` | `cache_dir/faster-whisper` | Download folder of the speech models |
+| `asr_model_dir` | `cache_dir/faster-whisper` | Download folder of the speech and translation models |
 | `cache_dir`, `tmp_dir` | `.cache`, `cache_dir/tmp` | Download caches and temporary files |
 | `dashboard_python` | `relay_env` | Python that runs the dashboard |
 | `restore_python` | `restore_env` | Python that runs Restore audio |
@@ -108,7 +108,10 @@ The first time, the dashboard offers a short tour that explains each page. **Gui
 3. On **Mic to Voice**, press **Start**, then hold push-to-talk, speak, and release. Choose audio output in **Settings**.
    **Start** turns on speech recognition, the voice engine, and the global push-to-talk key, and **Stop Everything** stops them.
    **Sync & Prepare** and training stop them first to free GPU memory.
-   Mic to Voice understands English speech and speaks it in the selected voice, whatever the dataset's language.
+   **Settings** sets the language you speak and the language the voice speaks: English, Chinese, Japanese, Korean or Cantonese, both English at first.
+   When they differ, your words are translated by [NLLB-200](https://huggingface.co/facebook/nllb-200-distilled-600M) on the CPU, which downloads about 650 MB on first use. **Its license, CC-BY-NC 4.0, allows only non-commercial use.**
+   Chinese and Cantonese need no translation between them: both are written in Chinese characters, which the voice reads in either.
+   Speech in languages other than English uses one more speech recognition model, downloaded on first use: about 145 MB with the standard `asr_model`. A voice sounds best in the language of its own clips.
 
 Datasets can be English, Chinese, Japanese, Korean, or Cantonese.
 To train a voice, add more clips, press **Sync & Prepare**, then train SoVITS and GPT with batch size 1. Each shows its progress by epoch.
@@ -164,4 +167,4 @@ python -m unittest discover -s tests
 CI checks Windows and Linux. Training and generation were tested on Windows 10 with an AMD Radeon RX 7900 XTX, through ROCm in WSL2, and CPU synthesis in Ubuntu. NVIDIA GPUs remain untested.
 `Setup-Engine.bat` was tested with the CPU and AMD builds, each in a fresh Ubuntu 24.04.
 
-[GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) with the [UVR5](https://github.com/Anjok07/ultimatevocalremovergui) separation models · [faster-whisper](https://github.com/SYSTRAN/faster-whisper) · [LavaSR](https://github.com/ysharma3501/LavaSR) (Apache-2.0) with the [UL-UNAS](https://github.com/Xiaobin-Rong/ul-unas) noise remover (MIT), downloaded by `Setup-Restore-Env.bat` · [MIT](LICENSE)
+[GPT-SoVITS](https://github.com/RVC-Boss/GPT-SoVITS) with the [UVR5](https://github.com/Anjok07/ultimatevocalremovergui) separation models · [faster-whisper](https://github.com/SYSTRAN/faster-whisper) · [NLLB-200](https://huggingface.co/facebook/nllb-200-distilled-600M) (CC-BY-NC 4.0, non-commercial), downloaded for translation · [LavaSR](https://github.com/ysharma3501/LavaSR) (Apache-2.0) with the [UL-UNAS](https://github.com/Xiaobin-Rong/ul-unas) noise remover (MIT), downloaded by `Setup-Restore-Env.bat` · [MIT](LICENSE)

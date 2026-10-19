@@ -109,6 +109,10 @@
               <div class="result-label">Transcript</div>
               <div class="result-transcript" id="relayTranscript"></div>
             </div>
+            <div id="relayTranslationBlock" hidden>
+              <div class="result-label">Translation</div>
+              <div class="result-transcript" id="relayTranslation"></div>
+            </div>
             <div id="relayPlayerBlock" hidden>
               <div class="result-label">Generated voice</div>
               <div class="result-player" id="relayPlayer">
@@ -392,6 +396,32 @@
             <div class="small" id="relayAuxPreviewStatus"></div>
           </div>
         </details>
+      </div>
+      <div>
+        <h3>Language</h3>
+        <div class="grid2">
+          <div>
+            <label for="relaySpoken">You speak</label>
+            <select id="relaySpoken">
+              <option value="en">English</option>
+              <option value="zh">Chinese (Mandarin)</option>
+              <option value="ja">Japanese</option>
+              <option value="ko">Korean</option>
+              <option value="yue">Cantonese</option>
+            </select>
+          </div>
+          <div>
+            <label for="relaySpeaks">The voice speaks</label>
+            <select id="relaySpeaks">
+              <option value="en">English</option>
+              <option value="zh">Chinese (Mandarin)</option>
+              <option value="ja">Japanese</option>
+              <option value="ko">Korean</option>
+              <option value="yue">Cantonese</option>
+            </select>
+          </div>
+        </div>
+        <div class="small" id="relayLanguageNote" hidden></div>
       </div>
       <div>
         <h3>Generation</h3>

@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 import wave
 import zipfile
@@ -476,15 +477,33 @@ class DashboardTests(unittest.TestCase):
     def test_start_loads_the_voice_during_a_gpu_job(self):
         dashboard.config.APP_CONFIG["tts_device"] = "cuda"
         port = self.start_server()
-        body = json.dumps({"gpt": "a.ckpt", "sovits": "b.pth"})
+        body = json.dumps({"gpt": "a.ckpt", "sovits": "b.pth", "spoken": "ja", "speaks": "en"})
         with patch.object(dashboard.system, "start_system") as start_system:
             with dashboard.jobs.gpu_reserved():
                 self.assertTrue(dashboard.jobs.gpu_busy())
                 # Start is pressed on purpose, for example to test a checkpoint during training.
                 answer = self.request(port, "POST", "/api/start-system", body=body, Host=f"127.0.0.1:{port}")[2]
                 self.assertEqual(json.loads(answer), {"ok": True})
-                start_system.assert_called_once_with("a.ckpt", "b.pth", "ShiftLeft")
+                # The languages go along, so their models load while the system starts.
+                start_system.assert_called_once_with("a.ckpt", "b.pth", "ShiftLeft", "ja", "en")
         self.assertFalse(dashboard.jobs.gpu_busy())
+
+    def test_mic_to_voice_requests_carry_the_languages(self):
+        port = self.start_server()
+        post = lambda path, data: json.loads(self.request(port, "POST", path, body=json.dumps(data), Host=f"127.0.0.1:{port}")[2])
+        with patch.object(dashboard.asr, "transcribe_relay", return_value={"text": "Hi.", "heard": "やあ。"}) as transcribe, \
+                patch.object(dashboard.asr, "translate_relay", return_value="こんにちは。") as translate:
+            self.assertEqual(post("/api/transcribe", {"audio_base64": "QUJD", "spoken": "ja", "speaks": "en"}),
+                             {"ok": True, "text": "Hi.", "heard": "やあ。"})
+            transcribe.assert_called_once_with("QUJD", "ja", "en")
+            self.assertEqual(post("/api/translate", {"text": " Hello \n there ", "spoken": "en", "speaks": "ja"}),
+                             {"ok": True, "text": "こんにちは。", "heard": "Hello there"})
+            # A language that the voice cannot speak counts as English.
+            post("/api/translate", {"text": "Hi.", "spoken": "fr", "speaks": "ja"})
+            translate.assert_called_with("Hi.", "en", "ja")
+            # The page from before languages were added sends none.
+            post("/api/transcribe", {"audio_base64": "QUJD"})
+            transcribe.assert_called_with("QUJD", "en", "en")
 
     def test_a_running_job_fails_before_it_stops_the_voice(self):
         running = MagicMock(**{"running.return_value": True})
@@ -906,6 +925,185 @@ class DashboardTests(unittest.TestCase):
                     dashboard.asr.transcribe_dataset_wav(wav, "en")
         self.assertEqual(loaded, ["small.en", "small", "large-v3"])
         self.assertEqual([(call["language"], call["beam_size"], call["vad_filter"]) for call in calls], [("en", 5, False), ("zh", 5, False), ("yue", 5, False)])
+
+    def test_mic_to_voice_hears_and_speaks_the_chosen_languages(self):
+        calls = []
+        loaded = []
+        translated = []
+
+        class Model:
+            def transcribe(self, path, **options):
+                calls.append(options)
+                return [MagicMock(text=" 駅で会いましょう。 ")], MagicMock(language=options["language"])
+
+        server = relay_asr_server.Server(("127.0.0.1", 0), relay_asr_server.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        wav = self.root / "line.wav"
+        self.write_wav(wav, 1.0, rate=16000)
+        audio = base64.b64encode(wav.read_bytes()).decode("ascii")
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        with (
+            patch.object(relay_asr_server, "load_model", side_effect=lambda name=None: loaded.append(name) or Model()),
+            patch.object(relay_asr_server, "load_translator") as load_translator,
+            patch.object(relay_asr_server, "translate_text",
+                         side_effect=lambda text, source, target: translated.append((text, source, target)) or "See you at the station."),
+            patch.object(relay_asr_server, "TMP_DIR", self.root / "asr"),
+            patch.object(dashboard.config, "RELAY_ASR_URL", url),
+            patch.object(dashboard.config, "RELAY_ASR_MODEL", "base.en"),
+            patch.object(dashboard.asr, "relay_asr_ready", return_value=True),
+        ):
+            # Japanese speech, which the voice says in English.
+            self.assertEqual(dashboard.asr.transcribe_relay(audio, "ja", "en"), {"text": "See you at the station.", "heard": "駅で会いましょう。"})
+            # The same language needs no translation.
+            self.assertEqual(dashboard.asr.transcribe_relay(audio, "ja", "ja"), {"text": "駅で会いましょう。", "heard": ""})
+            # Whisper writes Cantonese as Chinese, which the voice also reads in Mandarin.
+            dashboard.asr.transcribe_relay(audio, "yue", "zh")
+            dashboard.asr.transcribe_relay(audio, "en", "en")
+            # Into another language, that Chinese is translated as Chinese, and large-v3's Cantonese as Cantonese.
+            dashboard.asr.transcribe_relay(audio, "yue", "en")
+            with patch.object(dashboard.config, "RELAY_ASR_MODEL", "large-v3"):
+                dashboard.asr.transcribe_relay(audio, "yue", "en")
+            # A typed line is translated in the same way, from the language spoken.
+            self.assertEqual(dashboard.asr.translate_relay("Bye.", "en", "yue"), "See you at the station.")
+            # The warm-up loads the model of the language spoken, and the translation model only when asked.
+            self.assertTrue(json.loads(urllib.request.urlopen(f"{url}/warmup?model=base&translation=0", timeout=5).read())["ok"])
+            load_translator.assert_not_called()
+            self.assertTrue(json.loads(urllib.request.urlopen(f"{url}/warmup?model=base&translation=1", timeout=5).read())["ok"])
+            load_translator.assert_called_once()
+            # A server from before languages were added does not know these addresses.
+            with self.assertRaisesRegex(RuntimeError, "older version"):
+                dashboard.asr.ask_relay_asr("/no-such-address", {})
+            # One from before the dataset transcripts hears every language with its own model.
+            with patch.object(relay_asr_server, "transcribe_wav", return_value={"ok": True, "text": "Hello.", "model": "base.en"}):
+                with self.assertRaisesRegex(RuntimeError, "older version"):
+                    dashboard.asr.transcribe_relay(audio, "ja", "ja")
+        self.assertEqual(loaded, ["base", "base", "base", "base.en", "base", "large-v3", "base", "base"])
+        self.assertEqual([call["language"] for call in calls], ["ja", "ja", "zh", "en", "zh", "yue"])
+        self.assertEqual(translated, [("駅で会いましょう。", "ja", "en"), ("駅で会いましょう。", "zh", "en"),
+                                      ("駅で会いましょう。", "yue", "en"), ("Bye.", "en", "yue")])
+
+    def test_the_warm_up_asks_for_the_models_of_the_languages(self):
+        urls = []
+        with patch.object(dashboard.config, "RELAY_ASR_MODEL", "base.en"), \
+                patch.object(urllib.request, "urlopen", side_effect=lambda url, timeout: urls.append(url) or io.BytesIO(b'{"ok": true}')):
+            for spoken, speaks in [("en", "en"), ("ja", "en"), ("yue", "zh"), ("en", "ko")]:
+                dashboard.asr.warm_up_relay_asr(spoken, speaks)
+        # English alone asks as before, so it also starts with a server from before languages were added.
+        self.assertEqual([url.split("/warmup")[1] for url in urls],
+                         ["", "?model=base&translation=1", "?model=base&translation=0", "?model=base.en&translation=1"])
+        # English keeps asr_model. Other languages need a model that knows them; the distil models
+        # know only English, with or without .en.
+        for model, other in [("small", "small"), ("tiny.en", "tiny"), ("large-v3", "large-v3"),
+                             ("distil-small.en", "base"), ("distil-large-v3", "base"),
+                             ("Systran/faster-distil-whisper-large-v3", "base"), ("C:\\models\\whisper-small.en", "base"),
+                             ("Systran/faster-whisper-large-v3", "Systran/faster-whisper-large-v3")]:
+            with self.subTest(model=model), patch.object(dashboard.config, "RELAY_ASR_MODEL", model):
+                self.assertEqual((dashboard.asr.relay_model("en"), dashboard.asr.relay_model("ja")), (model, other))
+
+    def test_a_failed_translation_says_so(self):
+        def ask(path, payload):
+            if path == "/transcribe":
+                return {"ok": True, "text": "Hello.", "model": payload["model"]}
+            raise RuntimeError("Could not load the translation model: offline")
+
+        with patch.object(dashboard.asr, "ensure_relay_asr"), patch.object(dashboard.asr, "ask_relay_asr", side_effect=ask):
+            # The page shows "Translation failed" rather than "Transcription failed" by these words.
+            with self.assertRaisesRegex(RuntimeError, "^Translation failed: Could not load the translation model: offline$"):
+                dashboard.asr.translate_relay("Hello.", "en", "ja")
+            with self.assertRaisesRegex(RuntimeError, "^Translation failed"):
+                dashboard.asr.transcribe_relay("QUJD", "en", "ja")
+
+    def test_the_speech_server_s_silence_is_explained(self):
+        def answer(error):
+            return patch.object(urllib.request, "urlopen", side_effect=error)
+
+        # A server from before languages were added does not know the warm-up's question.
+        with answer(urllib.error.HTTPError("http://127.0.0.1/warmup", 404, "Not Found", {}, None)):
+            with self.assertRaisesRegex(RuntimeError, "older version"):
+                dashboard.asr.warm_up_relay_asr("ja", "en")
+        # A first download that takes longer than the wait goes on in the server.
+        for error in (TimeoutError("timed out"), urllib.error.URLError(TimeoutError("timed out"))):
+            with self.subTest(error=error), answer(error):
+                with self.assertRaisesRegex(RuntimeError, "still downloading"):
+                    dashboard.asr.warm_up_relay_asr("ja", "en")
+                with self.assertRaisesRegex(RuntimeError, "still downloading"):
+                    dashboard.asr.ask_relay_asr("/transcribe", {})
+        # Other failures keep their own words.
+        with answer(urllib.error.URLError(ConnectionRefusedError("refused"))):
+            with self.assertRaisesRegex(urllib.error.URLError, "refused"):
+                dashboard.asr.ask_relay_asr("/transcribe", {})
+
+    def test_translation_reads_each_sentence_with_its_language_codes(self):
+        sent = {}
+
+        class Tokenizer:
+            def encode(self, text, add_special_tokens=True):
+                return MagicMock(tokens=text.split())
+
+            def token_to_id(self, token):
+                return token
+
+            def decode(self, ids, skip_special_tokens=True):
+                return " ".join(ids)
+
+        class Translator:
+            def translate_batch(self, batch, target_prefix, beam_size, max_decoding_length):
+                sent.update(batch=batch, prefix=target_prefix, longest=max_decoding_length)
+                # The model writes the target language's code, then the translation.
+                return [MagicMock(hypotheses=[[prefix[0], *(token.upper() for token in tokens[1:-1])]])
+                        for tokens, prefix in zip(batch, target_prefix)]
+
+        with patch.object(relay_asr_server, "load_translator", return_value=(Translator(), Tokenizer())) as load:
+            self.assertEqual(relay_asr_server.translate_text("Hello there. How are you?", "en", "ja"), "HELLO THERE.HOW ARE YOU?")
+            self.assertEqual(sent["batch"], [["eng_Latn", "Hello", "there.", "</s>"], ["eng_Latn", "How", "are", "you?", "</s>"]])
+            self.assertEqual(sent["prefix"], [["jpn_Jpan"], ["jpn_Jpan"]])
+            self.assertEqual(relay_asr_server.translate_text("駅で。 また明日！", "ja", "ko"), "駅で。 また明日！")
+            self.assertEqual(sent["prefix"], [["kor_Hang"], ["kor_Hang"]])
+            # A full stop inside a number ends no sentence.
+            relay_asr_server.translate_text("It costs 3.5 dollars. See you!", "en", "ko")
+            self.assertEqual(sent["batch"], [["eng_Latn", "It", "costs", "3.5", "dollars.", "</s>"], ["eng_Latn", "See", "you!", "</s>"]])
+            self.assertEqual(sent["longest"], 256)
+            # A long sentence without a full stop gets room for its whole translation, up to NLLB's 1024.
+            relay_asr_server.translate_text(" ".join(["word"] * 200), "en", "ja")
+            self.assertEqual(sent["longest"], 3 * 202)
+            relay_asr_server.translate_text(" ".join(["word"] * 900), "en", "ja")
+            self.assertEqual(sent["longest"], 1024)
+            load.reset_mock()
+            self.assertEqual(relay_asr_server.translate_text("  ", "en", "ja"), "")
+            load.assert_not_called()
+            with self.assertRaisesRegex(ValueError, "Translation is from and to"):
+                relay_asr_server.translate_text("Hello.", "en", "fr")
+
+    def test_the_translation_model_loads_whole_or_again(self):
+        folder = self.root / "snapshot"
+        folder.mkdir()
+        for name in relay_asr_server.TRANSLATION_FILES:
+            if name != "model.bin":
+                (folder / name).write_text("{}")
+        downloads = []
+
+        def snapshot_download(repo, local_files_only=False, **options):
+            downloads.append("offline" if local_files_only else "online")
+            if not local_files_only:
+                # The download completes the folder that one cut short had left.
+                (folder / "model.bin").write_bytes(b"model")
+            return str(folder)
+
+        tokenizer = MagicMock(**{"from_file.side_effect": [ValueError("broken tokenizer.json"), "tokenizer"]})
+        fakes = {"ctranslate2": MagicMock(**{"Translator.return_value": "model"}),
+                 "huggingface_hub": MagicMock(snapshot_download=snapshot_download), "tokenizers": MagicMock(Tokenizer=tokenizer)}
+        with patch.dict(sys.modules, fakes), patch.dict(relay_asr_server.TRANSLATOR, {}, clear=True), \
+                patch.object(relay_asr_server, "MODEL_DIR", self.root / "models"):
+            with self.assertRaisesRegex(ValueError, "broken tokenizer.json"):
+                relay_asr_server.load_translator()
+            # Without its model.bin, the folder found offline is downloaded again.
+            self.assertEqual(downloads, ["offline", "online"])
+            # The model alone was not kept, so the next use loads both again.
+            self.assertEqual(relay_asr_server.TRANSLATOR, {})
+            self.assertEqual(relay_asr_server.load_translator(), ("model", "tokenizer"))
+            self.assertEqual(downloads, ["offline", "online", "offline"])
 
     def test_training_progress_follows_each_epoch(self):
         # As GPT-SoVITS logs them: SoVITS continuing from epoch 9 of an earlier run, and GPT's

@@ -403,7 +403,8 @@ class Handler(BaseHTTPRequestHandler):
             body = read_json(self)
             if path == "/api/start-system":
                 # The startup worker checks the models once WSL is running; see model_pair.
-                system.start_system(body.get("gpt") or "", body.get("sovits") or "", body.get("binding") or "ShiftLeft")
+                system.start_system(body.get("gpt") or "", body.get("sovits") or "", body.get("binding") or "ShiftLeft",
+                                    datasets.language_code(body.get("spoken")), datasets.language_code(body.get("speaks")))
                 self.send_json({"ok": True})
                 return
             if path == "/api/stop-system":
@@ -514,17 +515,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
                 return
             if path == "/api/transcribe":
-                asr.ensure_relay_asr()
-                req = urllib.request.Request(
-                    config.RELAY_ASR_URL + "/transcribe",
-                    data=json.dumps({"audio_base64": body.get("audio_base64", "")}).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=180) as resp:
-                    data = resp.read().decode("utf-8", errors="replace")
-                result = json.loads(data)
-                self.send_json(result, 200 if result.get("ok") else 500)
+                # Mic to Voice: a recording, in the language spoken, as the voice speaks it.
+                spoken, speaks = datasets.language_code(body.get("spoken")), datasets.language_code(body.get("speaks"))
+                self.send_json({"ok": True, **asr.transcribe_relay(body.get("audio_base64", ""), spoken, speaks)})
+                return
+            if path == "/api/translate":
+                # A line typed on Mic to Voice, in the language spoken, as the voice speaks it.
+                spoken, speaks = datasets.language_code(body.get("spoken")), datasets.language_code(body.get("speaks"))
+                text = " ".join(str(body.get("text") or "").split())
+                translated = asr.translate_relay(text, spoken, speaks)
+                self.send_json({"ok": True, "text": translated, "heard": text if translated != text else ""})
                 return
             if path == "/api/start-train":
                 with jobs.gpu_reserved():

@@ -124,7 +124,7 @@ def startup_step(run_id, phase, message):
     set_system_state("starting", phase, message)
 
 
-def _start_system_worker(gpt_path, sovits_path, run_id):
+def _start_system_worker(gpt_path, sovits_path, run_id, spoken="en", speaks="en"):
     try:
         result = wsl.run_wsl("true", timeout=30)
         if result.returncode != 0:
@@ -139,8 +139,10 @@ def _start_system_worker(gpt_path, sovits_path, run_id):
             asr.start_relay_asr()
         wait_until(asr.relay_asr_ready, 120, run_id, "Speech recognition", jobs.JOBS.get("relay-asr"))
         with SYSTEM_LOCK:
-            startup_step(run_id, "asr", "Loading the speech recognition model...")
-        asr.warm_up_relay_asr()
+            translated = asr.written(spoken) != asr.written(speaks)
+            startup_step(run_id, "asr", "Loading the speech recognition and translation models..." if translated
+                         else "Loading the speech recognition model...")
+        asr.warm_up_relay_asr(spoken, speaks)
 
         with SYSTEM_LOCK:
             startup_step(run_id, "tts", "Starting the selected voice engine...")
@@ -167,7 +169,9 @@ def _start_system_worker(gpt_path, sovits_path, run_id):
                 set_system_state("failed", "failed", "System startup failed.", str(exc))
 
 
-def start_system(gpt_path, sovits_path, binding="ShiftLeft"):
+def start_system(gpt_path, sovits_path, binding="ShiftLeft", spoken="en", speaks="en"):
+    """Start Mic to Voice's services. spoken and speaks are the languages of its Settings, whose
+    models load while it starts."""
     global SYSTEM_THREAD, SYSTEM_RUN_ID
     with SYSTEM_LOCK:
         # A startup that Stop Everything cancelled can still be waiting, but it can no longer
@@ -184,7 +188,7 @@ def start_system(gpt_path, sovits_path, binding="ShiftLeft"):
         set_system_state("starting", "wsl", "Starting the local model environment...")
         SYSTEM_THREAD = threading.Thread(
             target=_start_system_worker,
-            args=(gpt_path, sovits_path, run_id),
+            args=(gpt_path, sovits_path, run_id, spoken, speaks),
             daemon=True,
         )
         SYSTEM_THREAD.start()

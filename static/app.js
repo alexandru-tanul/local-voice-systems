@@ -194,8 +194,34 @@ const RELAY_SETTING_IDS = [
   "relayGptModel", "relaySovitsModel", "relayReference",
   "relayOutputDevice", "relayPttKey", "relayMonitorLocal", "relayPushToTalk",
   "relayAutoSpeak", "relayVolume", "relayTopK", "relayTopP",
-  "relayTemperature", "relaySpeed", "relayPause", "relayRepPenalty"
+  "relayTemperature", "relaySpeed", "relayPause", "relayRepPenalty",
+  "relaySpoken", "relaySpeaks"
 ];
+
+// The language you speak to Mic to Voice, and the one its voice speaks.
+function relayLanguages() {
+  return {spoken: $("relaySpoken").value, speaks: $("relaySpeaks").value};
+}
+
+// Chinese and Cantonese are both written in Chinese characters, so no translation is needed
+// between them; see written in dashboard/asr.py.
+function relayTranslates() {
+  const written = language => language === "yue" ? "zh" : language;
+  const {spoken, speaks} = relayLanguages();
+  return written(spoken) !== written(speaks);
+}
+
+function renderRelayLanguageNote() {
+  const notes = [];
+  if ($("relaySpoken").value !== "en") {
+    notes.push("The first time, speech recognition downloads a model for languages other than English, about 145 MB with the standard settings.");
+  }
+  if (relayTranslates()) {
+    notes.push("Your words are translated by NLLB-200, which downloads about 650 MB the first time. Its license allows only non-commercial use.");
+  }
+  $("relayLanguageNote").textContent = notes.join(" ");
+  $("relayLanguageNote").hidden = !notes.length;
+}
 
 function recentActivity(message) {
   if (message) $("recentActivity").textContent = message;
@@ -815,6 +841,7 @@ function fileToBase64(file) {
 }
 
 loadRelaySettings();
+renderRelayLanguageNote();
 // Migrate a saved volume from the old 0-4x scale to 0-100%; new-scale values are always > 4.
 if (relaySavedSettings.relayVolume !== undefined && Number(relaySavedSettings.relayVolume) <= 4) {
   $("relayVolume").value = Math.round(Number(relaySavedSettings.relayVolume) / 4 * 100);
@@ -1196,6 +1223,8 @@ const STATUS_HINTS = {
   "starting local speech": "Starting speech recognition. The first recording can take a moment.",
   "starting TTS engine": "Starting the voice engine. This can take a minute or two.",
   "transcription failed": "Transcription failed. Check the Logs page.",
+  "translating": "Translating the typed line.",
+  "translation failed": "Translation failed. Check the Logs page.",
   "local speech failed": "The microphone or speech recognition failed. Check the Logs page.",
   "audio devices failed": "The audio device list failed. Allow microphone access and try again.",
   "audio device list unavailable": "Audio devices are unavailable in this browser.",
@@ -1278,7 +1307,8 @@ function renderRelayQueue() {
     row.setAttribute("aria-selected", relayView.mode === "result" && relayView.itemId === item.id ? "true" : "false");
     const text = document.createElement("span");
     text.className = "history-text";
-    text.textContent = item.text;
+    // What you said, which for a translated line is not what the voice says.
+    text.textContent = item.heard || item.text;
     const meta = document.createElement("span");
     meta.className = "history-meta";
     const stateSpan = document.createElement("span");
@@ -1368,7 +1398,9 @@ function renderRelayCenter() {
 }
 
 function renderRelayResult(item) {
-  $("relayTranscript").textContent = item.text;
+  $("relayTranscript").textContent = item.heard || item.text;
+  $("relayTranslation").textContent = item.heard ? item.text : "";
+  $("relayTranslationBlock").hidden = !item.heard;
   const hasAudio = Boolean(item.url);
   $("relayPlayerBlock").hidden = !hasAudio;
   if (hasAudio) {
@@ -1423,7 +1455,7 @@ async function ensureRelayApiReady() {
   throw new Error("TTS engine did not become ready.");
 }
 
-async function generateRelayLine(text, generationId) {
+async function generateRelayLine(text, generationId, lang) {
   const ref = relayRef();
   if (!ref) throw new Error("Pick a reference clip in Settings.");
   const aux = relayAuxRefs().map(item => item.wsl_path);
@@ -1434,8 +1466,7 @@ async function generateRelayLine(text, generationId) {
     prompt_text: ref.text,
     prompt_lang: ref.lang,
     text,
-    // Speech recognition is English only, so relay lines are English.
-    text_lang: "en",
+    text_lang: lang,
     text_split_method: "cut5",
     seed: -1,
     top_k: $("relayTopK").value,
@@ -1479,17 +1510,20 @@ function playRelayUrl(url, label) {
   }
 }
 
-function newRelayItem(text, status) {
-  const clean = (text || "").replace(/\s+/g, " ").trim();
+// A line keeps the language its voice speaks, so Speak this line and Try again use it even after
+// the setting changed. heard is what was said, when the voice says it in another language.
+function newRelayItem(line, status) {
+  const clean = (line.text || "").replace(/\s+/g, " ").trim();
   if (!clean) return null;
-  const item = {id: relayNextId++, generationId: `relay-${Date.now()}-${relayNextId}`, text: clean, status, url: "", name: "", error: "", createdAt: Date.now()};
+  const item = {id: relayNextId++, generationId: `relay-${Date.now()}-${relayNextId}`, text: clean, heard: line.heard || "",
+    lang: line.lang || "en", status, url: "", name: "", error: "", createdAt: Date.now()};
   relayQueue.push(item);
   relayView = {mode: "result", itemId: item.id};
   return item;
 }
 
-function enqueueRelayLine(text) {
-  const item = newRelayItem(text, "queued");
+function enqueueRelayLine(line) {
+  const item = newRelayItem(line, "queued");
   if (!item) return;
   renderRelayQueue();
   relayStatus("line queued");
@@ -1522,7 +1556,7 @@ async function processRelayQueue() {
       relayStatus("generating");
       try {
         await ensureRelayApiReady();
-        const result = await generateRelayLine(item.text, item.generationId);
+        const result = await generateRelayLine(item.text, item.generationId, item.lang);
         if (item.status === "cancelled") continue;
         item.status = "ready";
         item.url = result.url;
@@ -1621,11 +1655,37 @@ async function ensureRelayAsrReady() {
   throw new Error("Local speech recognizer did not become ready.");
 }
 
+// A recording's words as a line for the voice: its text, in the language the voice speaks, and,
+// when that is another language, what was heard.
 async function transcribeRelayAudio(samples, sampleRate) {
   const wav = encodeWav(samples, sampleRate);
   const audio_base64 = await blobToBase64(wav);
-  const result = await post("/api/transcribe", {audio_base64});
-  return (result.text || "").replace(/\s+/g, " ").trim();
+  const languages = relayLanguages();
+  const result = await post("/api/transcribe", {audio_base64, ...languages});
+  return {text: (result.text || "").replace(/\s+/g, " ").trim(), heard: result.heard || "", lang: languages.speaks};
+}
+
+// A typed line counts as said, so it is translated in the same way.
+async function speakTypedRelayLine() {
+  const text = $("relayManualText").value.replace(/\s+/g, " ").trim();
+  if (!text) return;
+  const languages = relayLanguages();
+  if (!relayTranslates()) {
+    enqueueRelayLine({text, lang: languages.speaks});
+    return;
+  }
+  $("relaySpeakManual").disabled = true;
+  relayStatus("translating");
+  try {
+    const result = await post("/api/translate", {text, ...languages});
+    if (!result.text.trim()) throw new Error("Translation failed: it came back empty.");
+    enqueueRelayLine({text: result.text, heard: result.heard, lang: languages.speaks});
+  } catch (error) {
+    relayStatus("translation failed");
+    showError(error.message);
+  } finally {
+    $("relaySpeakManual").disabled = false;
+  }
 }
 
 function resetRelayCapture() {
@@ -1679,23 +1739,24 @@ function finishRelayCapture() {
   relayTranscribing = true;
   relayStatus("transcribing locally");
   transcribeRelayAudio(samples, sampleRate)
-    .then(text => {
+    .then(line => {
       relayTranscribing = false;
-      if (!text) {
+      if (!line.text) {
         relayStatus("no speech recognized");
         return;
       }
       if ($("relayAutoSpeak").checked) {
-        enqueueRelayLine(text);
+        enqueueRelayLine(line);
       } else {
-        newRelayItem(text, "transcribed");
+        newRelayItem(line, "transcribed");
         renderRelayQueue();
         relayStatus("transcribed");
       }
     })
     .catch(error => {
       relayTranscribing = false;
-      relayStatus("transcription failed");
+      // The cause is in Logs; see translate_relay in dashboard/asr.py for the translation's.
+      relayStatus(error.message.startsWith("Translation failed") ? "translation failed" : "transcription failed");
       console.error(error);
     });
 }
@@ -1787,7 +1848,9 @@ function stopRelayListening() {
   relayStream = null;
   if (relayAudioCtx) relayAudioCtx.close();
   relayAudioCtx = null;
-  finishRelayCapture();
+  // Stop Everything drops a recording it cuts off: transcribing it would start speech
+  // recognition again, and with Speak automatically on, the voice engine too.
+  resetRelayCapture();
   relayStatus(relayBusy ? "generating" : "not listening");
 }
 
@@ -1846,7 +1909,8 @@ async function startSystem() {
     saveRelaySettings();
     await refreshRelayDevices();
     if (token !== startToken) return;
-    await post("/api/start-system", {...relayModels(), binding: $("relayPttKey").value});
+    // The languages, so their models load while the system starts.
+    await post("/api/start-system", {...relayModels(), binding: $("relayPttKey").value, ...relayLanguages()});
     recentActivity("System startup requested.");
     await refreshSystem();
   } catch (error) {
@@ -2051,9 +2115,9 @@ const TOUR_STEPS = [
   {tab: "generate", voice: true, targets: [".voice-line"], title: "Choose the voice", text: "Pick the voice and a reference clip. The clip's tone shapes how the line sounds, and you can play it here."},
   {tab: "generate", voice: true, targets: [".compose-actions"], title: "Generate", text: "Generate makes the line. The voice engine starts by itself the first time, which takes a moment. The gear opens the models, the text language and finer controls."},
   {tab: "generate", targets: ["#tab-generate .history"], title: "Your lines", text: "Every line you generate is listed here. Click one to play it again."},
-  {tab: "relay", targets: ["#relayPttButton", "#relayCapture .no-voice-note"], title: "Mic to Voice", text: "Press Start to turn on speech recognition and the voice engine. Then hold this button or your push-to-talk key, speak English, and release. Your words are spoken in the voice.", noVoiceText: "Here you speak, and your words are spoken in a voice. It needs a voice first, made on Voice Training."},
+  {tab: "relay", targets: ["#relayPttButton", "#relayCapture .no-voice-note"], title: "Mic to Voice", text: "Press Start to turn on speech recognition and the voice engine. Then hold this button or your push-to-talk key, speak, and release. Your words are spoken in the voice.", noVoiceText: "Here you speak, and your words are spoken in a voice. It needs a voice first, made on Voice Training."},
   {tab: "relay", voice: true, targets: ["#relaySetPttKey"], title: "Push-to-talk key", text: "Click to choose another key. It also works while another app, such as a game, is in front."},
-  {tab: "relay", voice: true, targets: [".relay-options"], title: "Options", text: "With Hold to talk off, the microphone listens all the time instead. With Speak automatically off, your words are only written down. The gear sets the output device, the volume and the voice."},
+  {tab: "relay", voice: true, targets: [".relay-options"], title: "Options", text: "With Hold to talk off, the microphone listens all the time instead. With Speak automatically off, your words are only written down. The gear sets the output device, the volume, the voice, and the languages: the one you speak and the one the voice speaks, into which your words are translated."},
   {tab: "relay", targets: ["#relayHistory"], title: "Recordings", text: "Everything you said in this session is listed here, to read or play again."},
   {targets: ["#systemIsland"], title: "Status bar", text: "Shows whether speech recognition, the voice engine and the global key are running. Start on Mic to Voice starts them, and Stop Everything stops them and frees the GPU."},
   {targets: ["#openGuide"], title: "Take the tour again", text: "Press Guide to see this tour again at any time."},
@@ -2493,7 +2557,8 @@ document.addEventListener("contextmenu", event => {
 setRelayPttKey(localStorage.getItem("voiceDashboardRelayPttKey") || $("relayPttKey").value);
 updateRelayVolumeLabel();
 autoLoadRelayDevices();
-$("relaySpeakManual").onclick = () => enqueueRelayLine($("relayManualText").value);
+$("relaySpeakManual").onclick = speakTypedRelayLine;
+["relaySpoken", "relaySpeaks"].forEach(id => $(id).addEventListener("change", renderRelayLanguageNote));
 $("relayClearQueue").onclick = () => {
   relayQueue = relayQueue.filter(item => item.status !== "queued");
   if (!viewedRelayItem()) relayView = {mode: "capture", itemId: null};
