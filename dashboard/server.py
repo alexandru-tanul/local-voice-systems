@@ -54,7 +54,7 @@ def read_upload(handler, limit=4 * 1024 ** 3):
 def clean_old_temp_files(max_age=3600):
     """Remove the files a crash or a closed dashboard left in TMP_DIR: uploads, cut clips and
     voice files. Only older ones go, as another dashboard may share TMP_DIR."""
-    patterns = ("upload-*", "cut-*", "transcribe-*", "import-*", "voice-export-*.zip")
+    patterns = ("upload-*", "cut-*", "transcribe-*", "import-*", "restore-*.*", "voice-export-*.zip")
     for pattern in patterns:
         for path in config.TMP_DIR.glob(pattern):
             try:
@@ -62,6 +62,34 @@ def clean_old_temp_files(max_age=3600):
                     path.unlink()
             except OSError:
                 pass
+
+
+# The page's number fields, as it names them. A browser lets any text into a number field.
+SETTING_NAMES = {
+    "top_k": "Top K", "top_p": "Top P", "temperature": "Temperature", "speed_factor": "Speed", "fragment_interval": "Pause",
+    "repetition_penalty": "Repetition penalty", "seed": "Seed", "streaming_mode": "Streaming mode", "overlap_length": "Overlap length",
+    "min_chunk_length": "Minimum chunk length", "epochs": "Total epochs", "batch_size": "Batch size", "save_every": "Save every N epochs",
+}
+
+
+def setting(body, key, default, whole=False, least=None):
+    """A number from the page's request, or default for a field left empty. A letter, or a fraction
+    where a whole number is needed, is answered in the field's own name, not as a conversion error."""
+    value = body.get(key, default)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        value = default
+    name = SETTING_NAMES.get(key, key)
+    try:
+        number = float(value)
+        if whole:
+            if number != int(number):
+                raise ValueError
+            number = int(number)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"{name} must be a {'whole ' if whole else ''}number.") from None
+    if least is not None and number < least:
+        raise RuntimeError(f"{name} must be at least {least}.")
+    return number
 
 
 def read_json(handler):
@@ -314,16 +342,25 @@ class Handler(BaseHTTPRequestHandler):
             if range_header and range_header.startswith("bytes="):
                 status = 206
                 start_text, _, end_text = range_header[6:].partition("-")
-                if start_text:
-                    start = int(start_text)
-                    if end_text:
-                        end = int(end_text)
-                elif end_text:
-                    # "bytes=-N" asks for the last N bytes.
-                    start = max(file_size - int(end_text), 0)
+                try:
+                    if start_text:
+                        start = int(start_text)
+                        if end_text:
+                            end = int(end_text)
+                    elif end_text:
+                        # "bytes=-N" asks for the last N bytes.
+                        start = max(file_size - int(end_text), 0)
+                    else:
+                        raise ValueError(range_header)
+                except ValueError:
+                    # A range that is not two numbers cannot be satisfied.
+                    start, end = 1, 0
                 end = min(end, file_size - 1)
-                if start > end:
-                    self.send_error(416)
+                if start > end or start < 0:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
                     return
             length = end - start + 1
             self.send_response(status)
@@ -530,9 +567,9 @@ class Handler(BaseHTTPRequestHandler):
                 with jobs.gpu_reserved():
                     training.start_train(
                         body.get("kind"),
-                        int(body.get("epochs", 15)),
-                        int(body.get("batch_size", 1)),
-                        int(body.get("save_every", 5)),
+                        setting(body, "epochs", 15, whole=True, least=1),
+                        setting(body, "batch_size", 1, whole=True, least=1),
+                        setting(body, "save_every", 5, whole=True, least=1),
                         body.get("dataset_id") or "",
                         body.get("model_name") or "voice-model",
                         body.get("version") or "v2Pro",
@@ -553,27 +590,32 @@ class Handler(BaseHTTPRequestHandler):
                 if not engine.api_ready():
                     self.send_json({"ok": False, "error": "Inference engine is not ready yet."}, 409)
                     return
+                text = " ".join(str(body.get("text") or "").split())
+                if not text:
+                    raise RuntimeError("Type the text to speak first.")
+                if not body.get("ref_audio_path"):
+                    raise RuntimeError("Choose a reference clip first.")
                 payload = {
-                    "text": body["text"],
+                    "text": text,
                     "text_lang": datasets.language_code(body.get("text_lang")),
                     "ref_audio_path": body["ref_audio_path"],
                     "aux_ref_audio_paths": body.get("aux_ref_audio_paths") or [],
-                    "prompt_text": body["prompt_text"],
+                    "prompt_text": str(body.get("prompt_text") or ""),
                     "prompt_lang": datasets.language_code(body.get("prompt_lang")),
-                    "top_k": int(body.get("top_k", 15)),
-                    "top_p": float(body.get("top_p", 0.6)),
-                    "temperature": float(body.get("temperature", 0.6)),
+                    "top_k": setting(body, "top_k", 15, whole=True, least=1),
+                    "top_p": setting(body, "top_p", 0.6, least=0),
+                    "temperature": setting(body, "temperature", 0.6, least=0),
                     "text_split_method": body.get("text_split_method", "cut5"),
                     "batch_size": 1,
-                    "speed_factor": float(body.get("speed_factor", 1.0)),
-                    "fragment_interval": float(body.get("fragment_interval", 0.3)),
-                    "seed": int(body.get("seed", -1)),
+                    "speed_factor": setting(body, "speed_factor", 1.0, least=0.1),
+                    "fragment_interval": setting(body, "fragment_interval", 0.3, least=0),
+                    "seed": setting(body, "seed", -1, whole=True),
                     "media_type": "wav",
                     "parallel_infer": True,
-                    "repetition_penalty": float(body.get("repetition_penalty", 1.35)),
-                    "streaming_mode": int(body.get("streaming_mode", 0)),
-                    "overlap_length": int(body.get("overlap_length", 2)),
-                    "min_chunk_length": int(body.get("min_chunk_length", 16)),
+                    "repetition_penalty": setting(body, "repetition_penalty", 1.35, least=0),
+                    "streaming_mode": setting(body, "streaming_mode", 0, whole=True, least=0),
+                    "overlap_length": setting(body, "overlap_length", 2, whole=True, least=0),
+                    "min_chunk_length": setting(body, "min_chunk_length", 16, whole=True, least=1),
                 }
                 generation_id = str(body.get("generation_id") or "")
                 if generation_id:
@@ -610,7 +652,8 @@ class Handler(BaseHTTPRequestHandler):
                 if body.get("relay"):
                     engine.prune_relay_outputs()
                 else:
-                    speech_api.save_speech_settings(body.get("voice"), speech_api.speech_settings_from_generation(body))
+                    # The settings as numbers, as the request sent them as the page's text fields.
+                    speech_api.save_speech_settings(body.get("voice"), speech_api.speech_settings_from_generation({**body, **payload}))
                 jobs.log(f"Generated {output.name} in {time.time() - started:.1f}s.")
                 url = "/outputs/" + output.relative_to(config.OUTPUT_DIR).as_posix()
                 self.send_json({"ok": True, "url": url, "name": output.name})

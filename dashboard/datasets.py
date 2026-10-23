@@ -272,7 +272,9 @@ def add_dataset_audio(dataset_id, filename, audio_base64, text, speaker="", lang
     filename = str(filename or "clip.audio")
     stem = slugify(Path(filename).stem, "clip")
     suffix = Path(filename).suffix.lower() or ".audio"
-    fd, source_name = tempfile.mkstemp(prefix="upload-", suffix=suffix, dir=str(config.OUTPUT_DIR))
+    # In TMP_DIR, where the dashboard removes what a crash leaves, and not in the served outputs/.
+    config.TMP_DIR.mkdir(parents=True, exist_ok=True)
+    fd, source_name = tempfile.mkstemp(prefix="upload-", suffix=suffix, dir=str(config.TMP_DIR))
     os.close(fd)
     source = Path(source_name)
     converted = source.with_name(source.stem + "-converted.wav")

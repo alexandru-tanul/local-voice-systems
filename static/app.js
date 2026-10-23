@@ -143,6 +143,8 @@ let relaySource = null;
 let relayProcessor = null;
 let relayKeepAlive = null;
 let relayPushHeld = false;
+// Counts the starts of listening, so a start that Stop Everything cut short knows it.
+let relayStartCount = 0;
 let relayBindingPtt = false;
 let relayCapturing = false;
 let relayCurrentChunks = [];
@@ -294,15 +296,18 @@ function datasetLabel(dataset) {
   return `${dataset.name} — ${dataset.wav_count} ${dataset.wav_count === 1 ? "clip" : "clips"}`;
 }
 
-function fillDatasetSelects(datasets, activeId) {
+function fillDatasetSelects(datasets, activeId, requestedId) {
+  // The server answers with the voice it was asked for, or the first one when that is gone. An
+  // answer to an older request, from before the voice was changed, does not undo the change.
+  const chosen = voiceDataset === requestedId ? activeId : voiceDataset;
   ["voiceDataset", "relayDataset"].forEach(id => {
     const select = $(id);
     select.innerHTML = "";
     datasets.forEach(dataset => option(select, dataset.id, datasetLabel(dataset)));
-    if (datasets.some(dataset => dataset.id === activeId)) select.value = activeId;
+    if (datasets.some(dataset => dataset.id === chosen)) select.value = chosen;
   });
-  if (activeId !== voiceDataset) {
-    voiceDataset = activeId;
+  if (chosen !== voiceDataset) {
+    voiceDataset = chosen;
     try { localStorage.setItem("voiceDashboardVoiceDataset", voiceDataset); } catch (_) {}
   }
 }
@@ -1033,10 +1038,14 @@ function previewClip(picker, ref) {
 function renderAuxRefs(refs) { renderAuxPicker(generateAux, refs); }
 function renderRelayAuxRefs() { if (state) renderAuxPicker(relayAux, state.all_references); }
 
+// The clip whose words fill the reference text. An edit of them is kept while that clip stays
+// chosen; another clip, as after a change of voice, brings its own words.
+let promptClip = "";
 function setReference(ref, rewriteText = true) {
   $("refAudio").src = ref.local_url;
-  if (rewriteText) $("promptText").value = ref.text;
-  if (!$("promptText").value) $("promptText").value = ref.text;
+  const clip = `${state ? state.reference_dataset : ""}/${ref.id}`;
+  if (rewriteText || clip !== promptClip || !$("promptText").value) $("promptText").value = ref.text;
+  promptClip = clip;
 }
 
 function setRelayReference(ref) {
@@ -1443,12 +1452,14 @@ function setRelayLevel(db) {
   $("relayPttButton").style.setProperty("--level", level.toFixed(2));
 }
 
-async function ensureRelayApiReady() {
+// Waits for the voice engine, unless the line it is for is cancelled meanwhile.
+async function ensureRelayApiReady(item) {
   if (state && state.api_ready) return;
   relayStatus("starting TTS engine");
   await post("/api/start-api", relayModels());
   for (let i = 0; i < 80; i++) {
     await new Promise(resolve => setTimeout(resolve, 1500));
+    if (item && item.status === "cancelled") return;
     await refresh();
     if (state && state.api_ready) return;
   }
@@ -1555,7 +1566,9 @@ async function processRelayQueue() {
       renderRelayQueue();
       relayStatus("generating");
       try {
-        await ensureRelayApiReady();
+        await ensureRelayApiReady(item);
+        // A line cancelled while the engine was starting is not generated at all.
+        if (item.status === "cancelled") continue;
         const result = await generateRelayLine(item.text, item.generationId, item.lang);
         if (item.status === "cancelled") continue;
         item.status = "ready";
@@ -1649,6 +1662,7 @@ async function ensureRelayAsrReady() {
   await post("/api/start-relay-asr");
   for (let i = 0; i < 80; i++) {
     await new Promise(resolve => setTimeout(resolve, 500));
+    if (!relayListening) throw new Error("Listening was stopped.");
     await refresh();
     if (state && state.relay_asr_ready) return;
   }
@@ -1768,9 +1782,14 @@ function startRelayListening() {
     return;
   }
   relayListening = true;
+  // Stop Everything can come while speech recognition or the microphone is still starting. The
+  // start then goes no further, and opens no microphone that nothing would close.
+  const start = ++relayStartCount;
+  const stopped = () => start !== relayStartCount || !relayListening;
   relayStatus("starting local speech");
   ensureRelayAsrReady().then(async () => {
-    relayStream = await navigator.mediaDevices.getUserMedia({
+    if (stopped()) return;
+    const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: {ideal: 1},
         echoCancellation: false,
@@ -1778,6 +1797,11 @@ function startRelayListening() {
         autoGainControl: false,
       }
     });
+    if (stopped()) {
+      stream.getTracks().forEach(track => track.stop());
+      return;
+    }
+    relayStream = stream;
     relayAudioCtx = new AudioContext({latencyHint: "interactive"});
     relaySource = relayAudioCtx.createMediaStreamSource(relayStream);
     relayProcessor = relayAudioCtx.createScriptProcessor(4096, 1, 1);
@@ -1826,8 +1850,11 @@ function startRelayListening() {
     relayProcessor.connect(relayKeepAlive);
     relayKeepAlive.connect(relayAudioCtx.destination);
     if (relayAudioCtx.state === "suspended") await relayAudioCtx.resume();
+    if (stopped()) return;
     relayStatus($("relayPushToTalk").checked ? "push-to-talk ready" : "listening local");
   }).catch(error => {
+    // A start that was stopped meanwhile has nothing to report.
+    if (stopped()) return;
     relayListening = false;
     relayStatus("local speech failed");
     alert(error.message);
@@ -1836,6 +1863,7 @@ function startRelayListening() {
 
 function stopRelayListening() {
   relayListening = false;
+  relayStartCount++;
   relayPushHeld = false;
   $("relayPttButton").classList.remove("active");
   if (relayProcessor) relayProcessor.disconnect();
@@ -2008,14 +2036,15 @@ function refresh() {
 }
 
 async function refreshOnce() {
-  const res = await fetch(`/api/state?dataset=${encodeURIComponent(voiceDataset)}`);
+  const requested = voiceDataset;
+  const res = await fetch(`/api/state?dataset=${encodeURIComponent(requested)}`);
   state = await res.json();
   if (state.config_error && !configErrorShown) {
     configErrorShown = true;
     showError(state.config_error);
   }
   fillTrainingDatasets(state.datasets || []);
-  fillDatasetSelects(state.datasets || [], state.reference_dataset || "");
+  fillDatasetSelects(state.datasets || [], state.reference_dataset || "", requested);
   document.body.dataset.voice = hasVoice() ? "yes" : "no";
   if (Boolean(state.gpu_busy) !== lastGpuBusy) {
     lastGpuBusy = Boolean(state.gpu_busy);

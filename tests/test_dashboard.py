@@ -343,7 +343,7 @@ class DashboardTests(unittest.TestCase):
         second = dashboard.restore.add_restore_audio("clip.wav", base64.b64encode(b"sound").decode())
         self.assertNotEqual(first["id"], second["id"])
         # A stopped run leaves its work folder and a result it was still writing.
-        (self.root / "tmp").mkdir()
+        (self.root / "tmp").mkdir(exist_ok=True)
         leftovers = [self.root / "tmp" / f"restore-{dashboard.config.DASHBOARD_PORT}-old", self.root / "restored" / "clip-old.wav.part"]
         leftovers[0].mkdir()
         leftovers[1].write_bytes(b"")
@@ -761,6 +761,11 @@ class DashboardTests(unittest.TestCase):
             ("bytes=6-", (206, "bytes 6-9/10", b"6789")),
             ("bytes=-3", (206, "bytes 7-9/10", b"789")),
             ("bytes=-50", (206, "bytes 0-9/10", b"0123456789")),
+            # A range the file cannot satisfy, or one that is not two numbers, is answered as such, not as a server error.
+            ("bytes=12-", (416, "bytes */10", b"")),
+            ("bytes=abc-", (416, "bytes */10", b"")),
+            ("bytes=-", (416, "bytes */10", b"")),
+            ("bytes=2-x", (416, "bytes */10", b"")),
         ]:
             with self.subTest(range=header):
                 self.assertEqual(self.request(port, "GET", "/outputs/clip.wav", Host=f"127.0.0.1:{port}", Range=header), expected)
@@ -1669,3 +1674,67 @@ class DashboardTests(unittest.TestCase):
             dashboard.datasets.add_dataset_clip(root, self.root / "elsewhere.wav", "clip", "elsewhere.wav", "Words.")
         self.assertEqual(sorted(path.name for path in (root / "wavs").iterdir()), ["clip.wav"])
         self.assertFalse((self.root / "elsewhere.wav").exists())
+
+    def test_number_fields_from_the_page_are_checked_in_plain_words(self):
+        # A browser lets any text into a number field, and an empty one sends "".
+        dataset_id = self.make_speaking_voice()
+        port = self.start_server()
+        sent = []
+
+        class Response(io.BytesIO):
+            headers = {"Content-Type": "audio/wav"}
+
+        def urlopen(request, timeout=None):
+            sent.append(json.loads(request.data))
+            return contextlib.nullcontext(Response(b"RIFF" + b"\0" * 40))
+
+        def ask(path, **fields):
+            status, _, answer = self.request(port, "POST", path, json.dumps(fields), Host=f"127.0.0.1:{port}")
+            return status, json.loads(answer)
+
+        def generate(**fields):
+            return ask("/api/generate", **{"text": "Hello.", "ref_audio_path": "/home/me/datasets/clip-test/wavs/ref.wav", "prompt_text": "Reference words.",
+                                           "gpt": "GPT_weights_v2Pro/joe-e10.ckpt", "sovits": "SoVITS_weights_v2Pro/joe_e8_s1.pth", "voice": dataset_id, **fields})
+
+        with (patch.object(dashboard.engine, "api_ready", return_value=True), patch.object(dashboard.engine, "set_api_weights"),
+              patch.object(urllib.request, "urlopen", urlopen), patch.object(dashboard.config, "OUTPUT_DIR", self.root / "outputs")):
+            status, answer = generate(top_k="", top_p="0.7", seed="", temperature="")
+            self.assertEqual(status, 200, answer)
+            self.assertEqual([sent[-1][key] for key in ("top_k", "top_p", "seed", "temperature")], [15, 0.7, -1, 0.6])
+            # The speech API keeps the numbers, not the page's text.
+            saved = json.loads((dashboard.config.DATASETS_DIR / dataset_id / "speech.json").read_text(encoding="utf-8"))
+            self.assertEqual((saved["top_k"], saved["top_p"]), (15, 0.7))
+            for fields, message in [({"top_k": "abc"}, "Top K must be a whole number."), ({"top_k": "15.5"}, "Top K must be a whole number."),
+                                    ({"speed_factor": "0"}, "Speed must be at least 0.1."), ({"text": "  "}, "Type the text to speak first.")]:
+                with self.subTest(fields=fields):
+                    self.assertEqual(generate(**fields), (500, {"ok": False, "error": message}))
+        with patch.object(dashboard.training, "start_train") as start_train:
+            self.assertEqual(ask("/api/start-train", kind="gpt", dataset_id=dataset_id, epochs="", batch_size="2", save_every="")[0], 200)
+            start_train.assert_called_once_with("gpt", 15, 2, 5, dataset_id, "voice-model", "v2Pro")
+            self.assertEqual(ask("/api/start-train", kind="gpt", dataset_id=dataset_id, epochs="0"), (500, {"ok": False, "error": "Total epochs must be at least 1."}))
+            self.assertEqual(ask("/api/start-train", kind="gpt", dataset_id=dataset_id, epochs="x"), (500, {"ok": False, "error": "Total epochs must be a whole number."}))
+
+    def test_uploads_are_kept_out_of_the_served_outputs_folder(self):
+        # Their temporary files go to TMP_DIR, where the dashboard removes what a crash leaves.
+        dataset_id = self.make_dataset()
+        outputs, tmp = self.root / "outputs", self.root / "tmp"
+        outputs.mkdir()
+        self.enterContext(patch.object(dashboard.config, "OUTPUT_DIR", outputs))
+        self.enterContext(patch.object(dashboard.restore, "RESTORE_DIR", outputs / "restored"))
+        self.write_wav(self.root / "clip.wav", 1.0)
+        audio = base64.b64encode((self.root / "clip.wav").read_bytes()).decode("ascii")
+        with patch.object(dashboard.datasets, "convert_audio", lambda source, target, sample_rate=44100: shutil.copyfile(source, target)):
+            dashboard.datasets.add_dataset_audio(dataset_id, "clip.wav", audio, "Words.")
+            dashboard.restore.add_restore_audio("clip.wav", audio)
+        self.assertEqual([path.name for path in outputs.iterdir()], ["restored"])
+        self.assertEqual(list(tmp.iterdir()), [])
+        old = [tmp / "upload-a.wav", tmp / "restore-b.mp3", tmp / "transcribe-c.wav"]
+        for path in old:
+            path.write_bytes(b"")
+            os.utime(path, (0, 0))
+        fresh = tmp / "upload-d.wav"
+        fresh.write_bytes(b"")
+        work = tmp / f"restore-{dashboard.config.DASHBOARD_PORT}-run"
+        work.mkdir()
+        dashboard.server.clean_old_temp_files()
+        self.assertEqual(sorted(path.name for path in tmp.iterdir()), sorted([fresh.name, work.name]))

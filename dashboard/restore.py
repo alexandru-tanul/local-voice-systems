@@ -49,7 +49,9 @@ def add_restore_audio(filename, audio_base64):
     name = Path(filename).stem or "audio"
     item_id = restore_item_id(name)
     RESTORE_DIR.mkdir(parents=True, exist_ok=True)
-    fd, source_name = tempfile.mkstemp(prefix="restore-", suffix=Path(filename).suffix.lower() or ".audio", dir=str(config.OUTPUT_DIR))
+    # In TMP_DIR, where the dashboard removes what a crash leaves, and not in the served outputs/.
+    config.TMP_DIR.mkdir(parents=True, exist_ok=True)
+    fd, source_name = tempfile.mkstemp(prefix="restore-", suffix=Path(filename).suffix.lower() or ".audio", dir=str(config.TMP_DIR))
     os.close(fd)
     source = Path(source_name)
     target = RESTORE_DIR / f"{item_id}.wav"
