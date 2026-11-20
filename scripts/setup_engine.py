@@ -180,7 +180,7 @@ def main(argv=None):
         result = subprocess.run(["wsl.exe", "-d", distro, *user_args, "--exec", "bash", linux_script, phase, build["build"]])
         if result.returncode == OWN_INSTALL and phase != "root":
             print(f"\nGPT-SoVITS is already in {home}/GPT-SoVITS, from an install of your own, and setup leaves it as it is."
-                  "\nSet its paths in config.json, as the README describes.")
+                  "\nSet its paths in config.json, as docs/INSTALL.md describes.")
             return 1
         if result.returncode != 0:
             print("\nSetup stopped with an error, shown above. Run Setup-Engine.bat again to continue from where it stopped.")
